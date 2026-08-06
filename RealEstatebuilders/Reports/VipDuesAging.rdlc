@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2008/01/reportdefinition" xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner">
+  <Body>
+    <ReportItems>
+      <Tablix Name="Tablix1">
+        <TablixBody>
+          <TablixColumns>
+            <TablixColumn><Width>0.3in</Width></TablixColumn>
+            <TablixColumn><Width>1.15in</Width></TablixColumn>
+            <TablixColumn><Width>0.95in</Width></TablixColumn>
+            <TablixColumn><Width>0.55in</Width></TablixColumn>
+            <TablixColumn><Width>0.5in</Width></TablixColumn>
+            <TablixColumn><Width>0.45in</Width></TablixColumn>
+            <TablixColumn><Width>0.7in</Width></TablixColumn>
+            <TablixColumn><Width>0.75in</Width></TablixColumn>
+            <TablixColumn><Width>0.75in</Width></TablixColumn>
+            <TablixColumn><Width>0.45in</Width></TablixColumn>
+            <TablixColumn><Width>0.55in</Width></TablixColumn>
+          </TablixColumns>
+          <TablixRows>
+            <TablixRow>
+              <Height>0.28in</Height>
+              <TablixCells>
+                <TablixCell><CellContents><Textbox Name="h0"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Sr</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h1"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Customer</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h2"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Society</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h3"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Block</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h4"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Plot</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h5"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Type</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h6"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Paid</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h7"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Due</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h8"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Oldest</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h9"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Days</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="h10"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Bucket</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>#0A235F</BackgroundColor><Color>White</Color><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+              </TablixCells>
+            </TablixRow>
+            <TablixRow>
+              <Height>0.24in</Height>
+              <TablixCells>
+                <TablixCell><CellContents><Textbox Name="c0"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="TOTAL","",Fields!sr_no.Value)</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c1"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!customer_name.Value</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c2"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!society_name.Value</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c3"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!block_name.Value</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c4"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!plot_no.Value</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c5"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!plot_type.Value</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c6"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=FormatNumber(Fields!paid.Value,0)</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c7"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=FormatNumber(Fields!due_amount.Value,0)</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#F8D7DA",IIF(Fields!aging_bucket.Value=">90","#FDEDEC",IIF(Fields!aging_bucket.Value="61-90","#FFF3CD","White")))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c8"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!oldest_unpaid_date.Value</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c9"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="TOTAL","",Fields!days_overdue.Value)</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD","White")</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c10"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!aging_bucket.Value</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="TOTAL","#FFF3CD",IIF(Fields!aging_bucket.Value=">90","#F8D7DA",IIF(Fields!aging_bucket.Value="61-90","#FFF3CD","White")))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+              </TablixCells>
+            </TablixRow>
+          </TablixRows>
+        </TablixBody>
+        <TablixColumnHierarchy>
+          <TablixMembers>
+            <TablixMember /><TablixMember /><TablixMember /><TablixMember /><TablixMember /><TablixMember />
+            <TablixMember /><TablixMember /><TablixMember /><TablixMember /><TablixMember />
+          </TablixMembers>
+        </TablixColumnHierarchy>
+        <TablixRowHierarchy>
+          <TablixMembers>
+            <TablixMember />
+            <TablixMember><Group Name="Details" /></TablixMember>
+          </TablixMembers>
+        </TablixRowHierarchy>
+        <DataSetName>DataSet1</DataSetName>
+        <Top>0.05in</Top>
+        <Left>0in</Left>
+        <Height>0.52in</Height>
+        <Width>7.1in</Width>
+      </Tablix>
+      <Textbox Name="txtNote">
+        <Paragraphs><Paragraph><TextRuns><TextRun><Value>Buckets: Current (no due) | 0-30 | 31-60 | 61-90 | &gt;90 days from oldest unpaid / booking. Due = ledger billed − paid (or price − paid).</Value><Style><FontSize>7pt</FontSize><Color>#555555</Color></Style></TextRun></TextRuns></Paragraph></Paragraphs>
+        <Top>0.65in</Top><Left>0in</Left><Height>0.25in</Height><Width>7.1in</Width>
+      </Textbox>
+    </ReportItems>
+    <Height>1.0in</Height>
+  </Body>
+  <Width>7.3in</Width>
+  <Page>
+    <PageHeader>
+      <Height>0.85in</Height>
+      <PrintOnFirstPage>true</PrintOnFirstPage>
+      <PrintOnLastPage>true</PrintOnLastPage>
+      <ReportItems>
+        <Textbox Name="txtBrand">
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Parameters!HeaderBrand.Value</Value><Style><FontFamily>Segoe UI</FontFamily><FontSize>16pt</FontSize><FontWeight>Bold</FontWeight><Color>#0A235F</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+          <Top>0.05in</Top><Left>0in</Left><Height>0.3in</Height><Width>7.3in</Width>
+        </Textbox>
+        <Textbox Name="txtTitle">
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>Dues Aging Report (VIP)</Value><Style><FontFamily>Segoe UI</FontFamily><FontSize>11pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+          <Top>0.35in</Top><Left>0in</Left><Height>0.22in</Height><Width>7.3in</Width>
+        </Textbox>
+        <Textbox Name="txtAsOf">
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>="As Of: " &amp; Parameters!AsOfDate.Value</Value><Style><FontSize>8pt</FontSize><Color>#444444</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+          <Top>0.58in</Top><Left>0in</Left><Height>0.18in</Height><Width>7.3in</Width>
+        </Textbox>
+      </ReportItems>
+    </PageHeader>
+    <PageFooter>
+      <Height>0.28in</Height>
+      <PrintOnFirstPage>true</PrintOnFirstPage>
+      <PrintOnLastPage>true</PrintOnLastPage>
+      <ReportItems>
+        <Textbox Name="txtPage">
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>="Page " &amp; Globals!PageNumber &amp; " of " &amp; Globals!TotalPages</Value><Style><FontSize>8pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs>
+          <Top>0.05in</Top><Left>3.3in</Left><Height>0.18in</Height><Width>4in</Width>
+        </Textbox>
+      </ReportItems>
+    </PageFooter>
+    <PageHeight>11in</PageHeight>
+    <PageWidth>8.5in</PageWidth>
+    <LeftMargin>0.5in</LeftMargin>
+    <RightMargin>0.5in</RightMargin>
+    <TopMargin>0.35in</TopMargin>
+    <BottomMargin>0.35in</BottomMargin>
+  </Page>
+  <AutoRefresh>0</AutoRefresh>
+  <DataSources>
+    <DataSource Name="DummyDataSource">
+      <ConnectionProperties>
+        <DataProvider>System.Data.DataSet</DataProvider>
+        <ConnectString>/* Local Connection */</ConnectString>
+      </ConnectionProperties>
+      <rd:DataSourceID>c3d4e5f6-a7b8-9012-cdef-123456789abc</rd:DataSourceID>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="DataSet1">
+      <Query>
+        <DataSourceName>DummyDataSource</DataSourceName>
+        <CommandText>/* Local Query */</CommandText>
+      </Query>
+      <Fields>
+        <Field Name="sr_no"><DataField>sr_no</DataField><rd:TypeName>System.Int32</rd:TypeName></Field>
+        <Field Name="row_type"><DataField>row_type</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="customer_name"><DataField>customer_name</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="society_name"><DataField>society_name</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="block_name"><DataField>block_name</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="plot_no"><DataField>plot_no</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="plot_type"><DataField>plot_type</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="paid"><DataField>paid</DataField><rd:TypeName>System.Double</rd:TypeName></Field>
+        <Field Name="due_amount"><DataField>due_amount</DataField><rd:TypeName>System.Double</rd:TypeName></Field>
+        <Field Name="oldest_unpaid_date"><DataField>oldest_unpaid_date</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="days_overdue"><DataField>days_overdue</DataField><rd:TypeName>System.Int32</rd:TypeName></Field>
+        <Field Name="aging_bucket"><DataField>aging_bucket</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportParameters>
+    <ReportParameter Name="HeaderBrand">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>HeaderBrand</Prompt>
+      <DefaultValue><Values><Value>Hub Builders</Value></Values></DefaultValue>
+    </ReportParameter>
+    <ReportParameter Name="AsOfDate">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>AsOfDate</Prompt>
+      <DefaultValue><Values><Value></Value></Values></DefaultValue>
+    </ReportParameter>
+  </ReportParameters>
+  <rd:ReportUnitType>Inch</rd:ReportUnitType>
+  <rd:ReportID>d4e5f6a7-b8c9-0123-def0-23456789abcd</rd:ReportID>
+</Report>

@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<xs:schema id="dsCompleteCustomer" targetNamespace="http://tempuri.org/dsCompleteCustomer.xsd" xmlns:mstns="http://tempuri.org/dsCompleteCustomer.xsd" xmlns="http://tempuri.org/dsCompleteCustomer.xsd" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata" xmlns:msprop="urn:schemas-microsoft-com:xml-msprop" attributeFormDefault="qualified" elementFormDefault="qualified">
+  <xs:annotation>
+    <xs:appinfo source="urn:schemas-microsoft-com:xml-msdatasource">
+      <DataSource DefaultConnectionIndex="0" FunctionsComponentName="QueriesTableAdapter" Modifier="AutoLayout, AnsiClass, Class, Public" SchemaSerializationMode="IncludeSchema" xmlns="urn:schemas-microsoft-com:xml-msdatasource">
+        <Connections />
+        <Tables />
+        <Sources />
+      </DataSource>
+    </xs:appinfo>
+  </xs:annotation>
+  <xs:element name="dsCompleteCustomer" msdata:IsDataSet="true" msdata:UseCurrentLocale="true" msprop:EnableTableAdapterManager="true" msprop:Generator_UserDSName="dsCompleteCustomer" msprop:Generator_DataSetName="dsCompleteCustomer">
+    <xs:complexType>
+      <xs:choice minOccurs="0" maxOccurs="unbounded">
+        <xs:element name="DataTable1" msprop:Generator_RowEvHandlerName="DataTable1RowChangeEventHandler" msprop:Generator_RowDeletedName="DataTable1RowDeleted" msprop:Generator_RowDeletingName="DataTable1RowDeleting" msprop:Generator_RowEvArgName="DataTable1RowChangeEvent" msprop:Generator_TablePropName="DataTable1" msprop:Generator_RowChangedName="DataTable1RowChanged" msprop:Generator_RowChangingName="DataTable1RowChanging" msprop:Generator_TableClassName="DataTable1DataTable" msprop:Generator_RowClassName="DataTable1Row" msprop:Generator_TableVarName="tableDataTable1" msprop:Generator_UserTableName="DataTable1">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="name" msprop:Generator_ColumnPropNameInRow="name" msprop:Generator_ColumnPropNameInTable="nameColumn" msprop:Generator_ColumnVarNameInTable="columnname" msprop:Generator_UserColumnName="name" type="xs:string" minOccurs="0" />
+              <xs:element name="father_name" msprop:Generator_ColumnPropNameInRow="father_name" msprop:Generator_ColumnPropNameInTable="father_nameColumn" msprop:Generator_ColumnVarNameInTable="columnfather_name" msprop:Generator_UserColumnName="father_name" type="xs:string" minOccurs="0" />
+              <xs:element name="mobile" msprop:Generator_ColumnPropNameInRow="mobile" msprop:Generator_ColumnPropNameInTable="mobileColumn" msprop:Generator_ColumnVarNameInTable="columnmobile" msprop:Generator_UserColumnName="mobile" type="xs:string" minOccurs="0" />
+              <xs:element name="cnic" msprop:Generator_ColumnPropNameInRow="cnic" msprop:Generator_ColumnPropNameInTable="cnicColumn" msprop:Generator_ColumnVarNameInTable="columncnic" msprop:Generator_UserColumnName="cnic" type="xs:string" minOccurs="0" />
+              <xs:element name="notes" msprop:Generator_ColumnPropNameInRow="notes" msprop:Generator_ColumnPropNameInTable="notesColumn" msprop:Generator_ColumnVarNameInTable="columnnotes" msprop:Generator_UserColumnName="notes" type="xs:string" minOccurs="0" />
+              <xs:element name="created_at" msprop:Generator_ColumnPropNameInRow="created_at" msprop:Generator_ColumnPropNameInTable="created_atColumn" msprop:Generator_ColumnVarNameInTable="columncreated_at" msprop:Generator_UserColumnName="created_at" type="xs:string" minOccurs="0" />
+              <xs:element name="plots_count" msprop:Generator_ColumnPropNameInRow="plots_count" msprop:Generator_ColumnPropNameInTable="plots_countColumn" msprop:Generator_ColumnVarNameInTable="columnplots_count" msprop:Generator_UserColumnName="plots_count" type="xs:string" minOccurs="0" />
+              <xs:element name="total_received" msprop:Generator_ColumnPropNameInRow="total_received" msprop:Generator_ColumnPropNameInTable="total_receivedColumn" msprop:Generator_ColumnVarNameInTable="columntotal_received" msprop:Generator_UserColumnName="total_received" type="xs:string" minOccurs="0" />
+              <xs:element name="total_due" msprop:Generator_ColumnPropNameInRow="total_due" msprop:Generator_ColumnPropNameInTable="total_dueColumn" msprop:Generator_ColumnVarNameInTable="columntotal_due" msprop:Generator_UserColumnName="total_due" type="xs:string" minOccurs="0" />
+              <xs:element name="plots" msprop:Generator_ColumnPropNameInRow="plots" msprop:Generator_ColumnPropNameInTable="plotsColumn" msprop:Generator_ColumnVarNameInTable="columnplots" msprop:Generator_UserColumnName="plots" type="xs:string" minOccurs="0" />
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:choice>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

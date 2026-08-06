@@ -1,0 +1,57 @@
+# WinForms / .NET
+**/bin/
+**/obj/
+**/.vs/
+*.user
+*.suo
+*.cache
+*.pdb
+*.exe
+*.dll
+*.ilk
+*.log
+UpgradeLog*.htm
+RealEstatebuilders.exe_Url_*/
+
+# Local databases (client data — do not push)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.mdf
+*.ldf
+
+# Flutter / Dart
+HubBuilders/.dart_tool/
+HubBuilders/.flutter-plugins
+HubBuilders/.flutter-plugins-dependencies
+HubBuilders/.packages
+HubBuilders/build/
+HubBuilders/.pub-cache/
+HubBuilders/.pub/
+HubBuilders/coverage/
+**/ios/Pods/
+**/ios/.symlinks/
+**/android/.gradle/
+**/android/local.properties
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+**/android/**/GeneratedPluginRegistrant.java
+**/*.iml
+.idea/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+
+# Secrets / env
+.env
+.env.*
+**/google-services.json
+**/GoogleService-Info.plist
+**/key.properties
+**/*.jks
+**/*.keystore
