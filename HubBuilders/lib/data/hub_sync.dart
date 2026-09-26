@@ -1,0 +1,2977 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:sqflite/sqflite.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../db/app_database.dart';
+import 'block_monthly_store.dart';
+import 'hub_duplicate_cleanup.dart';
+import 'staff_audit.dart';
+import 'supabase_config.dart';
+import 'vendor_store.dart';
+
+/// Incremental sync — sirf naya/changed. Duplicate: Yes/No.
+abstract final class HubSync {
+  static final navKey = GlobalKey<NavigatorState>();
+
+  static const _tables = <String>[
+    'societies',
+    'customers',
+    'brokers',
+    'plans',
+    'users',
+    'Person',
+    'blocks',
+    'plot_types',
+    'plots',
+    'Deal',
+    'customer_plots',
+    'ledger',
+    'receipts',
+    'Credit',
+    'Expensetbl',
+    'customer_plot_partners',
+    'partner_money',
+    'staff_entry_log',
+    'staff_role_permissions',
+    'block_monthly_installments',
+  ];
+
+  static const _fks = <String, Map<String, String>>{
+    'blocks': {'society_id': 'societies'},
+    'plot_types': {'society_id': 'societies'},
+    'plots': {
+      'society_id': 'societies',
+      'block_id': 'blocks',
+      'plot_type_id': 'plot_types',
+    },
+    'customer_plots': {
+      'customer_id': 'customers',
+      'plot_id': 'plots',
+      'plan_id': 'plans',
+      'broker_id': 'brokers',
+    },
+    'receipts': {
+      'customer_plot_id': 'customer_plots',
+      'ledger_id': 'ledger',
+    },
+    'ledger': {'customer_plot_id': 'customer_plots'},
+    'customer_plot_partners': {
+      'customer_plot_id': 'customer_plots',
+      'partner_id': 'Person',
+    },
+    'partner_money': {
+      'partner_id': 'Person',
+      'customer_plot_id': 'customer_plots',
+      'receipt_id': 'receipts',
+      'society_id': 'societies',
+    },
+    'Deal': {'society_id': 'societies', 'owner_id': 'Person'},
+    'Credit': {'deal_id': 'Deal', 'partner_id': 'Person'},
+    'block_monthly_installments': {'block_id': 'blocks'},
+  };
+
+  static Timer? _timer;
+  static Future<void>? _inFlight;
+  static bool _dirty = true;
+  static final revision = ValueNotifier<int>(0);
+  static final notice = ValueNotifier<String?>(null);
+  static final snackKey = GlobalKey<ScaffoldMessengerState>();
+  static final _pullNotes = <String>[];
+  static DateTime _lastCatchUp = DateTime.now();
+  static DateTime _lastForceRecoverBg = DateTime.fromMillisecondsSinceEpoch(0);
+
+  static void _bump() {
+    revision.value++;
+  }
+
+  static void showNotice(String msg) {
+    // WinForms jaisa — background/local sync pe toast nahi.
+  }
+
+  static String prettyModule(String module) {
+    switch (module.toLowerCase()) {
+      case 'customers':
+        return 'Customer';
+      case 'societies':
+        return 'Society';
+      case 'blocks':
+        return 'Block';
+      case 'plots':
+        return 'Plot';
+      case 'plot_types':
+        return 'Plot Type';
+      case 'receipts':
+        return 'Receipt';
+      case 'expensetbl':
+        return 'Expense';
+      case 'brokers':
+        return 'Broker';
+      case 'person':
+        return 'Person';
+      case 'deal':
+        return 'Deal';
+      case 'credit':
+        return 'Credit';
+      case 'partner_money':
+        return 'Partner Cash';
+      case 'customer_plots':
+        return 'Allocation';
+      default:
+        return module;
+    }
+  }
+
+  static void _noteRemote(Map<String, dynamic> row, String verb, String table) {
+    // Pull toast disabled — WinForms NotePull no-op.
+  }
+
+  static String tablePk(String table) => _pk(table);
+
+  static Future<void> saveSyncAlias(
+    DatabaseExecutor db,
+    String table,
+    String syncId,
+    int localPk,
+  ) async {
+    final sid = syncId.trim();
+    if (sid.isEmpty || localPk <= 0 || table.trim().isEmpty) return;
+    try {
+      await db.insert(
+        'sync_alias',
+        {
+          'sync_id': sid,
+          'table_name': table,
+          'local_pk': localPk,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (_) {}
+  }
+
+  /// Row + sync_alias — delete se pehle collect karein.
+  static Future<List<String>> collectCloudDeleteIds(
+    String table,
+    int localPk,
+  ) async {
+    final ids = <String>{};
+    if (localPk <= 0 || table.trim().isEmpty) return [];
+    final db = await AppDatabase.instance.database;
+    final pk = _pk(table);
+    try {
+      final rows = await db.rawQuery(
+        'SELECT sync_id FROM "$table" WHERE "$pk" = ? LIMIT 1',
+        [localPk],
+      );
+      if (rows.isNotEmpty) {
+        final s = (rows.first['sync_id'] ?? '').toString().trim();
+        if (s.isNotEmpty) ids.add(s);
+      }
+    } catch (_) {}
+    try {
+      final aliases = await db.query(
+        'sync_alias',
+        columns: ['sync_id'],
+        where: 'lower(table_name) = lower(?) AND local_pk = ?',
+        whereArgs: [table, localPk],
+      );
+      for (final r in aliases) {
+        final s = (r['sync_id'] ?? '').toString().trim();
+        if (s.isNotEmpty) ids.add(s);
+      }
+    } catch (_) {}
+    return ids.toList();
+  }
+
+  static Future<void> tombstoneLocalRow(
+    String table,
+    int localPk, [
+    List<String>? preCollected,
+  ]) async {
+    if (localPk <= 0 || table.trim().isEmpty) return;
+    final ids = <String>{};
+    if (preCollected != null) {
+      for (final s in preCollected) {
+        if (s.trim().isNotEmpty) ids.add(s.trim());
+      }
+    }
+    ids.addAll(await collectCloudDeleteIds(table, localPk));
+    for (final sid in ids) {
+      // Turant hard delete — queue sirf fail par (_pushDeletedOne andar queue karta hai).
+      await _pushDeletedOne(table, sid);
+    }
+    notifyLocalWrite();
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.delete(
+        'sync_alias',
+        where: 'lower(table_name) = lower(?) AND local_pk = ?',
+        whereArgs: [table, localPk],
+      );
+    } catch (_) {}
+  }
+
+  /// Local SQLite table → Supabase table (har form alag).
+  static String _cloudTable(String local) {
+    switch (local) {
+      case 'Expensetbl':
+        return 'expensetbl';
+      case 'Person':
+        return 'person';
+      case 'Deal':
+        return 'deal';
+      case 'Credit':
+        return 'credit';
+      default:
+        return local.toLowerCase();
+    }
+  }
+
+  static String _fkCloudCol(String localFk) =>
+      '${localFk.substring(0, localFk.length - 3)}_sync_id';
+
+  static String _localColToCloud(String table, String col) {
+    if (table == 'users') {
+      if (col == 'uName') return 'uname';
+      if (col == 'Role') return 'role';
+    }
+    if (table == 'Expensetbl') {
+      switch (col) {
+        case 'Name':
+          return 'name';
+        case 'Amount':
+          return 'amount';
+        case 'Category':
+          return 'category';
+        case 'Note':
+          return 'note';
+        case 'EDate':
+          return 'edate';
+      }
+    }
+    return col.toLowerCase();
+  }
+
+  static String _cloudColToLocal(String table, String col) {
+    if (table == 'users') {
+      if (col == 'uname') return 'uName';
+      if (col == 'role') return 'Role';
+    }
+    if (table == 'Expensetbl') {
+      switch (col) {
+        case 'name':
+          return 'Name';
+        case 'amount':
+          return 'Amount';
+        case 'category':
+          return 'Category';
+        case 'note':
+          return 'Note';
+        case 'edate':
+          return 'EDate';
+      }
+    }
+    return col;
+  }
+
+  static Map<String, Object?> _cloudToLocalPayload(
+    String localTable,
+    Map<String, dynamic> cloud,
+  ) {
+    final p = <String, Object?>{};
+    for (final e in cloud.entries) {
+      final k = e.key.toString();
+      if (k == 'updated_at' || k == 'is_deleted' || k == 'dup_key') {
+        continue;
+      }
+      if (k == 'staff_name' && localTable != 'staff_entry_log') {
+        continue;
+      }
+      if (k.endsWith('_sync_id') && k != 'sync_id') {
+        final localFk = '${k.substring(0, k.length - 8)}_id';
+        p['__fk_$localFk'] = e.value;
+        continue;
+      }
+      if (k == 'sync_id') {
+        p['sync_id'] = e.value;
+        continue;
+      }
+      p[_cloudColToLocal(localTable, k)] = e.value;
+    }
+    return p;
+  }
+
+  static Map<String, Object?> _localToCloudRow(
+    String localTable,
+    Map<String, Object?> payload,
+  ) {
+    final out = <String, Object?>{'sync_id': payload['sync_id']};
+    final pk = _pk(localTable).toLowerCase();
+    final fkCols =
+        _fks[localTable]?.keys.map((k) => k.toLowerCase()).toSet() ?? {};
+    for (final e in payload.entries) {
+      final k = e.key;
+      if (k == 'sync_id' || k.startsWith('__fk_')) continue;
+      final lk = k.toLowerCase();
+      if (lk == pk ||
+          lk == 'id' ||
+          lk == 'sid' ||
+          lk == 'person_id' ||
+          lk == 'deal_id' ||
+          lk == 'credit_id' ||
+          lk == 'userid' ||
+          fkCols.contains(lk)) {
+        continue;
+      }
+      final v = _sqlVal(e.value);
+      if (v == null) continue;
+      out[_localColToCloud(localTable, k)] = v;
+    }
+    return out;
+  }
+
+  static List<Map<String, dynamic>> _asApplyRows(
+    String localTable,
+    List<Map<String, dynamic>> cloudRows,
+  ) {
+    return cloudRows
+        .map(
+          (r) => {
+            'table_name': localTable,
+            'sync_id': r['sync_id'],
+            'is_deleted': r['is_deleted'],
+            'staff_name': r['staff_name'],
+            'payload': _cloudToLocalPayload(localTable, r),
+          },
+        )
+        .toList();
+  }
+
+  static String _pk(String table) {
+    switch (table.toLowerCase()) {
+      case 'expensetbl':
+        return 'sid';
+      case 'person':
+        return 'person_id';
+      case 'deal':
+        return 'deal_id';
+      case 'credit':
+        return 'credit_id';
+      case 'users':
+        return 'userID';
+      default:
+        return 'id';
+    }
+  }
+
+  static void markDirty() {
+    _dirty = true;
+    _bump();
+  }
+
+  /// Restore ke baad: hashes clear + pehle push (warna cloud/mobile purana reh jata).
+  static Future<void> notifyDatabaseRestored() async {
+    try {
+      final db = await AppDatabase.instance.database;
+      try {
+        await db.delete('sync_hash');
+      } catch (_) {}
+      await _setState('push_hashes_ready', '');
+      await _setState('restore_push_first', '1');
+      // Full-pull mat chalao — restored data cloud ke purane se overwrite na ho
+      if (await _getState('first_pull_done') != '1') {
+        await _setState('first_pull_done', '1');
+      }
+      if ((await _getState('last_pull_utc')).trim().isEmpty) {
+        await _setState(
+          'last_pull_utc',
+          DateTime.now().toUtc().toIso8601String(),
+        );
+      }
+      markDirty();
+      unawaited(syncNow());
+    } catch (e) {
+      debugPrint('HubSync notifyDatabaseRestored: $e');
+    }
+  }
+
+  /// WinForms NotifyLocalWrite — local save/delete ke baad turant pull/push cycle.
+  static void notifyLocalWrite() {
+    try {
+      markDirty();
+    } catch (_) {}
+    unawaited(tick());
+  }
+
+  static int _manualHold = 0;
+
+  /// Manual Pull Now — pull + catch-up + hard-delete prune (fast).
+  static Future<bool> pullNow() async {
+    _manualHold++;
+    try {
+      if (!await _ensureSb()) return false;
+      if (_inFlight != null) {
+        try {
+          await _inFlight;
+        } catch (_) {}
+      }
+      _inFlight = _pullNowBody();
+      try {
+        await _inFlight;
+        return true;
+      } finally {
+        _inFlight = null;
+      }
+    } catch (e, st) {
+      debugPrint('HubSync pullNow: $e\n$st');
+      return false;
+    } finally {
+      _manualHold--;
+    }
+  }
+
+  /// Manual Sync Now = WinForms Sync Now: pull + catch-up + push + hard-delete prune.
+  static Future<bool> syncNow() async {
+    _manualHold++;
+    try {
+      markDirty();
+      if (!await _ensureSb()) return false;
+      if (_inFlight != null) {
+        try {
+          await _inFlight;
+        } catch (_) {}
+      }
+      _inFlight = _syncNowBody();
+      try {
+        await _inFlight;
+        return true;
+      } finally {
+        _inFlight = null;
+      }
+    } catch (e, st) {
+      debugPrint('HubSync syncNow: $e\n$st');
+      return false;
+    } finally {
+      _manualHold--;
+    }
+  }
+
+  /// Force Recover from Cloud (UI): soft-mark pending deletes + push dirty local
+  /// FIRST, then insert-missing-only for allocate chain. No full merge rewrite, no prune.
+  static Future<({bool ok, String summary})> forceRecoverFromCloud() async {
+    _manualHold++;
+    try {
+      if (!await _ensureSb()) {
+        return (ok: false, summary: 'Supabase configured nahi / offline');
+      }
+      if (_inFlight != null) {
+        try {
+          await _inFlight;
+        } catch (_) {}
+      }
+      final future = _forceRecoverBody();
+      _inFlight = future;
+      try {
+        return await future;
+      } finally {
+        _inFlight = null;
+      }
+    } catch (e, st) {
+      debugPrint('HubSync forceRecover: $e\n$st');
+      return (ok: false, summary: 'Recover fail: $e');
+    } finally {
+      _manualHold--;
+    }
+  }
+
+  static const _allocateRecoverTables = <String>[
+    'societies',
+    'blocks',
+    'plot_types',
+    'plots',
+    'plans',
+    'customers',
+    'brokers',
+    'customer_plots',
+    'ledger',
+    'receipts',
+  ];
+
+  static Future<({bool ok, String summary})> _forceRecoverBody() async {
+    // WinForms-safe: soft-mark pending deletes, push dirty local FIRST, then
+    // insert-missing-only. Never prune / never full-replace.
+    await _pushPendingDeletes();
+    if (await _canPush()) {
+      await _pushChanged();
+      _dirty = false;
+    }
+    await _setState('restore_push_first', '');
+
+    final stats = await forceRecoverMissingFromCloud();
+    try {
+      await reconcileOneActiveCustomerPlots();
+    } catch (_) {}
+    // NO prune — local-only extras mat mitao
+    _bump();
+
+    var summary =
+        'Recovered ${stats.recovered} missing rows '
+        '(allocate=${stats.allocateRecovered}), '
+        'skipped ${stats.skipped} duplicates (same sync_id). '
+        'Local extras wipe nahi.';
+    if (stats.skipReasons.trim().isNotEmpty) {
+      summary += ' Skipped: ${stats.skipReasons}';
+    }
+    debugPrint('HubSync $summary');
+    return (ok: true, summary: summary);
+  }
+
+  /// Pull-missing-only: cloud is_deleted=false + local sync_id absent → INSERT.
+  /// Local same sync_id → skip. Deleted cloud rows not fetched. No prune.
+  /// Multi-pass + parent ensure for customer_plots (plot chain / customer / placeholder).
+  static Future<
+      ({
+        int recovered,
+        int skipped,
+        int allocateRecovered,
+        String skipReasons,
+      })> forceRecoverMissingFromCloud() async {
+    var recovered = 0;
+    var skipped = 0;
+    var allocateRecovered = 0;
+    final skipList = <String>[];
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.delete(
+        'sync_alias',
+        where:
+            "lower(table_name) IN ('partner_money','receipts','customer_plots')",
+      );
+    } catch (_) {}
+
+    for (var pass = 0; pass < 3; pass++) {
+      for (final table in _allocateRecoverTables) {
+        final isAlloc = table == 'customer_plots';
+        final cloud = _cloudTable(table);
+        final db = await AppDatabase.instance.database;
+        final local = await _localSyncIdsForTable(db, table);
+        for (var page = 0; page < 60; page++) {
+          final from = page * 1000;
+          final got = await _sbSelect(
+            cloud,
+            from: from,
+            to: from + 999,
+            columns: 'sync_id',
+            orderBy: 'sync_id',
+          );
+          if (!got.ok || got.rows.isEmpty) break;
+          final missing = <String>[];
+          for (final row in got.rows) {
+            final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
+            if (id.isEmpty) continue;
+            if (local.contains(id)) {
+              if (pass == 0) skipped++;
+              continue;
+            }
+            missing.add(id);
+          }
+          for (var i = 0; i < missing.length; i += 30) {
+            final end = (i + 30 < missing.length) ? i + 30 : missing.length;
+            final chunk = missing.sublist(i, end);
+            final fetched = await _sbSelect(
+              cloud,
+              from: 0,
+              to: chunk.length + 5,
+              syncIds: chunk,
+            );
+            if (fetched.rows.isEmpty) continue;
+
+            final rows = fetched.rows
+                .map((r) => Map<String, dynamic>.from(r))
+                .toList();
+            if (isAlloc) {
+              await _ensureRecoverParentsForCustomerPlots(rows, skipList);
+            }
+
+            final before = await _localRowCount(table);
+            await _applyFetched(
+              _asApplyRows(table, rows),
+              notify: false,
+              bump: false,
+            );
+            final after = await _localRowCount(table);
+            final added = after > before ? after - before : 0;
+            recovered += added;
+            if (table == 'customer_plots' || table == 'receipts') {
+              allocateRecovered += added;
+            }
+            final db2 = await AppDatabase.instance.database;
+            for (final r in rows) {
+              final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+              if (id.isEmpty) continue;
+              if (await _localIdBySyncExact(db2, table, id) != null) {
+                local.add(id);
+              }
+            }
+          }
+          if (got.rows.length < 1000) break;
+        }
+      }
+    }
+
+    try {
+      final db = await AppDatabase.instance.database;
+      final localCp = await _localSyncIdsForTable(db, 'customer_plots');
+      final still = await _sbSelect(
+        'customer_plots',
+        from: 0,
+        to: 999,
+        columns: 'sync_id,plot_sync_id,customer_sync_id',
+        orderBy: 'sync_id',
+      );
+      for (final row in still.rows) {
+        final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
+        if (id.isEmpty || localCp.contains(id)) continue;
+        final ps = (row['plot_sync_id'] ?? '').toString().trim();
+        final cs = (row['customer_sync_id'] ?? '').toString().trim();
+        final hasPlot =
+            ps.isNotEmpty && await _localIdBySync(db, 'plots', ps) != null;
+        final hasCust =
+            cs.isNotEmpty && await _localIdBySync(db, 'customers', cs) != null;
+        final short = id.length >= 8 ? id.substring(0, 8) : id;
+        final why = !hasPlot
+            ? '$short: plot parent missing'
+            : (cs.isEmpty && !hasCust)
+                ? '$short: customer null/unresolved'
+                : (!hasCust
+                    ? '$short: customer not in cloud/local'
+                    : '$short: insert failed');
+        if (!skipList.any((s) => s.startsWith(short))) skipList.add(why);
+      }
+    } catch (_) {}
+
+    final uniq = <String>[];
+    for (final s in skipList) {
+      if (!uniq.contains(s)) uniq.add(s);
+      if (uniq.length >= 6) break;
+    }
+    return (
+      recovered: recovered,
+      skipped: skipped,
+      allocateRecovered: allocateRecovered,
+      skipReasons: uniq.join('; '),
+    );
+  }
+
+  /// Force Recover only: plot chain + customer (incl. soft-deleted) + placeholder.
+  static Future<void> _ensureRecoverParentsForCustomerPlots(
+    List<Map<String, dynamic>> cloudRows,
+    List<String> skipList,
+  ) async {
+    for (final row in cloudRows) {
+      try {
+        final allocSync = (row['sync_id'] ?? '').toString().trim();
+        final plotSync = (row['plot_sync_id'] ?? '').toString().trim();
+        final custSync = (row['customer_sync_id'] ?? '').toString().trim();
+        final planSync = (row['plan_sync_id'] ?? '').toString().trim();
+        final brokerSync = (row['broker_sync_id'] ?? '').toString().trim();
+
+        if (plotSync.isNotEmpty) await _ensureRecoverPlotChain(plotSync);
+        if (planSync.isNotEmpty) {
+          await _fetchAndApplyMissingRows('plans', [planSync], true);
+        }
+        if (brokerSync.isNotEmpty) {
+          await _fetchAndApplyMissingRows('brokers', [brokerSync], true);
+        }
+        if (custSync.isNotEmpty) {
+          await _fetchAndApplyMissingRows('customers', [custSync], true);
+        }
+
+        final db = await AppDatabase.instance.database;
+        final plotId = plotSync.isEmpty
+            ? null
+            : await _localIdBySync(db, 'plots', plotSync);
+        var custId = custSync.isEmpty
+            ? null
+            : await _localIdBySync(db, 'customers', custSync);
+
+        final short =
+            allocSync.length >= 8 ? allocSync.substring(0, 8) : allocSync;
+        if (plotId == null) {
+          skipList.add('$short: plot parent missing');
+          continue;
+        }
+        if (custId == null) {
+          final phSync = await _ensureRecoverPlaceholderCustomer(
+            db,
+            custSync,
+            allocSync,
+          );
+          if (phSync.isNotEmpty) {
+            row['customer_sync_id'] = phSync;
+          }
+        }
+      } catch (e) {
+        final id = (row['sync_id'] ?? '?').toString();
+        final short = id.length >= 8 ? id.substring(0, 8) : id;
+        skipList.add('$short: $e');
+      }
+    }
+  }
+
+  static Future<void> _ensureRecoverPlotChain(String plotSyncId) async {
+    final sid = plotSyncId.trim();
+    if (sid.isEmpty) return;
+    final db = await AppDatabase.instance.database;
+    if (await _localIdBySync(db, 'plots', sid) != null) return;
+    final got = await _sbSelect(
+      'plots',
+      from: 0,
+      to: 5,
+      syncIds: [sid],
+      includeDeleted: true,
+    );
+    if (got.rows.isEmpty) return;
+    final plot = Map<String, dynamic>.from(got.rows.first);
+    plot['is_deleted'] = false; // soft-deleted plot still needed as FK parent
+    final societySync = (plot['society_sync_id'] ?? '').toString().trim();
+    final blockSync = (plot['block_sync_id'] ?? '').toString().trim();
+    final typeSync = (plot['plot_type_sync_id'] ?? '').toString().trim();
+    if (societySync.isNotEmpty) {
+      await _fetchAndApplyMissingRows('societies', [societySync], true);
+    }
+    if (blockSync.isNotEmpty) {
+      await _fetchAndApplyMissingRows('blocks', [blockSync], true);
+    }
+    if (typeSync.isNotEmpty) {
+      await _fetchAndApplyMissingRows('plot_types', [typeSync], true);
+    }
+    await _applyFetched(
+      _asApplyRows('plots', [plot]),
+      notify: false,
+      bump: false,
+    );
+  }
+
+  static Future<void> _fetchAndApplyMissingRows(
+    String table,
+    List<String> syncIds,
+    bool includeDeleted,
+  ) async {
+    if (syncIds.isEmpty) return;
+    final db = await AppDatabase.instance.database;
+    final need = <String>[];
+    for (final id in syncIds) {
+      final t = id.trim();
+      if (t.isEmpty) continue;
+      if (await _localIdBySync(db, table, t) == null) need.add(t);
+    }
+    if (need.isEmpty) return;
+    for (var i = 0; i < need.length; i += 30) {
+      final end = (i + 30 < need.length) ? i + 30 : need.length;
+      final chunk = need.sublist(i, end);
+      final got = await _sbSelect(
+        _cloudTable(table),
+        from: 0,
+        to: chunk.length + 5,
+        syncIds: chunk,
+        includeDeleted: includeDeleted,
+      );
+      if (got.rows.isEmpty) continue;
+      final rows = got.rows.map((r) {
+        final m = Map<String, dynamic>.from(r);
+        // Soft-deleted parents: insert as live for FK resolve (do not ApplyRow-delete)
+        if (includeDeleted) m['is_deleted'] = false;
+        return m;
+      }).toList();
+      await _applyFetched(
+        _asApplyRows(table, rows),
+        notify: false,
+        bump: false,
+      );
+    }
+  }
+
+  /// Force Recover only — minimal customer for customer_id NOT NULL.
+  static Future<String> _ensureRecoverPlaceholderCustomer(
+    DatabaseExecutor db,
+    String customerSyncId,
+    String allocSyncId,
+  ) async {
+    var sid = customerSyncId.trim();
+    if (sid.isEmpty) {
+      final a = allocSyncId.trim();
+      sid = a.isNotEmpty
+          ? 'recover_$a'
+          : 'recover_${DateTime.now().millisecondsSinceEpoch}';
+    }
+    final existing = await _localIdBySync(db, 'customers', sid);
+    if (existing != null) return sid;
+
+    final name = customerSyncId.trim().isEmpty
+        ? 'Recovered (no cloud customer)'
+        : 'Recovered (cloud customer missing)';
+    try {
+      await db.insert('customers', {
+        'name': name,
+        'father_name': '',
+        'mobile': '',
+        'cnic': '',
+        'notes': 'force-recover placeholder',
+        'sync_id': sid,
+      });
+    } catch (e) {
+      debugPrint('HubSync placeholder customer: $e');
+    }
+    return sid;
+  }
+
+  static Future<void> _pullNowBody() async {
+    // Push-first — kabhi pull-wipe pehle nahi
+    await _pushLocalFirst();
+    if (await _needsFullPull()) {
+      await _fullPullAllTables();
+    } else {
+      await _pullIncremental();
+      await _catchUpMissing();
+    }
+    if (await _looksStaleLocal()) {
+      await forceRecoverMissingFromCloud();
+    }
+    await _mirrorUsersFromCloud();
+    await _pruneGoneFromCloud(force: true);
+    _bump();
+  }
+
+  static Future<void> _syncNowBody() async {
+    // Always push dirty local FIRST, then union-pull / insert-missing.
+    // Kabhi pull-wipe-first nahi (old mobile wipe bug).
+    await _pushLocalFirst();
+    if (await _needsFullPull()) {
+      await _fullPullAllTables();
+    } else {
+      await _pullIncremental();
+      await _catchUpMissing();
+    }
+    if (await _looksStaleLocal()) {
+      await forceRecoverMissingFromCloud();
+      try {
+        await reconcileOneActiveCustomerPlots();
+      } catch (_) {}
+    }
+    await _mirrorUsersFromCloud();
+    await _pruneGoneFromCloud(force: true);
+    _bump();
+  }
+
+  /// Soft-mark pending deletes + push dirty rows only (no empty destructive upload).
+  static Future<void> _pushLocalFirst() async {
+    await _pushPendingDeletes();
+    if (await _canPush()) {
+      await _pushChanged();
+      _dirty = false;
+    }
+    if (await _getState('restore_push_first') == '1') {
+      await _setState('restore_push_first', '');
+    }
+  }
+
+  static Future<void> pushNow(String table, Object? rowId) async {
+    if (rowId == null) return;
+    if (table == 'staff_entry_log' || table.startsWith('sync_')) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      if (!await _tableExists(db, table)) return;
+      final pk = _pk(table);
+      await db.execute(
+        'UPDATE "$table" SET sync_id = lower(hex(randomblob(16))) WHERE "$pk" = ? AND (sync_id IS NULL OR TRIM(sync_id)=\'\')',
+        [rowId],
+      );
+      final rows = await db.rawQuery(
+        'SELECT * FROM "$table" WHERE "$pk" = ? LIMIT 1',
+        [rowId],
+      );
+      if (rows.isEmpty) return;
+      final payload = Map<String, Object?>.from(rows.first);
+      final syncId = (payload['sync_id'] ?? '').toString();
+      if (syncId.trim().isEmpty) return;
+      final fks = _fks[table];
+      if (fks != null) {
+        for (final kv in fks.entries) {
+          final fkVal = payload[kv.key];
+          if (fkVal == null) continue;
+          final parent = await _lookupSyncId(db, kv.value, fkVal);
+          if (parent.isNotEmpty) payload['__fk_${kv.key}'] = parent;
+        }
+      }
+      final hash = _rowHash(payload);
+      final cloudRow = _localToCloudRow(table, payload);
+      if (fks != null) {
+        for (final kv in fks.entries) {
+          final fkVal = payload[kv.key];
+          if (fkVal == null) continue;
+          final parent = await _lookupSyncId(db, kv.value, fkVal);
+          if (parent.isNotEmpty) cloudRow[_fkCloudCol(kv.key)] = parent;
+        }
+      }
+      final staff = (StaffAudit.displayName ?? StaffAudit.username ?? '').trim();
+      cloudRow['dup_key'] = _dupKey(table, payload);
+      cloudRow['is_deleted'] = false;
+      cloudRow['staff_name'] = staff;
+      cloudRow['updated_at'] = DateTime.now().toUtc().toIso8601String();
+      final ok = await _httpUpsertIds(_cloudTable(table), [cloudRow]);
+      if (ok.contains(syncId)) await _saveHash(db, syncId, hash);
+      try {
+        await db.insert(
+          'sync_known',
+          {'sync_id': syncId, 'table_name': table},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      } catch (_) {}
+    } catch (e) {
+      debugPrint('HubSync pushNow $table: $e');
+    }
+  }
+
+  static Future<void> _queuePendingDelete(String localTable, String syncId) async {
+    final sid = syncId.trim();
+    final table = localTable.trim();
+    if (sid.isEmpty || table.isEmpty) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.insert(
+        'sync_pending_delete',
+        {'sync_id': sid, 'table_name': table},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      markDirty();
+    } catch (_) {}
+  }
+
+  static Future<void> _removePendingDelete(String syncId) async {
+    if (syncId.trim().isEmpty) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.delete(
+        'sync_pending_delete',
+        where: 'sync_id = ?',
+        whereArgs: [syncId.trim()],
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> _clearPendingDeleteMeta(String syncId) async {
+    final sid = syncId.trim();
+    if (sid.isEmpty) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.delete('sync_known', where: 'sync_id = ?', whereArgs: [sid]);
+      await db.delete('sync_hash', where: 'sync_id = ?', whereArgs: [sid]);
+      await db.delete('sync_alias', where: 'sync_id = ?', whereArgs: [sid]);
+    } catch (_) {}
+  }
+
+  /// Offline delete queue — soft-mark + delayed hard delete.
+  static Future<void> _pushPendingDeletes() async {
+    if (!SupabaseConfig.isConfigured) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      final pending = await db.query(
+        'sync_pending_delete',
+        columns: ['table_name', 'sync_id', 'queued_at'],
+        orderBy: 'queued_at ASC',
+      );
+      for (final row in pending) {
+        final table = (row['table_name'] ?? '').toString().trim();
+        final sid = (row['sync_id'] ?? '').toString().trim();
+        if (table.isEmpty || sid.isEmpty) continue;
+        await _softMarkCloudDeleted(table, sid);
+        if (!_pendingDeleteAged((row['queued_at'] ?? '').toString(), 45)) {
+          continue;
+        }
+        if (await _hardDeleteCloudRow(table, sid)) {
+          await _removePendingDelete(sid);
+        }
+      }
+    } catch (e) {
+      debugPrint('HubSync pending deletes: $e');
+    }
+  }
+
+  static bool _pendingDeleteAged(String queuedAt, int minSec) {
+    final q = queuedAt.trim();
+    if (q.isEmpty) return true;
+    var dt = DateTime.tryParse(q);
+    dt ??= DateTime.tryParse(q.replaceFirst(' ', 'T'));
+    if (dt == null) return true;
+    return DateTime.now().difference(dt).inSeconds >= minSec;
+  }
+
+  /// Soft-delete signal + queue hard delete. Doosre devices pull pe delete.
+  static Future<bool> _pushDeletedOne(String localTable, String syncId) async {
+    final sid = syncId.trim();
+    final table = localTable.trim();
+    if (sid.isEmpty || table.isEmpty) return true;
+    await _queuePendingDelete(table, sid);
+    if (!SupabaseConfig.isConfigured) return false;
+    final softOk = await _softMarkCloudDeleted(table, sid);
+    await _clearPendingDeleteMeta(sid);
+    return softOk;
+  }
+
+  static Future<bool> _softMarkCloudDeleted(
+    String localTable,
+    String syncId,
+  ) async {
+    final sid = syncId.trim();
+    final table = localTable.trim();
+    if (sid.isEmpty || table.isEmpty) return true;
+    try {
+      if (!await _ensureSb()) return false;
+      await Supabase.instance.client.from(_cloudTable(table)).update({
+        'is_deleted': true,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('sync_id', sid);
+      return true;
+    } catch (e) {
+      debugPrint('HubSync soft-delete $table $e');
+      return false;
+    }
+  }
+
+  static Future<bool> _hardDeleteCloudRow(
+    String localTable,
+    String syncId,
+  ) async {
+    final sid = syncId.trim();
+    final table = localTable.trim();
+    if (sid.isEmpty || table.isEmpty) return true;
+    try {
+      if (!await _ensureSb()) return false;
+      await Supabase.instance.client
+          .from(_cloudTable(table))
+          .delete()
+          .eq('sync_id', sid);
+      // Verify — RLS no-op catch
+      try {
+        final left = await Supabase.instance.client
+            .from(_cloudTable(table))
+            .select('sync_id')
+            .eq('sync_id', sid)
+            .limit(1);
+        if (left.isNotEmpty) {
+          await _softMarkCloudDeleted(table, sid);
+          return false;
+        }
+      } catch (_) {}
+      return true;
+    } catch (e) {
+      debugPrint('HubSync hard-delete $table $e');
+      return false;
+    }
+  }
+
+  /// Local delete ke baad cloud soft+hard delete queue.
+  static Future<void> pushDeleted(String localTable, String syncId) async {
+    await _pushDeletedOne(localTable, syncId);
+  }
+
+  /// Cloud login hard delete — username wale users Supabase se hatao.
+  static Future<void> pushDeletedUsername(String username) async {
+    final un = username.trim();
+    if (un.isEmpty) return;
+    try {
+      if (!await _ensureSb()) return;
+      await Supabase.instance.client
+          .from('users')
+          .delete()
+          .filter('username', 'ilike', un);
+    } catch (e) {
+      debugPrint('HubSync hard-delete username $e');
+    }
+  }
+
+  static Future<void> ensureLocalSchema() async {
+    final db = await AppDatabase.instance.database;
+    try {
+      await BlockMonthlyStore.ensureSchema(db);
+    } catch (_) {}
+    try {
+      await reconcileOneActiveCustomerPlots(db);
+    } catch (_) {}
+    try {
+      await BlockMonthlyStore.applyToEmptyActive();
+    } catch (_) {}
+    await db.execute(
+      'CREATE TABLE IF NOT EXISTS sync_state (k TEXT PRIMARY KEY, v TEXT)',
+    );
+    await db.execute(
+      'CREATE TABLE IF NOT EXISTS sync_known (sync_id TEXT PRIMARY KEY, table_name TEXT)',
+    );
+    await db.execute(
+      'CREATE TABLE IF NOT EXISTS sync_hash (sync_id TEXT PRIMARY KEY, row_hash TEXT)',
+    );
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS sync_alias (
+  sync_id TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  local_pk INTEGER NOT NULL
+)''');
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS sync_pending_delete (
+  sync_id TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  queued_at TEXT DEFAULT (datetime('now','localtime'))
+)''');
+    for (final t in _tables) {
+      if (!await _tableExists(db, t)) continue;
+      if (!await _hasColumn(db, t, 'sync_id')) {
+        await db.execute('ALTER TABLE "$t" ADD COLUMN sync_id TEXT');
+      }
+      await db.execute(
+        "UPDATE \"$t\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)=''",
+      );
+    }
+    await _seedHashesIfAlreadySynced();
+    if (await _getState('sync_schema') != '8') {
+      await _setState('last_pull_utc', '');
+      await _setState('first_pull_done', '');
+      await _setState('sync_schema', '8');
+      await _setState('alias_backfill_done', '');
+    }
+    if (SupabaseConfig.isConfigured && await _getState('alias_backfill_done') != '1') {
+      try {
+        await _backfillSyncAliases();
+        await _setState('alias_backfill_done', '1');
+      } catch (_) {}
+    }
+  }
+
+  static bool _lastGetOk = false;
+  static bool _sbReady = false;
+
+  static Future<bool> _ensureSb() async {
+    if (_sbReady) return true;
+    await SupabaseConfig.load();
+    if (!SupabaseConfig.isConfigured) return false;
+    try {
+      if (Supabase.instance.isInitialized) {
+        _sbReady = true;
+        return true;
+      }
+    } catch (_) {}
+    try {
+      await Supabase.initialize(
+        url: SupabaseConfig.url,
+        anonKey: SupabaseConfig.anonKey,
+      );
+      _sbReady = true;
+      return true;
+    } catch (e) {
+      try {
+        if (Supabase.instance.isInitialized) {
+          _sbReady = true;
+          return true;
+        }
+      } catch (_) {}
+      debugPrint('HubSync supabase init: $e');
+      return false;
+    }
+  }
+
+  static Future<void> start() async {
+    await SupabaseConfig.load();
+    await _ensureSb();
+    await ensureLocalSchema();
+    _timer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(tick());
+    });
+    // App start: push-first + stale force-recover (tick body)
+    markDirty();
+    unawaited(tick());
+  }
+
+  static Future<void> tick() async {
+    if (_manualHold > 0) return;
+    if (_inFlight != null) {
+      try {
+        await _inFlight;
+      } catch (_) {}
+      return;
+    }
+    _inFlight = _tickBody();
+    try {
+      await _inFlight;
+    } catch (_) {
+    } finally {
+      _inFlight = null;
+    }
+  }
+
+  static Future<void> _tickBody() async {
+    try {
+      if (!await _ensureSb()) {
+        debugPrint('HubSync: Supabase not ready');
+        return;
+      }
+      // Background = WinForms-style but ALWAYS push-first (anti-wipe).
+      final restoreFirst = await _getState('restore_push_first') == '1';
+      if (restoreFirst || _dirty || await _hasPendingDeletes()) {
+        await _pushLocalFirst();
+      }
+      if (await _needsFullPull()) {
+        await _fullPullAllTables();
+      } else {
+        await _pullIncremental();
+      }
+      await _mirrorUsersFromCloud();
+      if (_dirty && await _canPush()) {
+        debugPrint('HubSync pushing local changes');
+        await _pushChanged();
+        _dirty = false;
+      }
+      final stale = await _looksStaleLocal();
+      if (stale &&
+          DateTime.now().difference(_lastForceRecoverBg).inSeconds >= 90) {
+        // Old/stale local: insert-missing-only — NO wipe / NO prune for this path
+        debugPrint('HubSync stale local → force recover missing (background)');
+        await forceRecoverMissingFromCloud();
+        try {
+          await reconcileOneActiveCustomerPlots();
+        } catch (_) {}
+        _lastForceRecoverBg = DateTime.now();
+        _bump();
+      } else if (await _getState('first_pull_done') == '1' &&
+          DateTime.now().difference(_lastCatchUp).inSeconds >= 30) {
+        await _catchUpMissing();
+        _lastCatchUp = DateTime.now();
+      }
+      // Stale pe prune skip — empty/old cloud se local mat mitao
+      if (!stale && await _getState('first_pull_done') == '1') {
+        await _pruneGoneFromCloud();
+      }
+    } catch (e, st) {
+      debugPrint('HubSync tick: $e\n$st');
+    }
+  }
+
+  /// WinForms CanPush: first_pull done OR dirty / pending deletes.
+  /// Stuck first_pull pe bhi local data cloud pe ja sake (anti-wipe restore).
+  static Future<bool> _canPush() async {
+    if (!SupabaseConfig.isConfigured) return false;
+    if (await _getState('first_pull_done') == '1') return true;
+    if (_dirty) return true;
+    return await _hasPendingDeletes();
+  }
+
+  static Future<bool> _hasPendingDeletes() async {
+    try {
+      final db = await AppDatabase.instance.database;
+      final rows = await db.rawQuery(
+        'SELECT 1 FROM sync_pending_delete LIMIT 1',
+      );
+      return rows.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Cloud users are the login source. One username → one local row.
+  static Future<void> _mirrorUsersFromCloud() async {
+    try {
+      final got = await _sbSelect(
+        'users',
+        from: 0,
+        to: 499,
+        includeDeleted: false,
+      );
+      if (!got.ok) return;
+      // Empty / failed cloud = local login wipe mat karo (WinForms early return).
+      if (got.rows.isEmpty) return;
+      await _applyFetched(
+        _asApplyRows('users', got.rows),
+        notify: false,
+        bump: false,
+      );
+      final live = <String>{};
+      for (final r in got.rows) {
+        final un = (r['username'] ?? '').toString().trim().toLowerCase();
+        if (un.isNotEmpty) live.add(un);
+      }
+      final db = await AppDatabase.instance.database;
+      if (!await _tableExists(db, 'users')) return;
+      final local = await db.query('users');
+      for (final r in local) {
+        final un = (r['username'] ?? '').toString().trim().toLowerCase();
+        final sid = (r['sync_id'] ?? '').toString().trim();
+        if (un.isEmpty) continue;
+        if (live.contains(un)) continue;
+        if (sid.isEmpty) continue;
+        if (AuthStore.isBuiltInAdminUsername(un)) continue;
+        await db.delete('users', where: 'userID = ?', whereArgs: [r['userID']]);
+      }
+    } catch (e) {
+      debugPrint('HubSync mirror users: $e');
+    }
+    try {
+      await AppDatabase.ensureDefaultAdmin();
+    } catch (_) {}
+  }
+
+  /// Cloud duplicate sync_ids → local PK (WinForms BackfillSyncAliases).
+  static Future<void> _backfillSyncAliases() async {
+    if (!await _ensureSb()) return;
+    final db = await AppDatabase.instance.database;
+    await _aliasCloudTable(
+      db,
+      'customers',
+      'customers',
+      (row) async {
+        final n = (row['name'] ?? '').toString().trim().toLowerCase();
+        final m = (row['mobile'] ?? '').toString();
+        final c = (row['cnic'] ?? '').toString();
+        final found = await db.query(
+          'customers',
+          columns: ['id'],
+          where:
+              "lower(trim(ifnull(name,''))) = ? AND ifnull(mobile,'') = ? AND ifnull(cnic,'') = ?",
+          whereArgs: [n, m, c],
+          limit: 1,
+        );
+        if (found.isEmpty) return null;
+        return int.tryParse(found.first['id']?.toString() ?? '');
+      },
+    );
+    await _aliasCloudTable(
+      db,
+      'brokers',
+      'brokers',
+      (row) async {
+        final n = (row['name'] ?? '').toString().trim().toLowerCase();
+        final p = (row['phone'] ?? '').toString();
+        final found = await db.query(
+          'brokers',
+          columns: ['id'],
+          where:
+              "lower(trim(ifnull(name,''))) = ? AND ifnull(phone,'') = ?",
+          whereArgs: [n, p],
+          limit: 1,
+        );
+        if (found.isEmpty) return null;
+        return int.tryParse(found.first['id']?.toString() ?? '');
+      },
+    );
+    await _aliasCloudTable(
+      db,
+      'customer_plots',
+      'customer_plots',
+      (row) async {
+        final cs = (row['customer_sync_id'] ?? '').toString();
+        final ps = (row['plot_sync_id'] ?? '').toString();
+        final cust = await _localIdBySync(db, 'customers', cs);
+        final plot = await _localIdBySync(db, 'plots', ps);
+        if (cust == null || plot == null) return null;
+        // Sirf empty sync_id — alag sync_id wali rows ko alias se merge mat karo
+        final found = await db.query(
+          'customer_plots',
+          columns: ['id'],
+          where: "customer_id = ? AND plot_id = ? AND ifnull(sync_id,'') = ''",
+          whereArgs: [cust, plot],
+          limit: 1,
+        );
+        if (found.isEmpty) return null;
+        return int.tryParse(found.first['id']?.toString() ?? '');
+      },
+    );
+  }
+
+  static Future<void> _aliasCloudTable(
+    DatabaseExecutor db,
+    String cloudTable,
+    String localTable,
+    Future<int?> Function(Map<String, dynamic> row) findLocalPk,
+  ) async {
+    if (!await _tableExists(db, localTable)) return;
+    for (var page = 0; page < 20; page++) {
+      final got = await _sbSelect(
+        cloudTable,
+        from: page * 500,
+        to: page * 500 + 499,
+      );
+      if (!got.ok || got.rows.isEmpty) break;
+      for (final row in got.rows) {
+        final cloudSync = (row['sync_id'] ?? '').toString().trim();
+        if (cloudSync.isEmpty) continue;
+        final localPk = await findLocalPk(row);
+        if (localPk == null || localPk <= 0) continue;
+        final bySync = await _localIdBySync(db, localTable, cloudSync);
+        if (bySync == localPk) continue;
+        await saveSyncAlias(db, localTable, cloudSync, localPk);
+      }
+      if (got.rows.length < 500) break;
+    }
+  }
+
+  static Future<void> _dedupeLocalUser(
+    DatabaseExecutor db,
+    String username,
+    String keepSyncId,
+  ) async {
+    final un = username.trim();
+    if (un.isEmpty) return;
+    if (AuthStore.isBuiltInAdminUsername(un)) return;
+    try {
+      await db.delete(
+        'users',
+        where:
+            "lower(trim(ifnull(username,''))) = lower(trim(?)) AND ifnull(sync_id,'') <> ?",
+        whereArgs: [un, keepSyncId],
+      );
+    } catch (_) {}
+  }
+
+  static Future<int> _localRowCount(String table) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      if (!await _tableExists(db, table)) return 0;
+      final rows = await db.rawQuery('SELECT COUNT(*) AS c FROM "$table"');
+      return int.tryParse((rows.first['c'] ?? '0').toString()) ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  static Future<int> _cloudRowCount(String table) async {
+    final got = await _sbSelect(
+      _cloudTable(table),
+      from: 0,
+      to: 0,
+      columns: 'sync_id',
+    );
+    if (!got.ok) return -1;
+    return got.rows.isEmpty ? 0 : 1;
+  }
+
+  /// WinForms NeedsFullPull — sirf pehli baar. Empty allocate → Force Recover missing, not wipe-pull.
+  static Future<bool> _needsFullPull() async {
+    return await _getState('first_pull_done') != '1';
+  }
+
+  /// Old/stale local (wipe risk / missing cloud rows): insert-missing Force Recover path.
+  static Future<bool> _looksStaleLocal() async {
+    if (await _getState('first_pull_done') != '1') return true;
+    if (await _getState('sync_schema') != '8') return true;
+    final last = (await _getState('last_pull_utc')).trim();
+    if (last.isEmpty) return true;
+    final dt = DateTime.tryParse(last);
+    if (dt != null &&
+        DateTime.now().toUtc().difference(dt.toUtc()).inDays >= 14) {
+      return true;
+    }
+    for (final t in const ['customer_plots', 'customers', 'receipts']) {
+      if (await _localRowCount(t) != 0) continue;
+      final cloud = await _cloudRowCount(t);
+      if (cloud > 0) return true;
+    }
+    return false;
+  }
+
+  static Future<void> _resetPullState() async {
+    await _setState('first_pull_done', '');
+    await _setState('last_pull_utc', '');
+    await _setState('push_hashes_ready', '');
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.delete('sync_hash');
+      await db.delete('sync_known');
+    } catch (_) {}
+  }
+
+  static Future<void> _fullPullAllTables() async {
+    var maxTs = '1970-01-01T00:00:00.000Z';
+    var anyOk = false;
+    var anyFail = false;
+    final fetched = await Future.wait(_tables.map((table) async {
+      final cloud = _cloudTable(table);
+      final all = <Map<String, dynamic>>[];
+      var ok = true;
+      for (var page = 0; page < 60; page++) {
+        final from = page * 500;
+        final got = await _sbSelect(
+          cloud,
+          from: from,
+          to: from + 499,
+        );
+        if (!got.ok) {
+          ok = false;
+          break;
+        }
+        if (got.rows.isEmpty) break;
+        all.addAll(got.rows);
+        if (got.rows.length < 500) break;
+      }
+      return (table: table, rows: all, ok: ok);
+    }));
+    final bag = <Map<String, dynamic>>[];
+    for (final item in fetched) {
+      if (!item.ok) {
+        anyFail = true;
+      } else {
+        anyOk = true;
+      }
+      if (item.rows.isEmpty) continue;
+      bag.addAll(_asApplyRows(item.table, item.rows));
+      for (final row in item.rows) {
+        final ts = (row['updated_at'] ?? '').toString();
+        if (ts.compareTo(maxTs) > 0) maxTs = ts;
+      }
+    }
+    if (bag.isNotEmpty) {
+      await _applyFetched(bag, notify: false, bump: false);
+    }
+    if (maxTs == '1970-01-01T00:00:00.000Z') {
+      maxTs = DateTime.now().toUtc().toIso8601String();
+    }
+    if (anyOk && !anyFail) {
+      await _setState('last_pull_utc', maxTs);
+      await _setState('first_pull_done', '1');
+    }
+    _bump();
+    debugPrint(
+      'HubSync full pull ok=$anyOk fail=$anyFail getOk=$_lastGetOk '
+      'customers=${await _localRowCount('customers')} '
+      'plots=${await _localRowCount('plots')} '
+      'alloc=${await _localRowCount('customer_plots')} '
+      'receipts=${await _localRowCount('receipts')}',
+    );
+  }
+
+  static String _base() =>
+      SupabaseConfig.url.replaceAll(RegExp(r'/$'), '');
+
+  static Future<Set<String>> _httpUpsertIds(
+    String cloud,
+    List<Map<String, Object?>> rows,
+  ) async {
+    final okIds = <String>{};
+    if (rows.isEmpty) return okIds;
+    if (!await _ensureSb()) return okIds;
+    try {
+      final payload =
+          rows.map((r) => Map<String, dynamic>.from(r)).toList();
+      await Supabase.instance.client.from(cloud).upsert(
+            payload,
+            onConflict: 'sync_id',
+          );
+      for (final r in rows) {
+        final id = (r['sync_id'] ?? '').toString();
+        if (id.isNotEmpty) okIds.add(id);
+      }
+      return okIds;
+    } catch (e) {
+      debugPrint('HubSync UPSERT $cloud $e');
+      if (rows.length > 1) {
+        for (final row in rows) {
+          okIds.addAll(await _httpUpsertIds(cloud, [row]));
+        }
+      } else if (cloud == 'users' && rows.length == 1) {
+        final sid = await _mergeUserIntoLive(rows.first);
+        if (sid != null && sid.isNotEmpty) okIds.add(sid);
+      }
+    }
+    return okIds;
+  }
+
+  static Future<String?> _mergeUserIntoLive(Map<String, Object?> row) async {
+    try {
+      final un = (row['username'] ?? '').toString().trim();
+      if (un.isEmpty) return null;
+      final got = await Supabase.instance.client
+          .from('users')
+          .select('sync_id')
+          .eq('is_deleted', false)
+          .ilike('username', un)
+          .limit(1);
+      final list = (got as List)
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      if (list.isEmpty) return null;
+      final liveSid = (list.first['sync_id'] ?? '').toString().trim();
+      if (liveSid.isEmpty) return null;
+      final merged = Map<String, Object?>.from(row);
+      merged['sync_id'] = liveSid;
+      merged['is_deleted'] = false;
+      await Supabase.instance.client.from('users').upsert(
+            [Map<String, dynamic>.from(merged)],
+            onConflict: 'sync_id',
+          );
+      final db = await AppDatabase.instance.database;
+      await db.update(
+        'users',
+        {'sync_id': liveSid},
+        where: "lower(trim(ifnull(username,''))) = lower(trim(?))",
+        whereArgs: [un],
+      );
+      return liveSid;
+    } catch (e) {
+      debugPrint('HubSync merge user: $e');
+      return null;
+    }
+  }
+
+  static Future<void> _seedHashesIfAlreadySynced() async {
+    final last = await _getState('last_pull_utc');
+    if (last.trim().isEmpty) return;
+    if (await _getState('push_hashes_ready') == '1') return;
+    final db = await AppDatabase.instance.database;
+    for (final table in _tables) {
+      if (!await _tableExists(db, table)) continue;
+      final rows = await db.rawQuery('SELECT * FROM "$table"');
+      for (final r in rows) {
+        final payload = Map<String, Object?>.from(r);
+        final syncId = (payload['sync_id'] ?? '').toString();
+        if (syncId.trim().isEmpty) continue;
+        await _saveHash(db, syncId, _rowHash(payload));
+      }
+    }
+    await _setState('push_hashes_ready', '1');
+  }
+
+  static Future<void> _pushChanged() async {
+    final db = await AppDatabase.instance.database;
+    final staff = (StaffAudit.displayName ?? StaffAudit.username ?? '').trim();
+    final batch = <Map<String, Object?>>[];
+
+    Future<void> flush() async {
+      if (batch.isEmpty) return;
+      final grouped = <String, List<Map<String, Object?>>>{};
+      for (final row in batch) {
+        final t = (row.remove('_cloud_table') ?? '').toString();
+        if (t.isEmpty) continue;
+        grouped.putIfAbsent(t, () => []).add(row);
+      }
+      for (final e in grouped.entries) {
+        final hashes = <String, String>{};
+        for (final row in e.value) {
+          final sid = (row['sync_id'] ?? '').toString();
+          final h = (row.remove('_row_hash') ?? '').toString();
+          if (sid.isNotEmpty && h.isNotEmpty) hashes[sid] = h;
+        }
+        final ok = await _httpUpsertIds(e.key, e.value);
+        for (final id in ok) {
+          final h = hashes[id];
+          if (h != null) await _saveHash(db, id, h);
+        }
+      }
+      batch.clear();
+    }
+
+    final cloudUserSync = <String, String>{};
+    try {
+      final got = await _sbSelect('users', from: 0, to: 499);
+      if (got.ok) {
+        for (final r in got.rows) {
+          final un = (r['username'] ?? '').toString().trim().toLowerCase();
+          final sid = (r['sync_id'] ?? '').toString().trim();
+          if (un.isNotEmpty && sid.isNotEmpty) cloudUserSync[un] = sid;
+        }
+      }
+    } catch (_) {}
+
+    for (final table in _tables) {
+      if (!await _tableExists(db, table)) continue;
+      await db.execute(
+        "UPDATE \"$table\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)=''",
+      );
+      final rows = await db.rawQuery('SELECT * FROM "$table"');
+      // Empty local table → kuch upload mat karo (destructive empty overwrite avoid)
+      if (rows.isEmpty) continue;
+      for (final r in rows) {
+        final payload = Map<String, Object?>.from(r);
+        var syncId = (payload['sync_id'] ?? '').toString();
+        if (syncId.trim().isEmpty) continue;
+        if (table.toLowerCase() == 'users') {
+          final un = (payload['username'] ?? '').toString().trim().toLowerCase();
+          final keep = un.isEmpty ? '' : (cloudUserSync[un] ?? '');
+          if (keep.isNotEmpty && keep != syncId) {
+            final old = syncId;
+            await db.update(
+              'users',
+              {'sync_id': keep},
+              where: 'sync_id = ?',
+              whereArgs: [old],
+            );
+            payload['sync_id'] = keep;
+            syncId = keep;
+            unawaited(pushDeleted('users', old));
+          }
+        }
+        final fks = _fks[table];
+        if (fks != null) {
+          for (final kv in fks.entries) {
+            final fkVal = payload[kv.key];
+            if (fkVal == null) continue;
+            final parent = await _lookupSyncId(db, kv.value, fkVal);
+            if (parent.isNotEmpty) payload['__fk_${kv.key}'] = parent;
+          }
+        }
+        final hash = _rowHash(payload);
+        if (await _loadHash(db, syncId) == hash) continue;
+
+        final dupKey = _dupKey(table, payload);
+        final cloudRow = _localToCloudRow(table, payload);
+        if (fks != null) {
+          for (final kv in fks.entries) {
+            final fkVal = payload[kv.key];
+            if (fkVal == null) continue;
+            final parent = await _lookupSyncId(db, kv.value, fkVal);
+            if (parent.isNotEmpty) cloudRow[_fkCloudCol(kv.key)] = parent;
+          }
+        }
+        cloudRow['dup_key'] = dupKey;
+        cloudRow['is_deleted'] = false;
+        cloudRow['staff_name'] = staff;
+        cloudRow['updated_at'] = DateTime.now().toUtc().toIso8601String();
+        cloudRow['_cloud_table'] = _cloudTable(table);
+        cloudRow['_row_hash'] = hash;
+        batch.add(cloudRow);
+        if (batch.length >= 40) await flush();
+      }
+    }
+    await flush();
+    await _setState('push_hashes_ready', '1');
+  }
+
+  static Future<String> _lookupSyncId(Database db, String table, Object id) async {
+    try {
+      if (!await _tableExists(db, table)) return '';
+      final pk = _pk(table);
+      final rows = await db.rawQuery(
+        'SELECT sync_id FROM "$table" WHERE "$pk" = ? LIMIT 1',
+        [id],
+      );
+      if (rows.isEmpty) return '';
+      return (rows.first['sync_id'] ?? '').toString();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<void> _catchUpMissing() async {
+    try {
+      final db = await AppDatabase.instance.database;
+      // Stale content-dup aliases wipe union rows — clear union-safe tables
+      await db.delete(
+        'sync_alias',
+        where:
+            "lower(table_name) IN ('partner_money','receipts','customer_plots')",
+      );
+    } catch (_) {}
+    for (final table in _tables) {
+      final cloud = _cloudTable(table);
+      final db = await AppDatabase.instance.database;
+      // Sirf isi table ke sync_id (+ isi table ke alias) — global alias se missing skip na ho
+      final local = await _localSyncIdsForTable(db, table);
+      for (var page = 0; page < 60; page++) {
+        final from = page * 1000;
+        final got = await _sbSelect(
+          cloud,
+          from: from,
+          to: from + 999,
+          columns: 'sync_id',
+          orderBy: 'sync_id',
+        );
+        if (!got.ok || got.rows.isEmpty) break;
+        final missing = <String>[];
+        for (final row in got.rows) {
+          final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
+          if (id.isNotEmpty && !local.contains(id)) missing.add(id);
+        }
+        for (var i = 0; i < missing.length; i += 30) {
+          final end = (i + 30 < missing.length) ? i + 30 : missing.length;
+          final chunk = missing.sublist(i, end);
+          final fetched = await _sbSelect(
+            cloud,
+            from: 0,
+            to: chunk.length + 5,
+            syncIds: chunk,
+          );
+          if (fetched.rows.isNotEmpty) {
+            await _applyFetched(
+              _asApplyRows(table, fetched.rows),
+              notify: false,
+              bump: false,
+            );
+            for (final r in fetched.rows) {
+              final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+              if (id.isNotEmpty) local.add(id);
+            }
+          }
+        }
+        if (got.rows.length < 1000) break;
+      }
+    }
+    _bump();
+  }
+
+  /// Catch-up ke liye: isi table ki rows ke sync_id only (alias missing hide nahi kare).
+  static Future<Set<String>> _localSyncIdsForTable(
+    DatabaseExecutor db,
+    String table,
+  ) async {
+    final ids = <String>{};
+    try {
+      if (await _tableExists(db, table) &&
+          await _hasColumn(db, table, 'sync_id')) {
+        final rows = await db.rawQuery(
+          'SELECT sync_id FROM "$table" WHERE sync_id IS NOT NULL AND TRIM(sync_id)<>\'\'',
+        );
+        for (final r in rows) {
+          final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+          if (id.isNotEmpty) ids.add(id);
+        }
+      }
+    } catch (_) {}
+    return ids;
+  }
+
+  static Future<void> _pullIncremental() async {
+    var since = await _getState('last_pull_utc');
+    if (since.trim().isEmpty) since = '1970-01-01T00:00:00.000Z';
+    var maxTs = since;
+    final bag = <Map<String, dynamic>>[];
+    final fetched = await Future.wait(_tables.map((table) async {
+      final cloud = _cloudTable(table);
+      final all = <Map<String, dynamic>>[];
+      for (var page = 0; page < 40; page++) {
+        final from = page * 200;
+        final got = await _sbSelect(
+          cloud,
+          from: from,
+          to: from + 199,
+          updatedAfter: since,
+          includeDeleted: true,
+        );
+        if (!got.ok || got.rows.isEmpty) break;
+        all.addAll(got.rows);
+        if (got.rows.length < 200) break;
+      }
+      return (table: table, rows: all);
+    }));
+    for (final item in fetched) {
+      if (item.rows.isEmpty) continue;
+      bag.addAll(_asApplyRows(item.table, item.rows));
+      for (final row in item.rows) {
+        final ts = (row['updated_at'] ?? '').toString();
+        if (ts.compareTo(maxTs) > 0) maxTs = ts;
+      }
+    }
+    if (bag.isNotEmpty) await _applyFetched(bag);
+    if (maxTs.compareTo(since) > 0) await _setState('last_pull_utc', maxTs);
+  }
+
+  static Future<({bool ok, List<Map<String, dynamic>> rows})> _sbSelect(
+    String cloud, {
+    required int from,
+    required int to,
+    String columns = '*',
+    String orderBy = 'updated_at',
+    String? updatedAfter,
+    List<String>? syncIds,
+    bool includeDeleted = false,
+  }) async {
+    try {
+      if (!await _ensureSb()) {
+        return (ok: false, rows: <Map<String, dynamic>>[]);
+      }
+      var q = Supabase.instance.client.from(cloud).select(columns);
+      if (!includeDeleted) {
+        q = q.eq('is_deleted', false);
+      }
+      if (updatedAfter != null && updatedAfter.isNotEmpty) {
+        q = q.gt('updated_at', updatedAfter);
+      }
+      if (syncIds != null && syncIds.isNotEmpty) {
+        q = q.inFilter('sync_id', syncIds);
+      }
+      final data = await q.order(orderBy).range(from, to);
+      _lastGetOk = true;
+      final list = (data as List)
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      return (ok: true, rows: list);
+    } catch (e) {
+      _lastGetOk = false;
+      debugPrint('HubSync GET $cloud $e');
+      return (ok: false, rows: <Map<String, dynamic>>[]);
+    }
+  }
+
+  static Future<Set<String>> _localSyncIds(DatabaseExecutor db) async {
+    final ids = <String>{};
+    for (final t in _tables) {
+      if (!await _tableExists(db, t)) continue;
+      final rows = await db.rawQuery(
+        'SELECT sync_id FROM "$t" WHERE sync_id IS NOT NULL AND TRIM(sync_id)<>\'\'',
+      );
+      for (final r in rows) {
+        final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+        if (id.isNotEmpty) ids.add(id);
+      }
+    }
+    try {
+      final aliases = await db.query('sync_alias', columns: ['sync_id']);
+      for (final r in aliases) {
+        final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+        if (id.isNotEmpty) ids.add(id);
+      }
+    } catch (_) {}
+    return ids;
+  }
+
+  /// Hard delete doosre devices: cloud pe nahi + local hash hai → delete.
+  /// Bulk wipe block. Never-pushed skip. Manual sync pe force=true.
+  static DateTime _lastPrune = DateTime.fromMillisecondsSinceEpoch(0);
+
+  static Future<void> _pruneGoneFromCloud({bool force = false}) async {
+    if (!force && DateTime.now().difference(_lastPrune).inSeconds < 30) return;
+    _lastPrune = DateTime.now();
+    final pending = <String, List<String>>{};
+
+    // Parallel live-id fetch — fast
+    final liveByTable = <String, Set<String>>{};
+    await Future.wait(_tables.map((table) async {
+      final cloud = _cloudTable(table);
+      final live = <String>{};
+      var failed = false;
+      for (var page = 0; page < 80; page++) {
+        final from = page * 1000;
+        final got = await _sbSelect(
+          cloud,
+          from: from,
+          to: from + 999,
+          columns: 'sync_id',
+          orderBy: 'sync_id',
+        );
+        if (!got.ok) {
+          failed = true;
+          break;
+        }
+        if (got.rows.isEmpty) break;
+        for (final row in got.rows) {
+          final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
+          if (id.isNotEmpty) live.add(id);
+        }
+        if (got.rows.length < 1000) break;
+      }
+      if (!failed) liveByTable[table] = live;
+    }));
+
+    final db = await AppDatabase.instance.database;
+    for (final table in _tables.reversed) {
+      final live = liveByTable[table];
+      if (live == null) continue;
+      // Empty / incomplete cloud → local mat mitao (anti-wipe)
+      if (live.isEmpty) continue;
+      if (!await _tableExists(db, table)) continue;
+      if (!await _hasColumn(db, table, 'sync_id')) continue;
+      final local = await db.rawQuery(
+        'SELECT sync_id FROM "$table" WHERE sync_id IS NOT NULL AND TRIM(sync_id)<>\'\'',
+      );
+      final gone = <String>[];
+      for (final r in local) {
+        final sid = (r['sync_id'] ?? '').toString().trim();
+        if (sid.isEmpty) continue;
+        if (live.contains(sid.toLowerCase())) continue;
+        final hash = await _loadHash(db, sid);
+        final known = await _isSyncKnown(db, sid);
+        if (hash.isEmpty && !known) continue;
+        gone.add(sid);
+      }
+      if (gone.isEmpty) continue;
+      // Bulk wipe guard: incomplete cloud (110→78) mat mitao.
+      // Intentional delete soft-mark + pull se aata hai.
+      if (gone.length > 20 &&
+          (live.length < 5 || gone.length * 4 > live.length)) {
+        continue;
+      }
+      // Small tables: agar majority "gone" hai to cloud incomplete samjho
+      if (gone.length >= 3 && gone.length * 2 >= local.length) {
+        continue;
+      }
+      pending[table] = gone;
+    }
+    if (pending.isEmpty) return;
+    await AppDatabase.suspendSyncTriggers(db);
+    try {
+      await db.execute('PRAGMA foreign_keys = OFF');
+      for (final e in pending.entries) {
+        for (final sid in e.value) {
+          await db.delete(e.key, where: 'sync_id = ?', whereArgs: [sid]);
+          await db.delete('sync_known', where: 'sync_id = ?', whereArgs: [sid]);
+          await db.delete('sync_hash', where: 'sync_id = ?', whereArgs: [sid]);
+        }
+      }
+    } finally {
+      await db.execute('PRAGMA foreign_keys = ON');
+      await AppDatabase.restoreSyncTriggers(db);
+    }
+    _bump();
+  }
+
+  static int _tableOrder(String table) {
+    final i = _tables.indexWhere((t) => t.toLowerCase() == table.toLowerCase());
+    return i < 0 ? 500 : i;
+  }
+
+  static bool _rowIsDeleted(Map<String, dynamic> row) {
+    final del = row['is_deleted'];
+    return del == true || del == 1 || del?.toString().toLowerCase() == 'true';
+  }
+
+  static Future<void> _applyFetched(
+    List<Map<String, dynamic>> fetched, {
+    bool notify = true,
+    bool bump = true,
+  }) async {
+    if (fetched.isEmpty) return;
+    fetched.sort((a, b) {
+      final c = _tableOrder((a['table_name'] ?? '').toString())
+          .compareTo(_tableOrder((b['table_name'] ?? '').toString()));
+      if (c != 0) return c;
+      final da = _rowIsDeleted(a) ? 0 : 1;
+      final db = _rowIsDeleted(b) ? 0 : 1;
+      if (da != db) return da.compareTo(db);
+      return (a['sync_id'] ?? '').toString().compareTo((b['sync_id'] ?? '').toString());
+    });
+    if (notify) _pullNotes.clear();
+    final db = await AppDatabase.instance.database;
+    await AppDatabase.suspendSyncTriggers(db);
+    try {
+      await db.execute('PRAGMA foreign_keys = OFF');
+      try {
+        await db.execute('PRAGMA ignore_check_constraints = ON');
+      } catch (_) {}
+      for (var pass = 0; pass < 4; pass++) {
+        for (final row in fetched) {
+          try {
+            await _applyRow(db, row, promptDup: false, notify: notify);
+          } catch (e) {
+            debugPrint('HubSync apply ${(row['table_name'] ?? '')}: $e');
+          }
+        }
+      }
+    } finally {
+      try {
+        await db.execute('PRAGMA ignore_check_constraints = OFF');
+      } catch (_) {}
+      await db.execute('PRAGMA foreign_keys = ON');
+      await AppDatabase.restoreSyncTriggers(db);
+    }
+    // Union-safe pull can land 2 Active on same plot_id (triggers off). Soft-cancel older.
+    try {
+      await reconcileOneActiveCustomerPlots(db);
+    } catch (_) {}
+    if (bump) _bump();
+    if (bump) {
+      try {
+        await HubDuplicateCleanup.run(db);
+      } catch (_) {}
+    }
+  }
+
+  /// Per plot_id: keep newest Active (booking_date → sync_id → id); soft-cancel others.
+  /// Keeps sync_id + receipts; does NOT content-merge distinct sync_ids.
+  static Future<int> reconcileOneActiveCustomerPlots([
+    DatabaseExecutor? existing,
+  ]) async {
+    final db = existing ?? await AppDatabase.instance.database;
+    if (!await _tableExists(db, 'customer_plots')) return 0;
+    final n = await db.rawUpdate('''
+UPDATE customer_plots
+SET status = 'Cancelled',
+    cancelled_date = CASE
+      WHEN cancelled_date IS NULL OR TRIM(IFNULL(cancelled_date,'')) = ''
+      THEN date('now','localtime')
+      ELSE cancelled_date
+    END
+WHERE IFNULL(status,'') = 'Active'
+  AND id IN (
+    SELECT id FROM (
+      SELECT cp.id AS id
+      FROM customer_plots cp
+      WHERE IFNULL(cp.status,'') = 'Active'
+        AND EXISTS (
+          SELECT 1 FROM customer_plots newer
+          WHERE newer.plot_id = cp.plot_id
+            AND IFNULL(newer.status,'') = 'Active'
+            AND newer.id <> cp.id
+            AND (
+              IFNULL(newer.booking_date,'') > IFNULL(cp.booking_date,'')
+              OR (
+                IFNULL(newer.booking_date,'') = IFNULL(cp.booking_date,'')
+                AND IFNULL(newer.sync_id,'') > IFNULL(cp.sync_id,'')
+              )
+              OR (
+                IFNULL(newer.booking_date,'') = IFNULL(cp.booking_date,'')
+                AND IFNULL(newer.sync_id,'') = IFNULL(cp.sync_id,'')
+                AND newer.id > cp.id
+              )
+            )
+        )
+    )
+  )''');
+    if (n > 0) {
+      try {
+        markDirty();
+      } catch (_) {}
+    }
+    return n;
+  }
+
+  static Future<void> _applyRow(
+    DatabaseExecutor db,
+    Map<String, dynamic> row, {
+    bool promptDup = false,
+    bool notify = true,
+  }) async {
+    final table = (row['table_name'] ?? '').toString();
+    final syncId = (row['sync_id'] ?? '').toString();
+    final deleted = row['is_deleted'] == true ||
+        row['is_deleted'] == 1 ||
+        row['is_deleted']?.toString().toLowerCase() == 'true';
+    if (table.isEmpty || syncId.isEmpty) return;
+    if (!await _tableExists(db, table)) return;
+
+    if (deleted) {
+      if (table.toLowerCase() == 'users') {
+        try {
+          final rows = await db.query(
+            'users',
+            columns: ['username'],
+            where: 'sync_id = ?',
+            whereArgs: [syncId],
+            limit: 1,
+          );
+          if (rows.isNotEmpty &&
+              AuthStore.isBuiltInAdminUsername(
+                (rows.first['username'] ?? '').toString(),
+              )) {
+            return;
+          }
+        } catch (_) {}
+      }
+      await db.delete(table, where: 'sync_id = ?', whereArgs: [syncId]);
+      await db.delete('sync_known', where: 'sync_id = ?', whereArgs: [syncId]);
+      await db.delete('sync_hash', where: 'sync_id = ?', whereArgs: [syncId]);
+      if (notify) _noteRemote(row, 'delete', table);
+      return;
+    }
+
+    var payload = _coerceMap(row['payload']);
+    if (payload == null) return;
+    payload['sync_id'] = syncId;
+    _normalizePayload(table, payload);
+
+    final fks = _fks[table];
+    if (fks != null) {
+      for (final kv in fks.entries) {
+        final parentSync = payload['__fk_${kv.key}'];
+        if (parentSync == null) continue;
+        final local = await _localIdBySync(db, kv.value, parentSync.toString());
+        if (local != null) payload[kv.key] = local;
+      }
+    }
+
+    final pk = _pk(table);
+    // Partner Cash / Receipt / Allocate: alias se merge mat karo — warna union wipe
+    final unionSafe = _skipContentDupMerge(table);
+    int? existingBySync = unionSafe
+        ? await _localIdBySyncExact(db, table, syncId)
+        : await _localIdBySync(db, table, syncId);
+    int? existing = existingBySync;
+    if (promptDup && existing == null) {
+      final other = (row['staff_name'] ?? '').toString();
+      final me = (StaffAudit.displayName ?? StaffAudit.username ?? '').trim();
+      if (!_sameStaff(me, other) &&
+          await _localHasDup(db, table, payload, syncId) &&
+          !await _confirmDuplicate(other)) {
+        return;
+      }
+    }
+    if (existing == null && !promptDup && !unionSafe) {
+      existing = await _findDupPk(db, table, payload, syncId);
+    }
+
+    final info = await db.rawQuery('PRAGMA table_info("$table")');
+    final colMap = <String, String>{};
+    for (final c in info) {
+      final n = (c['name'] ?? '').toString();
+      if (n.isEmpty) continue;
+      colMap[n.toLowerCase()] = n;
+    }
+
+    Map<String, Object?> valuesFor(Map<String, Object?> src) {
+      final values = <String, Object?>{};
+      for (final e in src.entries) {
+        if (e.key.startsWith('__fk_')) continue;
+        final actual = colMap[e.key.toLowerCase()];
+        if (actual == null) continue;
+        if (actual.toLowerCase() == pk.toLowerCase()) continue;
+        if (actual.toLowerCase() == 'upass' &&
+            (e.value == null || e.value.toString().trim().isEmpty)) {
+          continue;
+        }
+        if (actual.toLowerCase() == 'upass' &&
+            table.toLowerCase() == 'users' &&
+            AuthStore.isBuiltInAdminUsername(
+              (src['username'] ?? payload['username'] ?? '').toString(),
+            )) {
+          values[actual] = AuthStore.builtInAdminPass;
+          continue;
+        }
+        values[actual] = _sqlVal(e.value);
+      }
+      final syncCol = colMap['sync_id'];
+      if (syncCol != null) values[syncCol] = syncId;
+      return values;
+    }
+
+    if (existing != null && existingBySync == null) {
+      await saveSyncAlias(db, table, syncId, existing);
+    }
+
+    if (existing != null) {
+      final values = valuesFor(payload);
+      if (values.isNotEmpty) {
+        await db.update(table, values, where: '$pk = ?', whereArgs: [existing]);
+      }
+    } else {
+      final values = valuesFor(payload);
+      if (table.toLowerCase() == 'customers') {
+        final n = (values['name'] ?? payload['name'] ?? '').toString().trim();
+        values['name'] = n.isEmpty ? 'Customer' : n;
+      }
+      if (values.isEmpty) return;
+      try {
+        await db.insert(table, values);
+      } catch (e) {
+        if (await _adoptExistingRow(db, table, payload, values)) {
+          // Local unique row now owns this cloud sync_id.
+        } else if (table.toLowerCase() == 'users') {
+          final un = (values['username'] ?? '').toString();
+          if (un.isNotEmpty) {
+            try {
+              await db.update(
+                'users',
+                values,
+                where: "lower(trim(ifnull(username,''))) = lower(trim(?))",
+                whereArgs: [un],
+              );
+            } catch (_) {
+              return;
+            }
+          } else {
+            debugPrint('HubSync insert $table: $e');
+            return;
+          }
+        } else {
+          debugPrint('HubSync insert $table: $e');
+          return;
+        }
+      }
+    }
+    if (table.toLowerCase() == 'users') {
+      await _dedupeLocalUser(
+        db,
+        (payload['username'] ?? '').toString(),
+        syncId,
+      );
+      try {
+        await AppDatabase.ensureDefaultAdmin(db is Database ? db : null);
+      } catch (_) {}
+    }
+    await _saveHash(db, syncId, _rowHash(payload));
+    try {
+      await db.insert(
+        'sync_known',
+        {'sync_id': syncId, 'table_name': table},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (_) {}
+    if (notify) {
+      _noteRemote(row, existing != null ? 'update' : 'entry', table);
+    }
+  }
+
+  static Future<bool> _adoptExistingRow(
+    DatabaseExecutor db,
+    String table,
+    Map<String, Object?> payload,
+    Map<String, Object?> values,
+  ) async {
+    try {
+      switch (table) {
+        case 'customers':
+          final n = (payload['name'] ?? '').toString();
+          if (n.isEmpty) return false;
+          return await db.update(
+                table,
+                values,
+                where:
+                    "lower(trim(ifnull(name,''))) = lower(trim(?)) AND ifnull(mobile,'')=? AND ifnull(cnic,'')=?",
+                whereArgs: [
+                  n,
+                  (payload['mobile'] ?? '').toString(),
+                  (payload['cnic'] ?? '').toString(),
+                ],
+              ) >
+              0;
+        case 'brokers':
+          return await db.update(
+                table,
+                values,
+                where:
+                    "lower(trim(ifnull(name,''))) = lower(trim(?)) AND ifnull(phone,'')=?",
+                whereArgs: [
+                  payload['name'] ?? '',
+                  (payload['phone'] ?? '').toString(),
+                ],
+              ) >
+              0;
+        case 'Person':
+          return await db.update(
+                table,
+                values,
+                where:
+                    "lower(trim(ifnull(name,''))) = lower(trim(?)) AND ifnull(is_owner,0)=? AND ifnull(is_partner,0)=?",
+                whereArgs: [
+                  payload['name'] ?? '',
+                  _to01(payload['is_owner']),
+                  _to01(payload['is_partner']),
+                ],
+              ) >
+              0;
+        case 'plans':
+          final n = (payload['name'] ?? '').toString();
+          if (n.isEmpty) return false;
+          return await db.update(
+                table,
+                values,
+                where: "lower(trim(ifnull(name,''))) = lower(trim(?))",
+                whereArgs: [n],
+              ) >
+              0;
+        // customer_plots / receipts: content adopt nahi — union-safe (Partner Cash pattern)
+        case 'societies':
+          final n = (payload['name'] ?? '').toString();
+          if (n.isEmpty) return false;
+          return await db.update(
+                table,
+                values,
+                where: "lower(trim(ifnull(name,''))) = lower(trim(?))",
+                whereArgs: [n],
+              ) >
+              0;
+        case 'blocks':
+          return await db.update(
+                table,
+                values,
+                where:
+                    "ifnull(society_id,0)=? AND lower(trim(ifnull(name,'')))=lower(trim(?))",
+                whereArgs: [payload['society_id'] ?? 0, payload['name'] ?? ''],
+              ) >
+              0;
+        case 'plot_types':
+          return await db.update(
+                table,
+                values,
+                where:
+                    "ifnull(society_id,0)=? AND lower(trim(ifnull(code,'')))=lower(trim(?))",
+                whereArgs: [payload['society_id'] ?? 0, payload['code'] ?? ''],
+              ) >
+              0;
+        case 'plots':
+          return await db.update(
+                table,
+                values,
+                where:
+                    "ifnull(society_id,0)=? AND ifnull(plot_no,'')=?",
+                whereArgs: [payload['society_id'] ?? 0, payload['plot_no'] ?? ''],
+              ) >
+              0;
+        case 'users':
+          final un = (payload['username'] ?? values['username'] ?? '').toString();
+          if (un.isEmpty) return false;
+          final n = await db.update(
+            'users',
+            values,
+            where: "lower(trim(ifnull(username,''))) = lower(trim(?))",
+            whereArgs: [un],
+          );
+          if (n > 0) {
+            await _dedupeLocalUser(
+              db,
+              un,
+              (values['sync_id'] ?? '').toString(),
+            );
+          }
+          return n > 0;
+        default:
+          return false;
+      }
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Object? _sqlVal(Object? v) {
+    if (v == null) return null;
+    if (v is bool) return v ? 1 : 0;
+    if (v is int || v is double) return v;
+    if (v is num) return v;
+    if (v is DateTime) return v.toUtc().toIso8601String();
+    if (v is Map || v is List) return jsonEncode(v);
+    return v.toString();
+  }
+
+  static void _normalizePayload(String table, Map<String, Object?> p) {
+    for (final k in p.keys.toList()) {
+      p[k] = _sqlVal(p[k]);
+    }
+    final t = table.toLowerCase();
+    if (t == 'receipts') {
+      final m = (p['mode'] ?? '').toString();
+      if (m != 'Cash' && m != 'Bank') {
+        p['mode'] = m.toLowerCase().contains('cash') ? 'Cash' : 'Bank';
+      }
+      if (p['amount'] == null && p['received'] != null) p['amount'] = p['received'];
+    } else if (t == 'plots') {
+      const ok = {'Available', 'Hold', 'Sold'};
+      final s = (p['status'] ?? 'Available').toString();
+      if (!ok.contains(s)) {
+        final low = s.toLowerCase();
+        if (low.contains('sold')) {
+          p['status'] = 'Sold';
+        } else if (low.contains('hold')) {
+          p['status'] = 'Hold';
+        } else {
+          p['status'] = 'Available';
+        }
+      }
+    } else if (t == 'customer_plots') {
+      const ok = {'Active', 'Closed', 'Cancelled', 'Completed'};
+      final s = (p['status'] ?? 'Active').toString();
+      if (!ok.contains(s)) p['status'] = 'Active';
+    } else if (t == 'ledger') {
+      const ok = {
+        'Booking',
+        'InstallmentDue',
+        'Surcharge',
+        'Discount',
+        'ReceiptCash',
+        'ReceiptBank',
+        'Adjustment',
+      };
+      final s = (p['txn_type'] ?? '').toString();
+      if (!ok.contains(s)) p['txn_type'] = 'Adjustment';
+    } else if (t == 'brokers') {
+      if (p['commission_amount_default'] == null) {
+        p['commission_amount_default'] = 0;
+      }
+      if (p['is_active'] == null) p['is_active'] = 1;
+    } else if (t == 'partner_money') {
+      if (p['amount'] == null) p['amount'] = 0;
+      if (p['direction'] == null) p['direction'] = 'In';
+    }
+  }
+
+  static Map<String, Object?>? _coerceMap(Object? o) {
+    if (o == null) return null;
+    if (o is Map<String, Object?>) return Map<String, Object?>.from(o);
+    if (o is Map) {
+      return o.map((k, v) => MapEntry(k.toString(), v));
+    }
+    if (o is String) {
+      try {
+        final d = jsonDecode(o);
+        if (d is Map) return d.map((k, v) => MapEntry(k.toString(), v));
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  static Future<int?> _localIdBySyncExact(
+    DatabaseExecutor db,
+    String table,
+    String syncId,
+  ) async {
+    if (syncId.trim().isEmpty) return null;
+    if (!await _tableExists(db, table)) return null;
+    final pk = _pk(table);
+    final rows = await db.rawQuery(
+      'SELECT "$pk" AS pk FROM "$table" WHERE sync_id = ? LIMIT 1',
+      [syncId],
+    );
+    if (rows.isEmpty) return null;
+    final v = rows.first['pk'];
+    if (v == null) return null;
+    return int.tryParse(v.toString());
+  }
+
+  static Future<int?> _localIdBySync(
+    DatabaseExecutor db,
+    String table,
+    String syncId,
+  ) async {
+    final exact = await _localIdBySyncExact(db, table, syncId);
+    if (exact != null) return exact;
+    try {
+      final alias = await db.query(
+        'sync_alias',
+        columns: ['local_pk'],
+        where: 'sync_id = ? AND lower(table_name) = lower(?)',
+        whereArgs: [syncId, table],
+        limit: 1,
+      );
+      if (alias.isNotEmpty) {
+        return int.tryParse(alias.first['local_pk']?.toString() ?? '');
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<bool> _tableExists(DatabaseExecutor db, String table) async {
+    final rows = await db.rawQuery(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+      [table],
+    );
+    return rows.isNotEmpty;
+  }
+
+  static Future<bool> _hasColumn(
+    DatabaseExecutor db,
+    String table,
+    String col,
+  ) async {
+    final info = await db.rawQuery('PRAGMA table_info("$table")');
+    return info.any(
+      (c) => (c['name'] ?? '').toString().toLowerCase() == col.toLowerCase(),
+    );
+  }
+
+  static Future<String> _getState(String k) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      final rows = await db.query('sync_state', where: 'k = ?', whereArgs: [k]);
+      if (rows.isEmpty) return '';
+      return (rows.first['v'] ?? '').toString();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<void> _setState(String k, String v) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.insert(
+        'sync_state',
+        {'k': k, 'v': v},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (_) {}
+  }
+
+  static Future<String> _loadHash(DatabaseExecutor db, String syncId) async {
+    try {
+      final rows = await db.query(
+        'sync_hash',
+        where: 'sync_id = ?',
+        whereArgs: [syncId],
+      );
+      if (rows.isEmpty) return '';
+      return (rows.first['row_hash'] ?? '').toString();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<bool> _isSyncKnown(DatabaseExecutor db, String syncId) async {
+    try {
+      final rows = await db.query(
+        'sync_known',
+        columns: ['sync_id'],
+        where: 'sync_id = ?',
+        whereArgs: [syncId],
+        limit: 1,
+      );
+      return rows.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> _saveHash(
+    DatabaseExecutor db,
+    String syncId,
+    String hash,
+  ) async {
+    try {
+      await db.insert(
+        'sync_hash',
+        {'sync_id': syncId, 'row_hash': hash},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (_) {}
+  }
+
+  static bool _skipDup(String table) {
+    final t = table.toLowerCase();
+    return t == 'staff_entry_log' ||
+        t == 'users' ||
+        t == 'ledger' ||
+        t == 'staff_role_permissions';
+  }
+
+  static String _p(Map<String, Object?> payload, String key) =>
+      (payload[key] ?? '').toString().trim().toLowerCase();
+
+  static String _sha(String s) =>
+      sha256.convert(utf8.encode(s)).toString();
+
+  static String _dupKey(String table, Map<String, Object?> payload) {
+    if (_skipDup(table)) return '';
+    String raw = '';
+    switch (table) {
+      case 'customers':
+        raw = '${_p(payload, 'name')}|${_p(payload, 'mobile')}|${_p(payload, 'cnic')}';
+      case 'societies':
+        raw = _p(payload, 'name');
+      case 'blocks':
+        raw = '${_p(payload, '__fk_society_id')}|${_p(payload, 'name')}';
+      case 'plot_types':
+        raw = '${_p(payload, '__fk_society_id')}|${_p(payload, 'code')}';
+      case 'plots':
+        raw = '${_p(payload, '__fk_society_id')}|${_p(payload, 'plot_no')}';
+      case 'brokers':
+        raw = '${_p(payload, 'name')}|${_p(payload, 'phone')}';
+      case 'plans':
+        raw = _p(payload, 'name');
+      case 'customer_plots':
+        raw =
+            '${_p(payload, '__fk_customer_id')}|${_p(payload, '__fk_plot_id')}';
+      case 'receipts':
+        raw =
+            '${_p(payload, '__fk_customer_plot_id')}|${_p(payload, 'receipt_date')}|${_p(payload, 'amount')}|${_p(payload, 'mode')}';
+      case 'Expensetbl':
+        raw =
+            '${_p(payload, 'Name')}|${_p(payload, 'Amount')}|${_p(payload, 'EDate')}|${_p(payload, 'Category')}';
+      case 'Person':
+        raw =
+            '${_p(payload, 'name')}|${_p(payload, 'phone')}|${_p(payload, 'is_owner')}|${_p(payload, 'is_partner')}';
+      case 'Deal':
+        raw =
+            '${_p(payload, '__fk_society_id')}|${_p(payload, 'amount')}|${_p(payload, 'deal_date')}';
+      case 'Credit':
+        raw =
+            '${_p(payload, 'amount')}|${_p(payload, 'pay_date')}|${_p(payload, 'note')}';
+      case 'partner_money':
+        raw =
+            '${_p(payload, '__fk_partner_id')}|${_p(payload, 'txn_date')}|${_p(payload, 'amount')}|${_p(payload, 'direction')}|${_p(payload, 'category')}';
+      case 'customer_plot_partners':
+        raw = _p(payload, '__fk_customer_plot_id');
+      case 'block_monthly_installments':
+        raw = _p(payload, '__fk_block_id');
+      default:
+        return '';
+    }
+    if (raw.replaceAll('|', '').trim().isEmpty) return '';
+    return _sha(raw);
+  }
+
+  static String _rowHash(Map<String, Object?> payload) {
+    final keys = payload.keys.toList()
+      ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    final buf = StringBuffer();
+    for (final k in keys) {
+      final lk = k.toLowerCase();
+      if (lk == 'id' ||
+          lk == 'sid' ||
+          lk == 'person_id' ||
+          lk == 'deal_id' ||
+          lk == 'credit_id' ||
+          lk == 'userid' ||
+          lk == 'sync_id') {
+        continue;
+      }
+      buf.write('$k=${payload[k]}|');
+    }
+    return _sha(buf.toString());
+  }
+
+  static bool _sameStaff(String a, String b) {
+    if (a.trim().isEmpty || b.trim().isEmpty) return false;
+    return a.trim().toLowerCase() == b.trim().toLowerCase();
+  }
+
+  static Future<String?> _cloudOtherDup(
+    String table,
+    String dupKey,
+    String mySync,
+  ) async {
+    try {
+      final cloud = _cloudTable(table);
+      final url = Uri.parse(
+        '$_base()/rest/v1/$cloud?dup_key=eq.${Uri.encodeComponent(dupKey)}&is_deleted=eq.false&select=sync_id,staff_name&limit=5',
+      );
+      final resp = await http.get(url, headers: {
+        'apikey': SupabaseConfig.anonKey,
+        'Authorization': 'Bearer ${SupabaseConfig.anonKey}',
+        'Accept': 'application/json',
+      });
+      if (resp.statusCode < 200 || resp.statusCode >= 300) return null;
+      if (resp.body.isEmpty || resp.body == '[]') return null;
+      final decoded = jsonDecode(resp.body);
+      if (decoded is! List) return null;
+      for (final raw in decoded) {
+        if (raw is! Map) continue;
+        final sid = (raw['sync_id'] ?? '').toString();
+        if (sid.toLowerCase() == mySync.toLowerCase()) continue;
+        final staff = (raw['staff_name'] ?? '').toString().trim();
+        return staff.isEmpty ? 'dusri device' : staff;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<bool> _localHasDup(
+    DatabaseExecutor db,
+    String table,
+    Map<String, Object?> payload,
+    String exceptSync,
+  ) async {
+    return await _findDupPk(db, table, payload, exceptSync) != null;
+  }
+
+  static int _to01(Object? v) {
+    if (v == null) return 0;
+    if (v is bool) return v ? 1 : 0;
+    final s = v.toString().trim().toLowerCase();
+    if (s == '1' || s == 'true') return 1;
+    final n = int.tryParse(s);
+    if (n == null) return 0;
+    return n != 0 ? 1 : 0;
+  }
+
+  static bool _skipContentDupMerge(String table) {
+    final t = table.toLowerCase();
+    // Partner Cash / Receipt / Allocate: har sync_id alag row (union merge)
+    return t == 'partner_money' || t == 'receipts' || t == 'customer_plots';
+  }
+
+  static Future<int?> _findDupPk(
+    DatabaseExecutor db,
+    String table,
+    Map<String, Object?> payload,
+    String exceptSync,
+  ) async {
+    try {
+      if (_skipContentDupMerge(table)) return null;
+      final t = table.toLowerCase();
+      if (t == 'users' ||
+          t == 'staff_entry_log' ||
+          t == 'staff_role_permissions') {
+        return null;
+      }
+      if (!await _tableExists(db, table)) return null;
+      List<Map<String, Object?>> rows;
+      if (table == 'customers') {
+        rows = await db.rawQuery(
+          "SELECT id FROM customers WHERE lower(trim(ifnull(name,'')))=? AND ifnull(mobile,'')=? AND ifnull(cnic,'')=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            _p(payload, 'name'),
+            (payload['mobile'] ?? '').toString(),
+            (payload['cnic'] ?? '').toString(),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'societies') {
+        rows = await db.rawQuery(
+          "SELECT id FROM societies WHERE lower(trim(ifnull(name,'')))=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [_p(payload, 'name'), exceptSync],
+        );
+      } else if (table == 'blocks') {
+        rows = await db.rawQuery(
+          "SELECT id FROM blocks WHERE ifnull(society_id,0)=? AND lower(trim(ifnull(name,'')))=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [payload['society_id'] ?? 0, _p(payload, 'name'), exceptSync],
+        );
+      } else if (table == 'plot_types') {
+        rows = await db.rawQuery(
+          "SELECT id FROM plot_types WHERE ifnull(society_id,0)=? AND lower(trim(ifnull(code,'')))=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [payload['society_id'] ?? 0, _p(payload, 'code'), exceptSync],
+        );
+      } else if (table == 'plots') {
+        rows = await db.rawQuery(
+          "SELECT id FROM plots WHERE ifnull(plot_no,'')=? AND ifnull(society_id,0)=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            (payload['plot_no'] ?? '').toString(),
+            payload['society_id'] ?? 0,
+            exceptSync,
+          ],
+        );
+      } else if (table == 'brokers') {
+        rows = await db.rawQuery(
+          "SELECT id FROM brokers WHERE lower(trim(ifnull(name,'')))=? AND ifnull(phone,'')=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            _p(payload, 'name'),
+            (payload['phone'] ?? '').toString(),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'plans') {
+        rows = await db.rawQuery(
+          "SELECT id FROM plans WHERE lower(trim(ifnull(name,'')))=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [_p(payload, 'name'), exceptSync],
+        );
+      } else if (table == 'Person') {
+        rows = await db.rawQuery(
+          "SELECT person_id AS id FROM Person WHERE lower(trim(ifnull(name,'')))=? AND ifnull(is_owner,0)=? AND ifnull(is_partner,0)=? AND ifnull(sync_id,'')<>? ORDER BY person_id LIMIT 1",
+          [
+            _p(payload, 'name'),
+            _to01(payload['is_owner']),
+            _to01(payload['is_partner']),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'customer_plots') {
+        rows = await db.rawQuery(
+          "SELECT id FROM customer_plots WHERE customer_id=? AND plot_id=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            payload['customer_id'] ?? 0,
+            payload['plot_id'] ?? 0,
+            exceptSync,
+          ],
+        );
+      } else if (table == 'receipts') {
+        rows = await db.rawQuery(
+          "SELECT id FROM receipts WHERE customer_plot_id=? AND ifnull(amount,0)=? AND substr(ifnull(receipt_date,''),1,10)=substr(ifnull(?,''),1,10) AND ifnull(mode,'')=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            payload['customer_plot_id'] ?? 0,
+            payload['amount'] ?? payload['received'] ?? 0,
+            payload['receipt_date'] ?? '',
+            (payload['mode'] ?? '').toString(),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'ledger') {
+        rows = await db.rawQuery(
+          "SELECT id FROM ledger WHERE customer_plot_id=? AND ifnull(txn_type,'')=? AND substr(ifnull(txn_date,''),1,10)=substr(ifnull(?,''),1,10) AND ifnull(debit,0)=? AND ifnull(credit,0)=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            payload['customer_plot_id'] ?? 0,
+            (payload['txn_type'] ?? '').toString(),
+            payload['txn_date'] ?? '',
+            payload['debit'] ?? 0,
+            payload['credit'] ?? 0,
+            exceptSync,
+          ],
+        );
+      } else if (table == 'Expensetbl') {
+        rows = await db.rawQuery(
+          "SELECT sid AS id FROM Expensetbl WHERE lower(trim(ifnull(Name,'')))=? AND ifnull(Amount,0)=? AND substr(ifnull(EDate,''),1,10)=substr(ifnull(?,''),1,10) AND ifnull(Category,'')=? AND ifnull(sync_id,'')<>? ORDER BY sid LIMIT 1",
+          [
+            (payload['Name'] ?? payload['name'] ?? '').toString().trim().toLowerCase(),
+            payload['Amount'] ?? 0,
+            payload['EDate'] ?? '',
+            (payload['Category'] ?? '').toString(),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'Deal') {
+        rows = await db.rawQuery(
+          "SELECT deal_id AS id FROM Deal WHERE ifnull(society_id,0)=? AND ifnull(amount,0)=? AND substr(ifnull(deal_date,''),1,10)=substr(ifnull(?,''),1,10) AND ifnull(sync_id,'')<>? ORDER BY deal_id LIMIT 1",
+          [
+            payload['society_id'] ?? 0,
+            payload['amount'] ?? 0,
+            payload['deal_date'] ?? '',
+            exceptSync,
+          ],
+        );
+      } else if (table == 'Credit') {
+        rows = await db.rawQuery(
+          "SELECT credit_id AS id FROM Credit WHERE ifnull(amount,0)=? AND substr(ifnull(pay_date,''),1,10)=substr(ifnull(?,''),1,10) AND ifnull(note,'')=? AND ifnull(sync_id,'')<>? ORDER BY credit_id LIMIT 1",
+          [
+            payload['amount'] ?? 0,
+            payload['pay_date'] ?? '',
+            (payload['note'] ?? '').toString(),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'partner_money') {
+        rows = await db.rawQuery(
+          "SELECT id FROM partner_money WHERE ifnull(partner_id,0)=? AND substr(ifnull(txn_date,''),1,10)=substr(ifnull(?,''),1,10) AND ifnull(amount,0)=? AND ifnull(direction,'')=? AND ifnull(category,'')=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            payload['partner_id'] ?? 0,
+            payload['txn_date'] ?? '',
+            payload['amount'] ?? 0,
+            (payload['direction'] ?? '').toString(),
+            (payload['category'] ?? '').toString(),
+            exceptSync,
+          ],
+        );
+      } else if (table == 'customer_plot_partners') {
+        rows = await db.rawQuery(
+          "SELECT id FROM customer_plot_partners WHERE customer_plot_id=? AND ifnull(partner_id,0)=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [
+            payload['customer_plot_id'] ?? 0,
+            payload['partner_id'] ?? 0,
+            exceptSync,
+          ],
+        );
+      } else if (table == 'block_monthly_installments') {
+        rows = await db.rawQuery(
+          "SELECT id FROM block_monthly_installments WHERE ifnull(block_id,0)=? AND ifnull(sync_id,'')<>? ORDER BY id LIMIT 1",
+          [payload['block_id'] ?? 0, exceptSync],
+        );
+      } else {
+        return null;
+      }
+      if (rows.isEmpty) return null;
+      final id = rows.first['id'];
+      if (id is int) return id;
+      return int.tryParse(id?.toString() ?? '');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<bool> _confirmDuplicate(String staff) async {
+    final ctx = navKey.currentContext;
+    if (ctx == null || !ctx.mounted) return true;
+    final who = staff.trim().isEmpty ? 'dusri device / staff' : staff.trim();
+    final ok = await showDialog<bool>(
+      context: ctx,
+      barrierDismissible: false,
+      builder: (c) => AlertDialog(
+        title: const Text('Duplicate entry'),
+        content: Text("Yeh entry pehle staff '$who' ne ki hai.\n\nSave karein?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(c, false),
+            child: const Text('No'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('Yes'),
+          ),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+}

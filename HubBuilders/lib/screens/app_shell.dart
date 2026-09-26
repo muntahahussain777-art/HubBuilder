@@ -1,8 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../data/dummy_data.dart';
+import '../data/hub_sync.dart';
 import '../data/nav_items.dart';
 import '../data/vendor_store.dart';
+import '../data/staff_access.dart';
+import '../data/staff_audit.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 import 'application_form_screen.dart';
@@ -21,6 +26,18 @@ import 'reports_hub_screen.dart';
 import 'agreement_design_screen.dart';
 import 'info_screen.dart';
 import 'vendor_forms.dart';
+import 'partner_cash_screen.dart';
+import 'vip_partner_cashbook_screen.dart';
+import 'vip_customer_plots_receipts_screen.dart';
+import 'report_preview_screen.dart';
+import 'staff_entry_log_screen.dart';
+import 'backup_restore_screen.dart';
+import 'letter_receipt_screens.dart';
+import 'dues_whatsapp_screen.dart';
+import 'plot_status_owner_screen.dart';
+import 'staff_salary_vip_screen.dart';
+import 'plot_alloc_vip_screen.dart';
+import '../data/reports_store.dart';
 
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
@@ -29,10 +46,38 @@ class AppShell extends StatefulWidget {
   State<AppShell> createState() => _AppShellState();
 }
 
-class _AppShellState extends State<AppShell> {
+class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
   HubRoute _route = HubRoute.home;
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   int _listTick = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    HubSync.revision.addListener(_onSyncRevision);
+  }
+
+  @override
+  void dispose() {
+    HubSync.revision.removeListener(_onSyncRevision);
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  void _onSyncRevision() {
+    if (!mounted) return;
+    _refreshLists();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Resume: push local dirty pehle, phir pull / force-recover-missing (no wipe)
+      HubSync.markDirty();
+      unawaited(HubSync.syncNow());
+    }
+  }
 
   String get _title {
     for (final item in [
@@ -45,11 +90,66 @@ class _AppShellState extends State<AppShell> {
     return switch (_route) {
       HubRoute.applicationForm => 'Application Form',
       HubRoute.applicationFormBlank => 'Blank Form Overlay',
+      HubRoute.partnerCash => 'Partner Cash Book',
+      HubRoute.vipPartnerCashBook => 'Partner Cash Book (VIP)',
+      HubRoute.vipCustomerPlotsReceipts => 'Customer Plots Receipts (VIP)',
+      HubRoute.duesWhatsApp => 'Dues WhatsApp Reminder',
+      HubRoute.rptPlotStatusOwner => 'Plot Status Report (Owner)',
+      HubRoute.rptStaffSalaryVip => 'Staff Salary Message (VIP)',
+      HubRoute.rptPlotAllocVip => 'Plot Allocation Message (VIP)',
+      HubRoute.rptVipAllocateTotals => 'Allocate Totals (VIP)',
+      HubRoute.rptInstallmentDetection => 'Installment Detection (VIP)',
+      HubRoute.rptMonthCollectionVip => 'Month Collection (VIP)',
+      HubRoute.rptVipBusinessAnalysis => 'Complete Business Analysis (VIP)',
+      HubRoute.rptRoughInstallmentEstimate => 'Rough Installment Estimate (VIP)',
+      HubRoute.rptExpense => 'Expense Report',
+      HubRoute.staffEntryLog => 'Staff Entry Log',
+      HubRoute.ownerPartnerReport => 'Owner Reports 1',
       _ => 'HubBuilders',
     };
   }
 
-  void go(HubRoute route) {
+  Widget _rpt(
+    ReportKind kind,
+    String title, {
+    bool dates = false,
+    bool asOf = false,
+    bool society = false,
+    bool customer = false,
+    bool broker = false,
+    bool customerPlot = false,
+    bool year = false,
+    bool mode = false,
+  }) {
+    return ReportPreviewScreen(
+      kind: kind,
+      title: title,
+      onBack: () => go(HubRoute.reports),
+      showDates: dates,
+      showAsOf: asOf,
+      showSociety: society,
+      showCustomer: customer,
+      showBroker: broker,
+      showCustomerPlot: customerPlot,
+      showYear: year,
+      showMode: mode,
+    );
+  }
+
+  void go(HubRoute route) async {
+    final mod = StaffAccess.moduleForRoute(route.name);
+    if (!await StaffAccess.can(mod, 'open')) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Aap ke role (${StaffAudit.role ?? ''}) ke liye yeh form allow nahi.',
+          ),
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
     setState(() {
       _route = route;
       _listTick++;
@@ -159,6 +259,7 @@ class _AppShellState extends State<AppShell> {
           addLabel: 'Add Partner',
           onOpenRow: (row) => _openPersonForm(isOwner: false, row: row),
         ),
+      HubRoute.partnerCash => PartnerCashScreen(key: ValueKey('pc-$_listTick')),
       HubRoute.deal => EntityListScreen(
           key: ValueKey('deal-$_listTick'),
           title: 'Deal Form',
@@ -166,6 +267,7 @@ class _AppShellState extends State<AppShell> {
           loader: VendorStore.dealRows,
           onAdd: () => _openDealForm(),
           addLabel: 'Add Deal',
+          onOpenRow: (row) => _openDealForm(row: row),
         ),
       HubRoute.credit => EntityListScreen(
           key: ValueKey('crd-$_listTick'),
@@ -174,6 +276,7 @@ class _AppShellState extends State<AppShell> {
           loader: VendorStore.creditRows,
           onAdd: () => _openCreditForm(),
           addLabel: 'Add Credit',
+          onOpenRow: (row) => _openCreditForm(row: row),
         ),
       HubRoute.applicationForm => ApplicationFormScreen(
           blankOverlay: false,
@@ -182,6 +285,161 @@ class _AppShellState extends State<AppShell> {
       HubRoute.applicationFormBlank => ApplicationFormScreen(
           blankOverlay: true,
           onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.vipPartnerCashBook => VipPartnerCashBookScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.vipCustomerPlotsReceipts => VipCustomerPlotsReceiptsScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.staffEntryLog => const StaffEntryLogScreen(),
+      HubRoute.ownerPartnerReport => _rpt(
+          ReportKind.ownerPartner,
+          'Owner Reports 1',
+        ),
+      HubRoute.rptAllocationList =>
+        _rpt(ReportKind.allocationList, 'Customer Plot Booking'),
+      HubRoute.rptCustomerTotals => _rpt(
+          ReportKind.customerTotals,
+          'Customer Totals Roll-Up',
+          customer: true,
+        ),
+      HubRoute.rptReceiptsDetail =>
+        _rpt(ReportKind.receiptsDetail, 'Receipts Detail'),
+      HubRoute.rptDues => _rpt(ReportKind.dues, 'Dues'),
+      HubRoute.rptAging => _rpt(ReportKind.aging, 'Aging Reports', asOf: true),
+      HubRoute.rptMonthly =>
+        _rpt(ReportKind.monthlyWise, 'MonthlyWise Report', year: true),
+      HubRoute.rptDaily => _rpt(ReportKind.dailyWise, 'Dailywise Report'),
+      HubRoute.rptInventory =>
+        _rpt(ReportKind.inventoryStatus, 'Inventory Status'),
+      HubRoute.rptProfitLoss => _rpt(
+          ReportKind.profitLoss,
+          'Profit & Lost',
+          dates: true,
+          mode: true,
+        ),
+      HubRoute.rptProfitCogs => _rpt(
+          ReportKind.profitCogs,
+          'Profit – Cash Basis COGS',
+          dates: true,
+          mode: true,
+        ),
+      HubRoute.rptSeparateCustomer => _rpt(
+          ReportKind.separateCustomer,
+          'Separate Customer Report',
+          dates: true,
+        ),
+      HubRoute.rptCustomerSenior =>
+        _rpt(ReportKind.customerSenior, 'Customer DIssnior'),
+      HubRoute.rptBrokerDetails => _rpt(
+          ReportKind.brokerDetails,
+          'Broker Details',
+          dates: true,
+          society: true,
+          broker: true,
+        ),
+      HubRoute.rptVipReceiptStatement => _rpt(
+          ReportKind.vipCustomerReceiptStatement,
+          'Customer Receipt Statement (VIP)',
+          dates: true,
+          customerPlot: true,
+        ),
+      HubRoute.rptVipDuesTracker => _rpt(
+          ReportKind.vipCompleteDuesTracker,
+          'Complete Dues Tracker (VIP)',
+          society: true,
+          asOf: true,
+        ),
+      HubRoute.rptVipSocietyProfit => _rpt(
+          ReportKind.vipSocietyProfitClosing,
+          'Society Profit Closing (VIP)',
+          dates: true,
+          society: true,
+        ),
+      HubRoute.rptVipBrokerDetails => _rpt(
+          ReportKind.vipBrokerDetails,
+          'Broker Details (VIP)',
+          dates: true,
+          society: true,
+          broker: true,
+        ),
+      HubRoute.rptVipDuesAging =>
+        _rpt(ReportKind.vipDuesAging, 'Dues Aging (VIP)', asOf: true),
+      HubRoute.rptTemporaryAllotment => TemporaryAllotmentScreen(
+          blankOverlay: false,
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptTemporaryAllotmentBlank => TemporaryAllotmentScreen(
+          blankOverlay: true,
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptLasbelaVillage => LasbelaReceiptScreen(
+          marketBhawani: false,
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptLasbelaMarket => LasbelaReceiptScreen(
+          marketBhawani: true,
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptBackupRestore => BackupRestoreScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.duesWhatsApp => DuesWhatsAppScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptReceiptsMinusCredit => _rpt(
+          ReportKind.receiptsMinusPartnerCredit,
+          'Receipts − Partner Credit',
+          dates: true,
+        ),
+      HubRoute.rptAvailablePlots => _rpt(
+          ReportKind.availablePlots,
+          'Available Plots Report',
+          society: true,
+        ),
+      HubRoute.rptPlotStatusOwner => PlotStatusOwnerScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptStaffSalaryVip => StaffSalaryVipScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptPlotAllocVip => PlotAllocVipScreen(
+          onBack: () => go(HubRoute.reports),
+        ),
+      HubRoute.rptVipAllocateTotals => _rpt(
+          ReportKind.vipAllocateTotals,
+          'Allocate Totals (VIP)',
+          society: true,
+        ),
+      HubRoute.rptInstallmentDetection => _rpt(
+          ReportKind.installmentDetection,
+          'Installment Detection (VIP)',
+          dates: true,
+          society: true,
+        ),
+      HubRoute.rptMonthCollectionVip => _rpt(
+          ReportKind.monthCollectionVip,
+          'Month Collection (VIP)',
+          dates: true,
+          society: true,
+        ),
+      HubRoute.rptVipBusinessAnalysis => _rpt(
+          ReportKind.vipBusinessAnalysis,
+          'Complete Business Analysis (VIP)',
+          dates: true,
+          society: true,
+        ),
+      HubRoute.rptRoughInstallmentEstimate => _rpt(
+          ReportKind.roughInstallmentEstimate,
+          'Rough Installment Estimate (VIP)',
+          dates: true,
+          society: true,
+        ),
+      HubRoute.rptExpense => _rpt(
+          ReportKind.expenseReport,
+          'Expense Report',
+          dates: true,
         ),
     };
   }
@@ -328,18 +586,124 @@ class _AppShellState extends State<AppShell> {
     _refreshLists();
   }
 
-  Future<void> _openDealForm() async {
+  Future<void> _openDealForm({ListRow? row}) async {
+    Map<String, String>? initial;
+    if (row?.id != null) {
+      final d = await VendorStore.dealById(row!.id!);
+      if (d != null) {
+        initial = {
+          'society_id': '${d['society_id'] ?? ''}',
+          'owner_id': '${d['owner_id'] ?? ''}',
+          'amount': '${d['amount'] ?? ''}',
+          'date': '${d['deal_date'] ?? ''}',
+          'note': '${d['note'] ?? ''}',
+        };
+      }
+    }
+    if (!mounted) return;
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const DealFormScreen()),
+      MaterialPageRoute(
+        builder: (_) => DealFormScreen(id: row?.id, initial: initial),
+      ),
     );
     _refreshLists();
   }
 
-  Future<void> _openCreditForm() async {
+  Future<void> _openCreditForm({ListRow? row}) async {
+    Map<String, String>? initial;
+    if (row?.id != null) {
+      final c = await VendorStore.creditById(row!.id!);
+      if (c != null) {
+        initial = {
+          'society_id': '${c['society_id'] ?? ''}',
+          'owner_id': '${c['owner_id'] ?? ''}',
+          'partner_id': '${c['partner_id'] ?? ''}',
+          'amount': '${c['amount'] ?? ''}',
+          'date': '${c['pay_date'] ?? ''}',
+          'note': '${c['note'] ?? ''}',
+        };
+      }
+    }
+    if (!mounted) return;
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const CreditFormScreen()),
+      MaterialPageRoute(
+        builder: (_) => CreditFormScreen(id: row?.id, initial: initial),
+      ),
     );
     _refreshLists();
+  }
+
+  Future<void> _runManualSync({required bool pull}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Syncing…'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+    // WinForms Sync Now jaisa: Sync ya Pull — dono full sync (pull+push+delete)
+    final ok = await HubSync.syncNow();
+    if (!mounted) return;
+    _refreshLists();
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          ok
+              ? 'Sync complete — entries + deletes updated'
+              : 'Sync busy/fail — thodi der baad dobara try',
+        ),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  Future<void> _runForceRecover() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Force Recover from Cloud'),
+        content: const Text(
+          'Cloud se missing allocate rows wapas (same sync_id skip). '
+          'Local extras wipe nahi. Intentionally deleted resurrect nahi.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Recover'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true || !mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Force recovering from cloud…'),
+        duration: Duration(seconds: 4),
+      ),
+    );
+    final result = await HubSync.forceRecoverFromCloud();
+    if (!mounted) return;
+    _refreshLists();
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          result.ok
+              ? result.summary
+              : 'Recover fail — ${result.summary}',
+        ),
+        duration: const Duration(seconds: 5),
+      ),
+    );
   }
 
   @override
@@ -351,12 +715,38 @@ class _AppShellState extends State<AppShell> {
         appBar: AppBar(
           title: Text(_title),
           actions: [
+            IconButton(
+              tooltip: 'Pull / Sync Now',
+              icon: const Icon(Icons.cloud_download_outlined),
+              onPressed: () => _runManualSync(pull: true),
+            ),
+            IconButton(
+              tooltip: 'Sync Now (pull + push + delete)',
+              icon: const Icon(Icons.sync),
+              onPressed: () => _runManualSync(pull: false),
+            ),
+            IconButton(
+              tooltip:
+                  'Force Recover — missing allocate sync_id INSERT only (duplicates skip)',
+              icon: const Icon(Icons.cloud_sync_outlined),
+              color: const Color(0xFFE8A838),
+              onPressed: _runForceRecover,
+            ),
             PopupMenuButton<String>(
               tooltip: 'File',
               icon: const Icon(Icons.folder_open_outlined),
               onSelected: (value) {
                 final match = fileMenuItems.where((e) => e.label == value);
-                if (match.isNotEmpty) go(match.first.route);
+                if (match.isEmpty) return;
+                if (match.first.route == HubRoute.staffEntryLog) {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const StaffEntryLogScreen(),
+                    ),
+                  );
+                  return;
+                }
+                go(match.first.route);
               },
               itemBuilder: (_) => fileMenuItems
                   .map(

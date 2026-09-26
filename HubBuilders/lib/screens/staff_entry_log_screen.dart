@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../data/staff_audit.dart';
+import '../data/hub_sync.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 
@@ -20,13 +21,19 @@ class _StaffEntryLogScreenState extends State<StaffEntryLogScreen> {
   @override
   void initState() {
     super.initState();
+    HubSync.revision.addListener(_onSync);
     _load();
   }
 
   @override
   void dispose() {
+    HubSync.revision.removeListener(_onSync);
     _search.dispose();
     super.dispose();
+  }
+
+  void _onSync() {
+    if (mounted) _load();
   }
 
   Future<void> _load() async {
@@ -95,7 +102,7 @@ class _StaffEntryLogScreenState extends State<StaffEntryLogScreen> {
                       final when = r['created_at'] ?? '';
                       final detail = r['detail'] ?? '';
                       final role = r['staff_role'] ?? '';
-                      return SoftCard(
+                      return SoftPanel(
                         child: ListTile(
                           contentPadding: EdgeInsets.zero,
                           title: Text(

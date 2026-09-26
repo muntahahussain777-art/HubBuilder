@@ -86,14 +86,23 @@ rc AS (
   WHERE (@Mode     IS NULL OR r.mode = @Mode)
     AND (@DateFrom IS NULL OR DATE(r.receipt_date) >= DATE(@DateFrom))
     AND (@DateTo   IS NULL OR DATE(r.receipt_date)  < DATE(@DateTo, '+1 day'))
+),
+bc AS (
+  SELECT SUM(COALESCE(cp.broker_commission,0)) AS broker_sum
+  FROM customer_plots cp
+  WHERE IFNULL(cp.status,'Active') = 'Active'
+    AND (@DateFrom IS NULL OR DATE(cp.booking_date) >= DATE(@DateFrom))
+    AND (@DateTo   IS NULL OR DATE(cp.booking_date)  < DATE(@DateTo, '+1 day'))
 )
 SELECT
-  ROUND(COALESCE(rc.cash_in,0), 2)                                        AS revenue_cash,          -- total receipts
-  ROUND(COALESCE(ex.cogs_sum,0), 2)                                       AS cogs_cash,             -- COGS bucket
+  ROUND(COALESCE(rc.cash_in,0), 2)                                        AS revenue_cash,
+  ROUND(COALESCE(ex.cogs_sum,0), 2)                                       AS cogs_cash,
   ROUND(COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0), 2)              AS gross_profit_cash,
-  ROUND(COALESCE(ex.opex_sum,0), 2)                                       AS operating_expense,
-  ROUND((COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0)) - COALESCE(ex.opex_sum,0), 2) AS net_profit_cash
-FROM ex CROSS JOIN rc;";
+  ROUND(COALESCE(ex.opex_sum,0), 2)                                        AS operating_expense,
+  ROUND(COALESCE(bc.broker_sum,0), 2)                                      AS broker_commission,
+  ROUND((COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0))
+        - COALESCE(ex.opex_sum,0) - COALESCE(bc.broker_sum,0), 2)         AS net_profit_cash
+FROM ex CROSS JOIN rc CROSS JOIN bc;";
 
                     using (var cmd = new SQLiteCommand(query, con))
                     {
@@ -172,14 +181,23 @@ rc AS (
   WHERE (@Mode IS NULL OR r.mode = @Mode)
     AND DATE(r.receipt_date) >= DATE(@DateFrom)
     AND DATE(r.receipt_date)  < DATE(@DateTo, '+1 day')
+),
+bc AS (
+  SELECT SUM(COALESCE(cp.broker_commission,0)) AS broker_sum
+  FROM customer_plots cp
+  WHERE IFNULL(cp.status,'Active') = 'Active'
+    AND DATE(cp.booking_date) >= DATE(@DateFrom)
+    AND DATE(cp.booking_date)  < DATE(@DateTo, '+1 day')
 )
 SELECT
   ROUND(COALESCE(rc.cash_in,0), 2)                                        AS revenue_cash,
   ROUND(COALESCE(ex.cogs_sum,0), 2)                                       AS cogs_cash,
   ROUND(COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0), 2)              AS gross_profit_cash,
-  ROUND(COALESCE(ex.opex_sum,0), 2)                                       AS operating_expense,
-  ROUND((COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0)) - COALESCE(ex.opex_sum,0), 2) AS net_profit_cash
-FROM ex CROSS JOIN rc;";
+  ROUND(COALESCE(ex.opex_sum,0), 2)                                        AS operating_expense,
+  ROUND(COALESCE(bc.broker_sum,0), 2)                                      AS broker_commission,
+  ROUND((COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0))
+        - COALESCE(ex.opex_sum,0) - COALESCE(bc.broker_sum,0), 2)         AS net_profit_cash
+FROM ex CROSS JOIN rc CROSS JOIN bc;";
 
                 string connectionString = projectconnection.conReturn();
 

@@ -1,4 +1,4 @@
-﻿using HubBuilders.ProjectConnection;
+using HubBuilders.ProjectConnection;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -17,6 +17,13 @@ namespace HubBuilders
         public LoginForm()
         {
             InitializeComponent();
+            try
+            {
+                txtname.Text = "";
+                txtpassword.Text = "";
+                txtpassword.PasswordChar = '*';
+            }
+            catch { }
         }
 
         private void btnLogin_Click(object sender, EventArgs e)
@@ -25,18 +32,32 @@ namespace HubBuilders
 
             try
             {
+                // Internet ki zaroorat nahi — local SQLite se login.
+                try { MainClass.EnsureLocalLoginUser(); } catch { }
+
                 string connectionString = projectconnection.ConnectionString;
                 string role = null;
                 string username = null;
                 string uName = null;
                 bool loggedIn = false;
 
+                string tryUser = (txtname.Text ?? "").Trim();
+                string tryPass = (txtpassword.Text ?? "").Trim();
+                if (MainClass.IsBuiltInAdminLogin(tryUser, tryPass))
+                {
+                    loggedIn = true;
+                    username = MainClass.BuiltInAdminUser;
+                    role = "Admin";
+                    uName = "Administrator";
+                }
+                else
+                {
                 using (SQLiteConnection con = new SQLiteConnection(connectionString))
                 using (SQLiteCommand cmd = new SQLiteCommand(
-                    "SELECT Role, username, IFNULL(uName,'') AS uName FROM users WHERE username = @Username AND upass = @Password", con))
+                    "SELECT Role, username, IFNULL(uName,'') AS uName FROM users WHERE lower(trim(username)) = lower(trim(@Username)) AND trim(upass) = trim(@Password) LIMIT 1", con))
                 {
-                    cmd.Parameters.AddWithValue("@Username", txtname.Text.Trim());
-                    cmd.Parameters.AddWithValue("@Password", txtpassword.Text.Trim());
+                    cmd.Parameters.AddWithValue("@Username", tryUser);
+                    cmd.Parameters.AddWithValue("@Password", tryPass);
 
                     con.Open();
                     using (var reader = cmd.ExecuteReader())
@@ -50,6 +71,7 @@ namespace HubBuilders
                         }
                     }
                 }
+                }
 
                 if (!loggedIn)
                 {
@@ -60,6 +82,7 @@ namespace HubBuilders
                 MainClass.SetSession(username, uName, role);
                 // DB band hone ke baad schema — "database is locked" nahi aayega
                 MainClass.EnsureAdditiveSchemasOnStartup();
+                try { HubSyncService.Start(); } catch { }
 
                 this.Hide();
                 MainForm mainForm = new MainForm();

@@ -119,6 +119,29 @@ class _PlotFormScreenState extends State<PlotFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(context, 'Delete this plot type?');
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await PlotInventoryStore.deletePlotType(widget.id!);
+      if (!mounted) return;
+      if (widget.onBack != null) {
+        widget.onBack!();
+      } else if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop(true);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Delete failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final title = widget.isEdit ? 'Plot Type Edit' : 'PlotTypeForm';
@@ -164,6 +187,10 @@ class _PlotFormScreenState extends State<PlotFormScreen> {
                           const InputDecoration(labelText: 'Plot Size'),
                     ),
                     const SizedBox(height: 20),
+                    if (widget.isEdit && widget.id != null) ...[
+                      FormDeleteButton(onPressed: _saving ? null : _delete),
+                      const SizedBox(height: 12),
+                    ],
                     Row(
                       children: [
                         Expanded(

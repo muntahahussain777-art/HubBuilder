@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows.Forms;
 
 namespace HubBuilders
@@ -11,7 +11,35 @@ namespace HubBuilders
         {
             InitializeComponent();
             WireCloseOnce();
-            this.Load += (s, e) => WireCloseOnce();
+            this.Load += (s, e) =>
+            {
+                WireCloseOnce();
+                WireSaveGuard();
+            };
+            WireSaveGuard();
+        }
+
+        private void WireSaveGuard()
+        {
+            if (btnSave == null) return;
+            btnSave.Click -= btnSave_Click;
+            btnSave.Click -= BtnSave_GuardedClick;
+            btnSave.Click += BtnSave_GuardedClick;
+        }
+
+        private void BtnSave_GuardedClick(object sender, EventArgs e)
+        {
+            string mod = StaffAccess.ModuleForForm(this);
+            // Add form: id often 0 = add, else edit — subclasses handle; gate both save paths lightly
+            if (!string.IsNullOrWhiteSpace(mod))
+            {
+                if (!StaffAccess.Can(mod, "add") && !StaffAccess.Can(mod, "edit"))
+                {
+                    StaffAccess.Deny(mod, "add");
+                    return;
+                }
+            }
+            btnSave_Click(sender, e);
         }
 
         private void WireCloseOnce()
@@ -63,7 +91,7 @@ namespace HubBuilders
             {
                 if (btnSave != null && btnSave.Enabled && btnSave.Visible)
                 {
-                    btnSave_Click(btnSave, EventArgs.Empty);
+                    BtnSave_GuardedClick(btnSave, EventArgs.Empty);
                     return true;
                 }
             }

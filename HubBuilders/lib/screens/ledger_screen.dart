@@ -6,6 +6,7 @@ import '../data/allocate_store.dart';
 import '../data/ledger_store.dart';
 import '../data/plot_inventory_store.dart';
 import '../theme/app_colors.dart';
+import '../widgets/type_suggest_field.dart';
 import '../widgets/ui_bits.dart';
 
 /// Same as C# `frmCustomerLedgerAdd` — Filter Panel Ledger Form.
@@ -263,40 +264,25 @@ class _LedgerScreenState extends State<LedgerScreen> {
                       : Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            DropdownButtonFormField<CustomerItem>(
-                              key: ValueKey(_customer?.id ?? 'cust'),
-                              initialValue: _customer,
-                              decoration:
-                                  const InputDecoration(labelText: 'Customer'),
-                              dropdownColor: AppColors.panel,
-                              items: _customers
-                                  .map(
-                                    (c) => DropdownMenuItem(
-                                      value: c,
-                                      child: Text(c.name),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: _onCustomer,
+                            TypeSuggestField<CustomerItem>(
+                              label: 'Customer (type to search)',
+                              items: _customers,
+                              selected: _customer,
+                              display: (c) => c.fatherName.trim().isEmpty
+                                  ? c.name
+                                  : '${c.name} / ${c.fatherName}',
+                              filterExtra: (c, q) =>
+                                  c.mobile.toLowerCase().contains(q) ||
+                                  c.name.toLowerCase().contains(q),
+                              onSelected: (v) => _onCustomer(v),
                             ),
-                            const SizedBox(height: 10),
-                            DropdownButtonFormField<IdName>(
-                              key: ValueKey(_society?.id ?? 'soc'),
-                              initialValue: _society,
-                              decoration:
-                                  const InputDecoration(labelText: 'Society'),
-                              dropdownColor: AppColors.panel,
-                              items: _societies
-                                  .map(
-                                    (s) => DropdownMenuItem(
-                                      value: s,
-                                      child: Text(s.name),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: _onSociety,
+                            TypeSuggestField<IdName>(
+                              label: 'Society (type to search)',
+                              items: _societies,
+                              selected: _society,
+                              display: (s) => s.name,
+                              onSelected: (v) => _onSociety(v),
                             ),
-                            const SizedBox(height: 10),
                             if (_loadingPlots)
                               const Padding(
                                 padding: EdgeInsets.symmetric(vertical: 12),
@@ -311,25 +297,12 @@ class _LedgerScreenState extends State<LedgerScreen> {
                                 ),
                               )
                             else
-                              DropdownButtonFormField<LedgerPlotOption>(
-                                key: ValueKey(
-                                  'plot-${_customer?.id}-${_society?.id}-'
-                                  '${_plot?.valueId}-${_plotOptions.length}',
-                                ),
-                                initialValue: _plot,
-                                decoration: const InputDecoration(
-                                  labelText: 'Plot NO',
-                                ),
-                                dropdownColor: AppColors.panel,
-                                items: _plotOptions
-                                    .map(
-                                      (p) => DropdownMenuItem(
-                                        value: p,
-                                        child: Text(p.label),
-                                      ),
-                                    )
-                                    .toList(),
-                                onChanged: (v) => setState(() => _plot = v),
+                              TypeSuggestField<LedgerPlotOption>(
+                                label: 'Plot NO (type to search)',
+                                items: _plotOptions,
+                                selected: _plot,
+                                display: (p) => p.label,
+                                onSelected: (v) => setState(() => _plot = v),
                               ),
                             const SizedBox(height: 10),
                             InkWell(

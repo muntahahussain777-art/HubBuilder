@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.IO;
@@ -8,6 +9,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Printing;
 using System.Windows.Forms;
+using Guna.UI2.WinForms;
 
 namespace HubBuilders.Model
 {
@@ -49,9 +51,28 @@ namespace HubBuilders.Model
         private float[] _colW; // computed per page
         private readonly string[] _heads = { "Date", "Voucher", "Narration", "Debit", "Credit", "Running" };
 
+        // ===== Ctrl+1: suggest search on all combos (same style as Allocate) | Ctrl+2: back =====
+        private static readonly Color ThemeFill = Color.FromArgb(37, 41, 74);
+        private static readonly Color ThemeBorder = Color.FromArgb(112, 51, 255);
+        private static readonly Color ThemeText = Color.White;
+
+        private sealed class SearchSlot
+        {
+            public ComboBox Target;
+            public Guna2TextBox Box;
+            public ListBox Suggest;
+            public string Placeholder;
+        }
+
+        private readonly List<SearchSlot> _slots = new List<SearchSlot>();
+        private bool _searchReady;
+        private bool _searchBusy;
+        private bool _searchActive;
+
         public frmCustomerLedgerAdd()
         {
             InitializeComponent();
+            this.KeyPreview = true;
 
             if (dtpFrom != null) dtpFrom.Value = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
             if (dtpTo != null) dtpTo.Value = DateTime.Today;
@@ -70,6 +91,26 @@ namespace HubBuilders.Model
             LoadSocieties();
             LoadAllocations();
             EnsureGridColumns();
+
+            EnsureSearchSetup();
+            ExitSearchMode(apply: false);
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Control | Keys.D1))
+            {
+                EnsureSearchSetup();
+                EnterSearchMode();
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.D2))
+            {
+                EnsureSearchSetup();
+                ExitSearchMode(apply: true);
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         // ---------------------- Master data ----------------------
@@ -715,6 +756,430 @@ namespace HubBuilders.Model
                 return false;
             }
             catch { return false; }
+        }
+
+        // ---------------------- Ctrl+1 / Ctrl+2 suggest search ----------------------
+
+        private void EnsureSearchSetup()
+        {
+            if (_searchReady) return;
+
+            AddSlot(cmbCustomer, "Type customer name…");
+            AddSlot(cmbSociety, "Type society…");
+            AddSlot(cmbCustomerPlot, "Type plot no…");
+
+            this.Resize += (s, e) => { if (_searchActive) PositionAll(); };
+            _searchReady = true;
+        }
+
+        private void AddSlot(ComboBox target, string placeholder)
+        {
+            if (target == null) return;
+
+            var box = new Guna2TextBox
+            {
+                FillColor = ThemeFill,
+                ForeColor = ThemeText,
+                BorderColor = ThemeBorder,
+                BorderRadius = 17,
+                Font = new Font("Segoe UI Semibold", 12F, FontStyle.Bold),
+                PlaceholderForeColor = Color.Silver,
+                PlaceholderText = placeholder,
+                Cursor = Cursors.IBeam,
+                Visible = false,
+                TabStop = true
+            };
+            try
+            {
+                box.FocusedState.BorderColor = Color.FromArgb(94, 148, 255);
+                box.HoverState.BorderColor = ThemeBorder;
+                box.ShadowDecoration.Parent = box;
+            }
+            catch { }
+
+            var suggest = new ListBox
+            {
+                Font = new Font("Segoe UI", 10f),
+                BackColor = ThemeFill,
+                ForeColor = ThemeText,
+                BorderStyle = BorderStyle.FixedSingle,
+                Visible = false,
+                IntegralHeight = false,
+                Height = ReferenceEquals(target, cmbCustomer) ? 200 : 140
+            };
+
+            var slot = new SearchSlot
+            {
+                Target = target,
+                Box = box,
+                Suggest = suggest,
+                Placeholder = placeholder
+            };
+
+            box.Enter += (s, e) =>
+            {
+                HideOtherSuggests(slot);
+                RefreshSuggest(slot);
+            };
+
+            box.TextChanged += (s, e) =>
+            {
+                if (_searchBusy || !_searchActive) return;
+                RefreshSuggest(slot);
+                TryExact(slot);
+            };
+
+            box.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Down && suggest.Visible && suggest.Items.Count > 0)
+                {
+                    e.SuppressKeyPress = true;
+                    suggest.Focus();
+                    if (suggest.SelectedIndex < 0) suggest.SelectedIndex = 0;
+                }
+                else if (e.KeyCode == Keys.Enter)
+                {
+                    e.SuppressKeyPress = true;
+                    ApplySlot(slot);
+                    int ix = _slots.IndexOf(slot);
+                    if (ix >= 0 && ix + 1 < _slots.Count)
+                        _slots[ix + 1].Box.Focus();
+                    else
+                        suggest.Visible = false;
+                }
+                else if (e.KeyCode == Keys.Escape)
+                {
+                    e.SuppressKeyPress = true;
+                    ExitSearchMode(apply: true);
+                }
+            };
+
+            box.Leave += (s, e) =>
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (!_searchActive || _searchBusy) return;
+                    if (suggest.Focused) return;
+                    suggest.Visible = false;
+                    ApplySlot(slot);
+                }));
+            };
+
+            suggest.Click += (s, e) =>
+            {
+                if (suggest.SelectedItem == null) return;
+                _searchBusy = true;
+                try { box.Text = Convert.ToString(suggest.SelectedItem); }
+                finally { _searchBusy = false; }
+                ApplySlot(slot);
+                suggest.Visible = false;
+                box.Focus();
+            };
+
+            suggest.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.SuppressKeyPress = true;
+                    if (suggest.SelectedItem != null)
+                    {
+                        _searchBusy = true;
+                        try { box.Text = Convert.ToString(suggest.SelectedItem); }
+                        finally { _searchBusy = false; }
+                        ApplySlot(slot);
+                        suggest.Visible = false;
+                        box.Focus();
+                    }
+                }
+                else if (e.KeyCode == Keys.Escape)
+                {
+                    e.SuppressKeyPress = true;
+                    box.Focus();
+                }
+            };
+
+            this.Controls.Add(box);
+            this.Controls.Add(suggest);
+            _slots.Add(slot);
+        }
+
+        private SearchSlot FindSlot(ComboBox cb)
+        {
+            foreach (var s in _slots)
+                if (ReferenceEquals(s.Target, cb)) return s;
+            return null;
+        }
+
+        private void HideOtherSuggests(SearchSlot keep)
+        {
+            foreach (var s in _slots)
+                if (s.Suggest != null && !ReferenceEquals(s, keep))
+                    s.Suggest.Visible = false;
+        }
+
+        private void EnterSearchMode()
+        {
+            if (_slots.Count == 0) return;
+            _searchActive = true;
+            _searchBusy = true;
+            try
+            {
+                foreach (var slot in _slots)
+                {
+                    SyncSlot(slot);
+                    slot.Box.Visible = true;
+                    slot.Box.BringToFront();
+                    slot.Suggest.Visible = false;
+                }
+                PositionAll();
+            }
+            finally { _searchBusy = false; }
+
+            try
+            {
+                _slots[0].Box.Focus();
+                _slots[0].Box.SelectAll();
+            }
+            catch { }
+        }
+
+        private void ExitSearchMode(bool apply)
+        {
+            if (apply)
+            {
+                foreach (var slot in _slots)
+                    ApplySlot(slot);
+            }
+
+            _searchActive = false;
+            foreach (var slot in _slots)
+            {
+                slot.Box.Visible = false;
+                slot.Suggest.Visible = false;
+            }
+            try { cmbCustomer?.Focus(); } catch { }
+        }
+
+        private void PositionAll()
+        {
+            foreach (var slot in _slots)
+            {
+                var t = slot.Target;
+                if (t == null) continue;
+                // Combos may sit on nested panels — map to form coords
+                Point pt = this.PointToClient(t.Parent.PointToScreen(t.Location));
+                slot.Box.SetBounds(pt.X, pt.Y, t.Width, Math.Max(36, t.Height));
+                int h = ReferenceEquals(t, cmbCustomer) ? 200 : 140;
+                slot.Suggest.SetBounds(slot.Box.Left, slot.Box.Bottom + 2, Math.Max(slot.Box.Width, 240), h);
+                slot.Box.BringToFront();
+                if (slot.Suggest.Visible) slot.Suggest.BringToFront();
+            }
+        }
+
+        private void SyncSlot(SearchSlot slot)
+        {
+            if (slot?.Box == null || slot.Target == null) return;
+            _searchBusy = true;
+            try
+            {
+                string cur = "";
+                if (slot.Target.SelectedIndex >= 0)
+                    cur = Convert.ToString(slot.Target.Text ?? "").Trim();
+                slot.Box.Text = cur;
+            }
+            finally { _searchBusy = false; }
+        }
+
+        private void RefreshSuggest(SearchSlot slot)
+        {
+            if (slot?.Suggest == null || slot.Target == null) return;
+            string q = (slot.Box.Text ?? "").Trim();
+            List<string> items = FilterCombo(slot.Target, q);
+
+            // Customer: also match mobile → show combo label
+            if (ReferenceEquals(slot.Target, cmbCustomer) && q.Length > 0)
+                AppendCustomerMobileMatches(items, q);
+
+            slot.Suggest.BeginUpdate();
+            try
+            {
+                slot.Suggest.Items.Clear();
+                foreach (var s in items) slot.Suggest.Items.Add(s);
+            }
+            finally { slot.Suggest.EndUpdate(); }
+
+            PositionAll();
+            if (slot.Suggest.Items.Count > 0 && slot.Box.Focused)
+            {
+                if (slot.Suggest.SelectedIndex < 0) slot.Suggest.SelectedIndex = 0;
+                slot.Suggest.Visible = true;
+                slot.Suggest.BringToFront();
+                slot.Box.BringToFront();
+            }
+            else
+            {
+                slot.Suggest.Visible = false;
+            }
+        }
+
+        private void AppendCustomerMobileMatches(List<string> items, string q)
+        {
+            try
+            {
+                var dt = MainClass.ExecuteSelectQuery(
+                    "SELECT id, name, COALESCE(mobile,'') AS mobile, COALESCE(father_name,'') AS father_name FROM customers ORDER BY name;",
+                    null);
+                if (dt == null) return;
+                var existing = new HashSet<string>(items, StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < dt.Rows.Count; i++)
+                {
+                    string mobile = Convert.ToString(dt.Rows[i]["mobile"] ?? "").Trim();
+                    if (mobile.Length == 0) continue;
+                    if (mobile.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    string name = Convert.ToString(dt.Rows[i]["name"] ?? "").Trim();
+                    string father = Convert.ToString(dt.Rows[i]["father_name"] ?? "").Trim();
+                    string label = father.Length > 0 ? (name + " / " + father) : name;
+                    if (label.Length == 0 || existing.Contains(label)) continue;
+                    items.Add(label);
+                    existing.Add(label);
+                    if (items.Count >= 100) break;
+                }
+            }
+            catch { }
+        }
+
+        private List<string> FilterCombo(ComboBox cb, string q)
+        {
+            var list = new List<string>();
+            foreach (var s in GetComboDisplayList(cb))
+            {
+                if (q.Length == 0 || s.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    list.Add(s);
+                    if (list.Count >= 80) break;
+                }
+            }
+            return list;
+        }
+
+        private void TryExact(SearchSlot slot)
+        {
+            string t = (slot.Box.Text ?? "").Trim();
+            if (t.Length == 0) return;
+            int row = FindComboRow(slot.Target, t);
+            if (row < 0) return;
+            var dt = GetComboTable(slot.Target);
+            string col = GetDisplayColumn(slot.Target);
+            if (dt == null || !dt.Columns.Contains(col)) return;
+            string cand = Convert.ToString(dt.Rows[row][col] ?? "").Trim();
+            if (string.Equals(cand, t, StringComparison.OrdinalIgnoreCase))
+                SelectComboRow(slot.Target, row);
+        }
+
+        private void ApplySlot(SearchSlot slot)
+        {
+            if (slot?.Box == null || slot.Target == null) return;
+            string txt = (slot.Box.Text ?? "").Trim();
+            if (txt.Length == 0) return;
+
+            if (slot.Suggest.Visible && slot.Suggest.SelectedItem != null)
+            {
+                string sel = Convert.ToString(slot.Suggest.SelectedItem).Trim();
+                if (sel.Length > 0) txt = sel;
+            }
+
+            int row = FindComboRow(slot.Target, txt);
+            if (row < 0) return;
+            SelectComboRow(slot.Target, row);
+
+            // Customer / Society change → reload plots, sync plot search box
+            if (ReferenceEquals(slot.Target, cmbCustomer) || ReferenceEquals(slot.Target, cmbSociety))
+            {
+                try { LoadAllocations(); } catch { }
+                var plotSlot = FindSlot(cmbCustomerPlot);
+                if (plotSlot != null && _searchActive) SyncSlot(plotSlot);
+            }
+        }
+
+        private List<string> GetComboDisplayList(ComboBox cb)
+        {
+            var list = new List<string>();
+            var dt = GetComboTable(cb);
+            string col = GetDisplayColumn(cb);
+            if (dt == null || !dt.Columns.Contains(col)) return list;
+            for (int i = 0; i < dt.Rows.Count; i++)
+            {
+                var s = Convert.ToString(dt.Rows[i][col] ?? "").Trim();
+                if (s.Length > 0) list.Add(s);
+            }
+            return list;
+        }
+
+        private DataTable GetComboTable(ComboBox cb)
+        {
+            if (cb?.DataSource == null) return null;
+            if (cb.DataSource is DataTable dt) return dt;
+            if (cb.DataSource is DataView dv) return dv.Table;
+            if (cb.DataSource is BindingSource bs)
+            {
+                if (bs.DataSource is DataTable t) return t;
+                if (bs.DataSource is DataView v) return v.Table;
+            }
+            return null;
+        }
+
+        private string GetDisplayColumn(ComboBox cb)
+        {
+            string dm = (cb?.DisplayMember ?? "").Trim();
+            return dm.Length > 0 ? dm : "label";
+        }
+
+        private string GetValueColumn(ComboBox cb)
+        {
+            string vm = (cb?.ValueMember ?? "").Trim();
+            return vm.Length > 0 ? vm : "id";
+        }
+
+        private int FindComboRow(ComboBox cb, string input)
+        {
+            var dt = GetComboTable(cb);
+            string col = GetDisplayColumn(cb);
+            input = (input ?? "").Trim();
+            if (dt == null || input.Length == 0 || !dt.Columns.Contains(col)) return -1;
+            int exact = -1, starts = -1, contains = -1;
+            for (int i = 0; i < dt.Rows.Count; i++)
+            {
+                var name = Convert.ToString(dt.Rows[i][col] ?? "").Trim();
+                if (name.Length == 0) continue;
+                if (exact < 0 && string.Equals(name, input, StringComparison.OrdinalIgnoreCase)) exact = i;
+                if (starts < 0 && name.StartsWith(input, StringComparison.OrdinalIgnoreCase)) starts = i;
+                if (contains < 0 && name.IndexOf(input, StringComparison.OrdinalIgnoreCase) >= 0) contains = i;
+                if (exact >= 0) break;
+            }
+            if (exact >= 0) return exact;
+            if (starts >= 0) return starts;
+            return contains;
+        }
+
+        private void SelectComboRow(ComboBox cb, int rowIndex)
+        {
+            var dt = GetComboTable(cb);
+            if (dt != null && rowIndex >= 0 && rowIndex < dt.Rows.Count)
+            {
+                string valueCol = GetValueColumn(cb);
+                if (dt.Columns.Contains(valueCol))
+                {
+                    try
+                    {
+                        cb.SelectedValue = dt.Rows[rowIndex][valueCol];
+                        if (cb.SelectedValue == null || cb.SelectedValue is DBNull)
+                            cb.SelectedIndex = rowIndex;
+                        return;
+                    }
+                    catch { }
+                }
+            }
+            try { cb.SelectedIndex = rowIndex; } catch { }
         }
     }
 }

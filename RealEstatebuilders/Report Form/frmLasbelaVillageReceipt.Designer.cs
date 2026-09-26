@@ -97,9 +97,9 @@ namespace HubBuilders.Report_Form
             this.panelButtons.Controls.Add(this.btnClear);
             this.panelButtons.Controls.Add(this.btnPreview);
             this.panelButtons.Dock = System.Windows.Forms.DockStyle.Bottom;
-            this.panelButtons.Location = new System.Drawing.Point(8, 582);
+            this.panelButtons.Location = new System.Drawing.Point(8, 532);
             this.panelButtons.Name = "panelButtons";
-            this.panelButtons.Size = new System.Drawing.Size(404, 60);
+            this.panelButtons.Size = new System.Drawing.Size(404, 110);
             this.panelButtons.TabIndex = 1;
             // 
             // btnClear
@@ -135,7 +135,7 @@ namespace HubBuilders.Report_Form
             this.panelFieldsHost.Dock = System.Windows.Forms.DockStyle.Fill;
             this.panelFieldsHost.Location = new System.Drawing.Point(8, 8);
             this.panelFieldsHost.Name = "panelFieldsHost";
-            this.panelFieldsHost.Size = new System.Drawing.Size(404, 574);
+            this.panelFieldsHost.Size = new System.Drawing.Size(404, 524);
             this.panelFieldsHost.TabIndex = 0;
             // 
             // panelFields
@@ -195,7 +195,7 @@ namespace HubBuilders.Report_Form
         internal System.Windows.Forms.TextBox txtFatherOrHusband;
         internal System.Windows.Forms.TextBox txtReceivedAmount;
         internal System.Windows.Forms.TextBox txtAmountInWords;
-        internal System.Windows.Forms.TextBox txtPaymentMode;
+        internal System.Windows.Forms.ComboBox txtPaymentMode;
         internal System.Windows.Forms.TextBox txtPaymentDate;
         internal System.Windows.Forms.TextBox txtPlotNo;
         internal System.Windows.Forms.TextBox txtPlotSize;

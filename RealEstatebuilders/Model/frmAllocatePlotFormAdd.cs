@@ -1,4 +1,4 @@
-﻿// =========================
+// =========================
 // RealEstatebuilders.Model.frmAllocatePlotFormAdd (UNTOUCHED; already supports broker on Add)
 // =========================
 using System;
@@ -32,6 +32,11 @@ namespace HubBuilders.Model
         private bool _ready;
         private bool _busy;
         private bool _active;
+
+        private Guna2ComboBox cmbDealType;
+        private Label lblDealType;
+        private Guna2NumericUpDown numMonthlyInstallment;
+        private Label lblMonthlyInstallment;
 
         public int CreatedAllocationId { get; private set; } = 0;
 
@@ -96,11 +101,16 @@ namespace HubBuilders.Model
                 if (_active) SyncDependents();
             };
 
-            cmbBlock.SelectionChangeCommitted += (s, ev) => RefreshAvailablePlots();
+            cmbBlock.SelectionChangeCommitted += (s, ev) =>
+            {
+                RefreshAvailablePlots();
+                TryApplyBlockMonthlyDefault();
+            };
             cmbBlock.SelectedValueChanged += (s, ev) =>
             {
                 RefreshAvailablePlots();
                 if (_active) SyncSlot(FindSlot(cmbPlotNo));
+                TryApplyBlockMonthlyDefault();
             };
 
             cmbPlotType.SelectionChangeCommitted += (s, ev) => RefreshAvailablePlots();
@@ -113,6 +123,9 @@ namespace HubBuilders.Model
             if (numPrice.Minimum < 0) numPrice.Minimum = 0;
             if (numPrice.Value < 0) numPrice.Value = 0;
             dtpBookingDate.Value = DateTime.Today;
+
+            EnsureDealTypeCombo();
+            EnsureMonthlyInstallmentField();
 
             MakeScrollable(cmbCustomer);
             MakeScrollable(cmbSociety);
@@ -206,11 +219,19 @@ namespace HubBuilders.Model
             if (!TryGetId(cmbBlock, out bid)) return;
             if (!TryGetId(cmbPlotType, out ptid)) return;
 
+            // Sync/desync: Active allocation ho to status Available na dikhe
+            try { MainClass.RepairAllocatedPlotStatuses(); } catch { }
+
             var dt = MainClass.ExecuteSelectQuery(
                 @"SELECT id, plot_no
                   FROM plots
                   WHERE society_id=@sid AND block_id=@bid AND plot_type_id=@ptid
                     AND status='Available'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM customer_plots cp
+                      WHERE cp.plot_id = plots.id
+                        AND IFNULL(cp.status,'') = 'Active'
+                    )
                   ORDER BY plot_no;",
                 new Hashtable { { "@sid", sid }, { "@bid", bid }, { "@ptid", ptid } });
 
@@ -240,23 +261,41 @@ namespace HubBuilders.Model
             if (!TryGetId(cmbPlotNo, out plotId))
             { MessageBox.Show("Plot No select karein (sirf Available dikhte hain).", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning); cmbPlotNo.DroppedDown = true; return; }
 
-            if (numPrice.Value <= 0)
-            { MessageBox.Show("Price required hai.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning); numPrice.Focus(); return; }
+            // Price / broker / commission optional — Reserve bina paisa / bina broker bhi save
+            decimal price = numPrice.Value;
+            if (price < 0) price = 0;
 
-            // ===== BROKER / PARTNER: required + commission >= 0 =====
-            if (!MainClass.TryParseBrokerPartnerKey(cmbBroker.SelectedValue, out string bpKind, out int bpId))
-            { MessageBox.Show("Broker ya Partner select karein.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning); cmbBroker.DroppedDown = true; return; }
+            string bpKind = "";
+            int bpId = 0;
+            MainClass.TryParseBrokerPartnerKey(cmbBroker.SelectedValue, out bpKind, out bpId);
 
             decimal brokerComm = numBrokerCommission.Value;
-            if (brokerComm < 0)
-            { MessageBox.Show("Broker commission 0 ya us se zyada honi chahiye.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning); numBrokerCommission.Focus(); return; }
+            if (brokerComm < 0) brokerComm = 0;
 
-            int brokerIdForDb = bpKind == "B" ? bpId : 0;
+            int brokerIdForDb = (bpKind == "B" && bpId > 0) ? bpId : 0;
             // ==============================================
+
+            string dealType = GetSelectedDealType();
+            string plotStatus = dealType == "Sold" ? "Sold" : "Hold";
+            decimal monthlyInst = 0;
+            try
+            {
+                if (numMonthlyInstallment != null) monthlyInst = numMonthlyInstallment.Value;
+                if (monthlyInst < 0) monthlyInst = 0;
+            }
+            catch { monthlyInst = 0; }
+            if (monthlyInst <= 0)
+            {
+                try
+                {
+                    double def = BlockMonthlyInstallmentStore.GetAmountForBlock(bid);
+                    if (def > 0) monthlyInst = (decimal)def;
+                }
+                catch { }
+            }
 
             string bookingDate = dtpBookingDate.Value.ToString("yyyy-MM-dd");
             string notes = (txtAllocNotes.Text ?? "").Trim();
-            decimal price = numPrice.Value;
 
             try
             {
@@ -268,9 +307,10 @@ namespace HubBuilders.Model
 
                     int upd;
                     using (var cmd = new SQLiteCommand(
-                        "UPDATE plots SET status='Hold' WHERE id=@pid AND status='Available';",
+                        "UPDATE plots SET status=@st WHERE id=@pid AND status='Available';",
                         MainClass.con, tx))
                     {
+                        cmd.Parameters.AddWithValue("@st", plotStatus);
                         cmd.Parameters.AddWithValue("@pid", plotId);
                         upd = cmd.ExecuteNonQuery();
                     }
@@ -287,9 +327,9 @@ namespace HubBuilders.Model
                     int ins;
                     using (var cmd = new SQLiteCommand(
                         @"INSERT INTO customer_plots
-                    (customer_id, plot_id, price, booking_date, notes, status, broker_id, broker_commission)
+                    (customer_id, plot_id, price, booking_date, notes, status, broker_id, broker_commission, deal_type, monthly_installment)
                   VALUES
-                    (@cid, @pid, @price, @bdate, @notes, 'Active', @brokerId, @brokerComm);",
+                    (@cid, @pid, @price, @bdate, @notes, 'Active', @brokerId, @brokerComm, @dealType, @monthly);",
                         MainClass.con, tx))
                     {
                         cmd.Parameters.AddWithValue("@cid", custId);
@@ -299,6 +339,8 @@ namespace HubBuilders.Model
                         cmd.Parameters.AddWithValue("@notes", notes);
                         cmd.Parameters.AddWithValue("@brokerId", brokerIdForDb > 0 ? (object)brokerIdForDb : DBNull.Value);
                         cmd.Parameters.AddWithValue("@brokerComm", brokerComm);
+                        cmd.Parameters.AddWithValue("@dealType", dealType);
+                        cmd.Parameters.AddWithValue("@monthly", monthlyInst);
                         ins = cmd.ExecuteNonQuery();
                     }
 
@@ -314,8 +356,8 @@ namespace HubBuilders.Model
                     using (var idCmd = new SQLiteCommand("SELECT last_insert_rowid();", MainClass.con, tx))
                         newCpId = Convert.ToInt64(idCmd.ExecuteScalar());
 
-                    // Partner select → commission Partner Cash Book mein
-                    if (bpKind == "P" && newCpId > 0)
+                    // Partner select → commission Partner Cash Book mein (optional)
+                    if (bpKind == "P" && bpId > 0 && newCpId > 0)
                     {
                         MainClass.SyncAllocationPartnerCommission(
                             newCpId, bpId, brokerComm, bookingDate, MainClass.con, tx);
@@ -324,20 +366,26 @@ namespace HubBuilders.Model
                     tx.Commit();
                     tx = null;
 
+                    try { HubSyncService.NotifyLocalWrite(); } catch { }
+
                     try
                     {
                         MainClass.LogStaffEntry("Insert", "customer_plots",
-                            $"plot={plotId}; customer={custId}; price={price}; bp={bpKind}:{bpId}; comm={brokerComm}");
+                            $"plot={plotId}; customer={custId}; price={price}; deal={dealType}; bp={bpKind}:{bpId}; comm={brokerComm}");
                     }
                     catch { }
 
-                    new CustomeMessage("Plot allocate ho gaya (plot status: Hold).", "RealEstate Builders").ShowDialog();
+                    new CustomeMessage(
+                        "Plot allocate ho gaya (" + dealType + " — plot: " + plotStatus + ").",
+                        "RealEstate Builders").ShowDialog();
 
                     cmbPlotNo.DataSource = null;
                     RefreshAvailablePlots();
                     numPrice.Value = 0;
+                    try { if (numMonthlyInstallment != null) numMonthlyInstallment.Value = 0; } catch { }
                     txtAllocNotes.Clear();
                     dtpBookingDate.Value = DateTime.Today;
+                    try { if (cmbDealType != null) cmbDealType.SelectedIndex = 0; } catch { }
 
                     cmbBroker.SelectedIndex = -1;
                     if (numBrokerCommission.Minimum <= 0 && numBrokerCommission.Maximum >= 0)
@@ -357,6 +405,151 @@ namespace HubBuilders.Model
             {
                 HubBuilders.AppSafety.ShowSoft(ex);
             }
+        }
+
+        private void EnsureDealTypeCombo()
+        {
+            if (cmbDealType != null) return;
+
+            // Notes above Save/Close (panel2 dock bottom) — form taller; notes sit cleanly above buttons
+            try
+            {
+                if (label8 != null) label8.Top = 410;
+                if (txtAllocNotes != null)
+                {
+                    txtAllocNotes.Top = 435;
+                    txtAllocNotes.Height = 70;
+                }
+                // Keep Save/Close panel on bottom and above other controls
+                try
+                {
+                    var p2 = this.Controls["panel2"] as Panel;
+                    if (p2 != null)
+                    {
+                        p2.Dock = DockStyle.Bottom;
+                        p2.Height = 71;
+                        p2.BringToFront();
+                    }
+                }
+                catch { }
+            }
+            catch { }
+
+            lblDealType = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI Semibold", 12F, FontStyle.Bold),
+                ForeColor = Color.White,
+                BackColor = Color.Transparent,
+                Location = new Point(30, 340),
+                Text = "Deal Type"
+            };
+
+            cmbDealType = new Guna2ComboBox
+            {
+                Name = "cmbDealType",
+                AutoRoundedCorners = true,
+                BackColor = Color.Transparent,
+                BorderColor = Color.FromArgb(112, 51, 255),
+                BorderRadius = 17,
+                DrawMode = DrawMode.OwnerDrawFixed,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                FillColor = Color.FromArgb(37, 41, 74),
+                Font = new Font("Segoe UI Semibold", 12F, FontStyle.Bold),
+                ForeColor = Color.White,
+                ItemHeight = 30,
+                Location = new Point(17, 362),
+                Size = new Size(245, 36)
+            };
+            cmbDealType.Items.Add("Installment");
+            cmbDealType.Items.Add("Reserve");
+            cmbDealType.Items.Add("Sold");
+            cmbDealType.SelectedIndex = 0; // default Installment
+
+            this.Controls.Add(lblDealType);
+            this.Controls.Add(cmbDealType);
+            lblDealType.BringToFront();
+            cmbDealType.BringToFront();
+            try
+            {
+                var p2 = this.Controls["panel2"] as Panel;
+                if (p2 != null) p2.BringToFront();
+            }
+            catch { }
+            MakeScrollable(cmbDealType);
+        }
+
+        private void EnsureMonthlyInstallmentField()
+        {
+            if (numMonthlyInstallment != null) return;
+            lblMonthlyInstallment = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI Semibold", 12F, FontStyle.Bold),
+                ForeColor = Color.White,
+                BackColor = Color.Transparent,
+                Location = new Point(294, 340),
+                Text = "Monthly Installment"
+            };
+            numMonthlyInstallment = new Guna2NumericUpDown
+            {
+                Name = "numMonthlyInstallment",
+                AutoRoundedCorners = true,
+                BackColor = Color.FromArgb(32, 36, 61),
+                BorderColor = Color.FromArgb(112, 51, 255),
+                BorderRadius = 17,
+                FillColor = Color.FromArgb(37, 41, 74),
+                Font = new Font("Segoe UI", 9F),
+                ForeColor = Color.White,
+                Location = new Point(294, 362),
+                Size = new Size(245, 36),
+                Minimum = 0,
+                Maximum = 1000000000,
+                DecimalPlaces = 0,
+                Value = 0
+            };
+            this.Controls.Add(lblMonthlyInstallment);
+            this.Controls.Add(numMonthlyInstallment);
+            lblMonthlyInstallment.BringToFront();
+            numMonthlyInstallment.BringToFront();
+            try
+            {
+                var p2 = this.Controls["panel2"] as Panel;
+                if (p2 != null) p2.BringToFront();
+            }
+            catch { }
+        }
+
+        private void TryApplyBlockMonthlyDefault()
+        {
+            try
+            {
+                if (numMonthlyInstallment == null) return;
+                if (numMonthlyInstallment.Value > 0) return;
+                int bid;
+                if (!TryGetId(cmbBlock, out bid) || bid <= 0) return;
+                double def = BlockMonthlyInstallmentStore.GetAmountForBlock(bid);
+                if (def <= 0) return;
+                decimal d = (decimal)def;
+                if (d < numMonthlyInstallment.Minimum) d = numMonthlyInstallment.Minimum;
+                if (d > numMonthlyInstallment.Maximum) d = numMonthlyInstallment.Maximum;
+                numMonthlyInstallment.Value = d;
+            }
+            catch { }
+        }
+
+        private string GetSelectedDealType()
+        {
+            try
+            {
+                if (cmbDealType == null || cmbDealType.SelectedItem == null)
+                    return "Installment";
+                string s = Convert.ToString(cmbDealType.SelectedItem).Trim();
+                if (string.Equals(s, "Reserve", StringComparison.OrdinalIgnoreCase)) return "Reserve";
+                if (string.Equals(s, "Sold", StringComparison.OrdinalIgnoreCase)) return "Sold";
+                return "Installment";
+            }
+            catch { return "Installment"; }
         }
 
         // ================== Search mode: Guna2TextBox (theme fill — NOT black) ==================

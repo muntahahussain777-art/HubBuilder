@@ -1,4 +1,4 @@
-﻿namespace HubBuilders.Model
+namespace HubBuilders.Model
 {
     partial class frmAllocatePlotFormAdd
     {
@@ -420,7 +420,7 @@
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(9F, 21F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(799, 542);
+            this.ClientSize = new System.Drawing.Size(799, 640);
             this.Controls.Add(this.label10);
             this.Controls.Add(this.numBrokerCommission);
             this.Controls.Add(this.cmbBroker);

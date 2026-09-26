@@ -1,4 +1,4 @@
-﻿using HubBuilders.Model;
+using HubBuilders.Model;
 using System;
 using System.Collections.Generic;
 using System.Windows.Forms;

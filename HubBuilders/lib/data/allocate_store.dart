@@ -1,6 +1,8 @@
 import '../db/app_database.dart';
-import 'staff_audit.dart';
+import 'hub_sync.dart';
+import 'partner_cash_store.dart';
 import 'plot_inventory_store.dart';
+import 'staff_audit.dart';
 
 class CustomerItem {
   const CustomerItem(
@@ -96,8 +98,10 @@ class AllocationListRow {
     required this.type,
     required this.plotNo,
     required this.price,
-    required this.bookingDate,
+    required     this.bookingDate,
     required this.status,
+    this.staff = '',
+    this.monthlyInstallment = 0,
   });
 
   final int id;
@@ -110,6 +114,8 @@ class AllocationListRow {
   final double price;
   final String bookingDate;
   final String status;
+  final String staff;
+  final double monthlyInstallment;
 }
 
 /// SQLite-backed customers / brokers / customer_plots.
@@ -196,6 +202,123 @@ abstract final class AllocateStore {
     return n > 0;
   }
 
+  /// Cascade: pehle receipts → phir allocate → phir customer.
+  static Future<({bool ok, String message})> deleteCustomer(int id) async {
+    final db = await AppDatabase.instance.database;
+    final recObj = await db.rawQuery(
+      '''
+SELECT COUNT(*) AS c
+FROM receipts r
+JOIN customer_plots cp ON cp.id = r.customer_plot_id
+WHERE cp.customer_id = ?''',
+      [id],
+    );
+    final recCount = (recObj.first['c'] as num?)?.toInt() ?? 0;
+    if (recCount > 0) {
+      return (
+        ok: false,
+        message:
+            'Customer delete allow nahi.\nPehle Receipt Form se is customer ki $recCount receipt(s) delete karein.\nPhir Allocate se delete, phir customer.',
+      );
+    }
+
+    final allocObj = await db.rawQuery(
+      'SELECT COUNT(*) AS c FROM customer_plots WHERE customer_id = ?',
+      [id],
+    );
+    final allocCount = (allocObj.first['c'] as num?)?.toInt() ?? 0;
+    if (allocCount > 0) {
+      return (
+        ok: false,
+        message:
+            'Customer delete allow nahi.\nPehle Allocate se is customer ki $allocCount allocation(s) delete karein.\nPhir customer delete hoga.',
+      );
+    }
+
+    final n = await StaffAudit.delete(
+      'customers',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    if (n <= 0) {
+      return (ok: false, message: 'Customer delete failed / not found.');
+    }
+    return (ok: true, message: 'Customer delete ho gaya.');
+  }
+
+  /// Hard delete allocation — linked receipts/ledger/partner cash bhi (WinForms cascade).
+  static Future<({bool ok, String message})> deleteAllocation(
+    int customerPlotId,
+  ) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'customer_plots',
+      where: 'id = ?',
+      whereArgs: [customerPlotId],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return (ok: false, message: 'Allocation not found.');
+    }
+    final plotId = rows.first['plot_id'] as int;
+    final status = (rows.first['status'] as String?) ?? '';
+
+    try {
+      try {
+        await db.delete(
+          'allocation_cancellations',
+          where: 'customer_plot_id = ?',
+          whereArgs: [customerPlotId],
+        );
+      } catch (_) {}
+      await StaffAudit.delete(
+        'partner_money',
+        where: 'customer_plot_id = ?',
+        whereArgs: [customerPlotId],
+      );
+      await StaffAudit.delete(
+        'receipts',
+        where: 'customer_plot_id = ?',
+        whereArgs: [customerPlotId],
+      );
+      await StaffAudit.delete(
+        'ledger',
+        where: 'customer_plot_id = ?',
+        whereArgs: [customerPlotId],
+      );
+      try {
+        await StaffAudit.delete(
+          'customer_plot_partners',
+          where: 'customer_plot_id = ?',
+          whereArgs: [customerPlotId],
+        );
+      } catch (_) {}
+
+      final n = await StaffAudit.delete(
+        'customer_plots',
+        where: 'id = ?',
+        whereArgs: [customerPlotId],
+      );
+      if (n <= 0) {
+        return (ok: false, message: 'Allocation delete failed.');
+      }
+
+      if (status == 'Active' || status == 'Hold') {
+        await db.update(
+          'plots',
+          {'status': 'Available'},
+          where: "id = ? AND status IN ('Hold','Sold')",
+          whereArgs: [plotId],
+        );
+        await HubSync.pushNow('plots', plotId);
+      }
+      HubSync.notifyLocalWrite();
+      return (ok: true, message: 'Allocation delete ho gaya.');
+    } catch (e) {
+      return (ok: false, message: 'Allocation delete failed: $e');
+    }
+  }
+
   static Future<List<BrokerItem>> brokers({bool activeOnly = false}) async {
     final db = await AppDatabase.instance.database;
     final rows = await db.query(
@@ -267,6 +390,15 @@ abstract final class AllocateStore {
     return n > 0;
   }
 
+  static Future<bool> deleteBroker(int id) async {
+    final n = await StaffAudit.delete(
+      'brokers',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
   static Future<AllocationRecord?> allocationById(int id) async {
     final db = await AppDatabase.instance.database;
     final rows =
@@ -286,6 +418,7 @@ abstract final class AllocateStore {
     final q = query.trim().toLowerCase();
     final rows = await db.rawQuery('''
 SELECT cp.id, cp.price, cp.booking_date, cp.status,
+       COALESCE(cp.monthly_installment,0) AS monthly_installment,
        c.name AS customer, c.mobile AS phone,
        s.name AS society, b.name AS block, pt.code AS type,
        p.plot_no
@@ -295,6 +428,7 @@ JOIN plots p ON p.id = cp.plot_id
 JOIN societies s ON s.id = p.society_id
 JOIN blocks b ON b.id = p.block_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
+WHERE IFNULL(cp.status,'') <> 'Cancelled'
 ORDER BY cp.id DESC
 ''');
 
@@ -311,6 +445,8 @@ ORDER BY cp.id DESC
         price: (r['price'] as num?)?.toDouble() ?? 0,
         bookingDate: r['booking_date'] as String? ?? '',
         status: r['status'] as String? ?? '',
+        monthlyInstallment: (r['monthly_installment'] as num?)?.toDouble() ?? 0,
+        staff: await StaffAudit.staffForId(r['id'] as int),
       );
       if (q.isEmpty ||
           row.customer.toLowerCase().contains(q) ||
@@ -336,17 +472,15 @@ ORDER BY cp.id DESC
     required String notes,
     required int brokerId,
     required double brokerCommission,
+    int partnerId = 0,
+    String dealType = 'Installment',
+    double monthlyInstallment = 0,
   }) async {
-    if (price <= 0) {
-      return (ok: false, message: 'Price required hai.', allocId: 0);
-    }
-    if (brokerCommission < 0) {
-      return (
-        ok: false,
-        message: 'Broker commission 0 ya us se zyada honi chahiye.',
-        allocId: 0,
-      );
-    }
+    // Price / broker / commission optional — 0 = reserve without money
+    if (price < 0) price = 0;
+    if (brokerCommission < 0) brokerCommission = 0;
+    final deal = _normalizeDealType(dealType);
+    final plotStatus = deal == 'Sold' ? 'Sold' : 'Hold';
 
     final plot = await PlotInventoryStore.plotById(plotId);
     if (plot == null ||
@@ -360,7 +494,7 @@ ORDER BY cp.id DESC
       );
     }
 
-    if (!await PlotInventoryStore.holdIfAvailable(plotId)) {
+    if (!await PlotInventoryStore.holdIfAvailable(plotId, status: plotStatus)) {
       return (
         ok: false,
         message: 'Selected plot ab Available nahi raha.',
@@ -370,6 +504,8 @@ ORDER BY cp.id DESC
 
     try {
       final db = await AppDatabase.instance.database;
+      await AppDatabase.ensureCustomerPlotsDealType(db);
+      await AppDatabase.ensureCustomerPlotsMonthlyInstallment(db);
       final id = await db.insert('customer_plots', {
         'customer_id': customerId,
         'plot_id': plotId,
@@ -380,12 +516,26 @@ ORDER BY cp.id DESC
         'broker_id': brokerId > 0 ? brokerId : null,
         'broker_commission': brokerCommission,
         'down_payment': 0,
+        'deal_type': deal,
+        'monthly_installment': monthlyInstallment < 0 ? 0 : monthlyInstallment,
       });
+      if (partnerId > 0) {
+        try {
+          await PartnerCashStore.syncAllocationPartnerCommission(
+            customerPlotId: id,
+            partnerId: partnerId,
+            amount: brokerCommission,
+            txnDate: bookingDate,
+          );
+        } catch (_) {}
+      }
       await StaffAudit.log('Insert', 'customer_plots',
-          detail: 'id=$id; plotId=$plotId; price=$price');
+          detail: 'id=$id; plotId=$plotId; price=$price; deal=$deal; partner=$partnerId');
+      await HubSync.pushNow('customer_plots', id);
+      HubSync.notifyLocalWrite();
       return (
         ok: true,
-        message: 'Plot allocate ho gaya (plot status: Hold).',
+        message: 'Plot allocate ho gaya ($deal — plot: $plotStatus).',
         allocId: id,
       );
     } catch (e) {
@@ -396,5 +546,164 @@ ORDER BY cp.id DESC
         allocId: 0,
       );
     }
+  }
+
+  static String _normalizeDealType(String? raw) {
+    final s = (raw ?? '').trim().toLowerCase();
+    if (s == 'reserve') return 'Reserve';
+    if (s == 'sold') return 'Sold';
+    return 'Installment';
+  }
+
+  static Future<({bool ok, String message})> updateAllocation({
+    required int customerPlotId,
+    required double price,
+    required String bookingDate,
+    required String notes,
+    int brokerId = 0,
+    double brokerCommission = 0,
+    double monthlyInstallment = 0,
+  }) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'customer_plots',
+      where: 'id = ?',
+      whereArgs: [customerPlotId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return (ok: false, message: 'Allocation not found.');
+    if ((rows.first['status'] as String?) != 'Active') {
+      return (ok: false, message: 'Only Active allocation edit ho sakti hai.');
+    }
+    await db.update(
+      'customer_plots',
+      {
+        'price': price,
+        'booking_date': bookingDate,
+        'notes': notes,
+        'broker_id': brokerId > 0 ? brokerId : null,
+        'broker_commission': brokerCommission,
+        'monthly_installment': monthlyInstallment < 0 ? 0 : monthlyInstallment,
+      },
+      where: 'id = ?',
+      whereArgs: [customerPlotId],
+    );
+    await StaffAudit.log('Update', 'customer_plots',
+        detail: 'id=$customerPlotId; price=$price');
+    await HubSync.pushNow('customer_plots', customerPlotId);
+    HubSync.notifyLocalWrite();
+    return (ok: true, message: 'Allocation updated.');
+  }
+
+  /// WinForms cancel — deduction % on received, free plot to Available.
+  static Future<({bool ok, String message})> cancelAllocation({
+    required int customerPlotId,
+    double deductionPercent = 30,
+    String? notes,
+  }) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.rawQuery(
+      '''
+SELECT cp.id, cp.plot_id, cp.status, cp.notes,
+  COALESCE((SELECT SUM(amount) FROM receipts r WHERE r.customer_plot_id = cp.id),0) AS received
+FROM customer_plots cp WHERE cp.id = ?''',
+      [customerPlotId],
+    );
+    if (rows.isEmpty) return (ok: false, message: 'Allocation not found.');
+    final r = rows.first;
+    if ((r['status'] as String?) != 'Active') {
+      return (ok: false, message: 'Only Active allocation cancel ho sakti hai.');
+    }
+    final received = (r['received'] as num?)?.toDouble() ?? 0;
+    final plotId = r['plot_id'] as int;
+    final pct = deductionPercent.clamp(0, 100);
+    final deduction = received * pct / 100;
+    final refundable = received - deduction;
+    final cancelDate = DateTime.now().toIso8601String().split('T').first;
+
+    final cancelId = await db.insert('allocation_cancellations', {
+      'customer_plot_id': customerPlotId,
+      'cancel_date': cancelDate,
+      'deduction_percent': pct,
+      'allocation_amount': 0,
+      'received_amount': received,
+      'deduction_amount': deduction,
+      'refundable_amount': refundable,
+      'notes': notes,
+    });
+
+    final oldNotes = (r['notes'] as String?) ?? '';
+    final append =
+        ' [Cancelled $cancelDate; ded=$pct%; refund=${refundable.toStringAsFixed(2)}]';
+    await db.update(
+      'customer_plots',
+      {
+        'status': 'Cancelled',
+        'cancelled_date': cancelDate,
+        'cancellation_id': cancelId,
+        'notes': oldNotes + append,
+      },
+      where: 'id = ?',
+      whereArgs: [customerPlotId],
+    );
+    await db.update(
+      'plots',
+      {'status': 'Available'},
+      where: 'id = ?',
+      whereArgs: [plotId],
+    );
+    await StaffAudit.log('Cancel', 'customer_plots',
+        detail: 'id=$customerPlotId; refund=$refundable');
+    await HubSync.pushNow('customer_plots', customerPlotId);
+    await HubSync.pushNow('plots', plotId);
+    HubSync.notifyLocalWrite();
+    return (ok: true, message: 'Allocation cancelled. Plot Available.');
+  }
+
+  static Future<({bool ok, String message})> setStatus({
+    required int customerPlotId,
+    required String status,
+  }) async {
+    if (status != 'Active' && status != 'Cancelled' && status != 'Completed') {
+      return (ok: false, message: 'Invalid status.');
+    }
+    if (status == 'Cancelled') {
+      return cancelAllocation(customerPlotId: customerPlotId);
+    }
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'customer_plots',
+      where: 'id = ?',
+      whereArgs: [customerPlotId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return (ok: false, message: 'Not found.');
+    final plotId = rows.first['plot_id'] as int;
+    final cur = rows.first['status'] as String? ?? '';
+    if (cur == 'Completed' && status != 'Completed') {
+      return (ok: false, message: 'Completed allocation status change nahi.');
+    }
+    await db.update(
+      'customer_plots',
+      {'status': status},
+      where: 'id = ?',
+      whereArgs: [customerPlotId],
+    );
+    if (status == 'Completed') {
+      await db.update(
+        'plots',
+        {'status': 'Sold'},
+        where: 'id = ?',
+        whereArgs: [plotId],
+      );
+    }
+    await StaffAudit.log('Update', 'customer_plots',
+        detail: 'id=$customerPlotId; status=$status');
+    await HubSync.pushNow('customer_plots', customerPlotId);
+    if (status == 'Completed') {
+      await HubSync.pushNow('plots', plotId);
+    }
+    HubSync.notifyLocalWrite();
+    return (ok: true, message: 'Status updated.');
   }
 }

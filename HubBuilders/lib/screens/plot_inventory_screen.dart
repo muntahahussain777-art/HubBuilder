@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../data/plot_inventory_store.dart';
+import '../data/hub_sync.dart';
 import '../logic/plot_no_helper.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
@@ -33,7 +34,19 @@ class _PlotInventoryScreenState extends State<PlotInventoryScreen> {
   @override
   void initState() {
     super.initState();
+    HubSync.revision.addListener(_onSync);
     _loadSocieties();
+  }
+
+  @override
+  void dispose() {
+    HubSync.revision.removeListener(_onSync);
+    _startPlot.dispose();
+    super.dispose();
+  }
+
+  void _onSync() {
+    if (mounted) _loadSocieties();
   }
 
   Future<void> _loadSocieties() async {
@@ -61,12 +74,6 @@ class _PlotInventoryScreenState extends State<PlotInventoryScreen> {
       _blocks = blocks;
       _types = types;
     });
-  }
-
-  @override
-  void dispose() {
-    _startPlot.dispose();
-    super.dispose();
   }
 
   void _toast(String msg) {

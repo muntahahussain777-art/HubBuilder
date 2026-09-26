@@ -101,6 +101,7 @@
     <Reference Include="System.Deployment" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Net.Http" />
+    <Reference Include="System.Web.Extensions" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Xml" />
   </ItemGroup>
@@ -113,6 +114,10 @@
       <DependentUpon>ActivationForm.cs</DependentUpon>
     </Compile>
     <Compile Include="ActivationStore.cs" />
+    <Compile Include="SupabaseConfig.cs" />
+    <Compile Include="HubSyncService.cs" />
+    <Compile Include="HubDuplicateCleanup.cs" />
+    <Compile Include="StaffGridHelper.cs" />
     <Compile Include="DataSet\dsBrokerCommision.Designer.cs">
       <AutoGen>True</AutoGen>
       <DesignTime>True</DesignTime>
@@ -197,6 +202,16 @@
       <DependentUpon>LoginForm.cs</DependentUpon>
     </Compile>
     <Compile Include="AppSafety.cs" />
+    <Compile Include="HubLiveToast.cs" />
+    <Compile Include="HubAutoBackup.cs" />
+    <Compile Include="ReportPdfHelper.cs" />
+    <Compile Include="HubWhatsAppPdfHelper.cs" />
+    <Compile Include="StaffAccess.cs" />
+    <Compile Include="BlockMonthlyInstallmentStore.cs" />
+    <Compile Include="View\frmBlockMonthlyInstallment.cs" />
+    <Compile Include="View\frmStaffRolePermissions.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="MainClass.cs" />
     <Compile Include="MainForm.cs">
       <SubType>Form</SubType>
@@ -384,6 +399,7 @@
     <Compile Include="Report Form\frmTemporaryAllotmentLetterBlank.Designer.cs">
       <DependentUpon>frmTemporaryAllotmentLetterBlank.cs</DependentUpon>
     </Compile>
+    <Compile Include="Report Form\LasbelaReceiptToCustomerReceipt.cs" />
     <Compile Include="Report Form\frmLasbelaVillageReceipt.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -429,6 +445,42 @@
     <Compile Include="Report Form\frmVipCustomerAllPlotsReceipts.cs">
       <SubType>Form</SubType>
     </Compile>
+    <Compile Include="Report Form\frmDuesWhatsAppList.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmReceiptsMinusPartnerCredit.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipAllocateTotals.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmInstallmentDetectionReport.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmMonthCollectionVip.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipBusinessAnalysis.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmRoughInstallmentEstimate.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmAvailablePlotsReport.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmExpenseReport.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmPlotStatusOwnerReport.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipStaffSalaryMessage.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipPlotAllocationWhatsApp.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="Report Form\frmVipDuesAging.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -436,6 +488,7 @@
       <DependentUpon>frmVipDuesAging.cs</DependentUpon>
     </Compile>
     <Compile Include="Report Form\ReportHeaderSocietyHelper.cs" />
+    <Compile Include="Report Form\Ctrl1SuggestHelper.cs" />
     <Compile Include="Report Form\frmBrokerCommissionform.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -910,6 +963,15 @@
     <EmbeddedResource Include="Reports\inventoryStatusReport.rdlc">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </EmbeddedResource>
+    <EmbeddedResource Include="Reports\AvailablePlotsReport.rdlc">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Reports\ExpenseReport.rdlc">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Reports\BusinessAnalysis.rdlc">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
     <EmbeddedResource Include="Reports\monthlywiseReport.rdlc">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </EmbeddedResource>
@@ -1158,6 +1220,13 @@
   </ItemGroup>
   <ItemGroup />
   <ItemGroup>
+    <Content Include="supabase_config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\supabase\hubbuilders.sql">
+      <Link>supabase\hubbuilders.sql</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="ChatGPT Image Jul 30, 2026, 03_09_36 PM.ico" />
     <Content Include="FarhadCityForm.png" />
     <Content Include="Reports\ApplicationFormFront.png">

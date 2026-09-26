@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 
+import '../data/block_monthly_store.dart';
 import '../data/plot_inventory_store.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 
-/// Same fields as C# `frmBlockFormAdd` — SQLite `blocks`.
+/// Same fields as C# `frmBlockFormAdd` — SQLite `blocks` + block_monthly_installments.
 class BlockFormScreen extends StatefulWidget {
   const BlockFormScreen({
     super.key,
@@ -29,6 +30,7 @@ class BlockFormScreen extends StatefulWidget {
 
 class _BlockFormScreenState extends State<BlockFormScreen> {
   late final TextEditingController _blockName;
+  late final TextEditingController _monthly;
   IdName? _society;
   List<IdName> _societies = const [];
   bool _loading = true;
@@ -38,6 +40,7 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
   void initState() {
     super.initState();
     _blockName = TextEditingController(text: widget.blockName ?? '');
+    _monthly = TextEditingController();
     _load();
   }
 
@@ -54,10 +57,16 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
         selected = list.firstWhere((s) => s.name == widget.societyName);
       } catch (_) {}
     }
+    var monthlyText = '';
+    if (widget.isEdit && widget.id != null) {
+      final m = await BlockMonthlyStore.amountForBlock(widget.id!);
+      if (m > 0) monthlyText = m.toStringAsFixed(0);
+    }
     if (!mounted) return;
     setState(() {
       _societies = list;
       _society = selected;
+      _monthly.text = monthlyText;
       _loading = false;
     });
   }
@@ -65,11 +74,13 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
   @override
   void dispose() {
     _blockName.dispose();
+    _monthly.dispose();
     super.dispose();
   }
 
   void _clear() {
     _blockName.clear();
+    _monthly.clear();
     setState(() => _society = null);
   }
 
@@ -86,19 +97,31 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
       );
       return;
     }
+    final monthly = double.tryParse(_monthly.text.trim().replaceAll(',', '')) ?? 0;
+    if (monthly < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Monthly installment 0 ya us se zyada.')),
+      );
+      return;
+    }
     setState(() => _saving = true);
     try {
+      int blockId;
       if (widget.isEdit && widget.id != null) {
         await PlotInventoryStore.updateBlock(
           id: widget.id!,
           societyId: _society!.id,
           name: _blockName.text,
         );
+        blockId = widget.id!;
       } else {
-        await PlotInventoryStore.insertBlock(
+        blockId = await PlotInventoryStore.insertBlock(
           societyId: _society!.id,
           name: _blockName.text,
         );
+      }
+      if (blockId > 0) {
+        await BlockMonthlyStore.upsertForBlock(blockId, monthly);
       }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -119,6 +142,29 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(context, 'Delete this block?');
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await PlotInventoryStore.deleteBlock(widget.id!);
+      if (!mounted) return;
+      if (widget.onBack != null) {
+        widget.onBack!();
+      } else if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop(true);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Delete failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final title = widget.isEdit ? 'Block Edit' : 'BlockForm';
@@ -129,7 +175,7 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
             children: [
               SectionHeader(
                 title: title,
-                subtitle: 'Society, Block',
+                subtitle: 'Society, Block, Monthly Installment',
                 trailing: widget.onBack == null
                     ? null
                     : IconButton(
@@ -163,7 +209,20 @@ class _BlockFormScreenState extends State<BlockFormScreen> {
                       decoration:
                           const InputDecoration(labelText: 'Block Name'),
                     ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _monthly,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Monthly Installment',
+                        hintText: '0',
+                      ),
+                    ),
                     const SizedBox(height: 20),
+                    if (widget.isEdit && widget.id != null) ...[
+                      FormDeleteButton(onPressed: _saving ? null : _delete),
+                      const SizedBox(height: 12),
+                    ],
                     Row(
                       children: [
                         Expanded(

@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Data;
+using System.Globalization;
 using System.Windows.Forms;
 
 namespace HubBuilders.Model
@@ -48,6 +49,17 @@ namespace HubBuilders.Model
             SafeClose();
         }
 
+        private double ParseMonthly()
+        {
+            string s = (txtMonthlyInstallment?.Text ?? "").Trim().Replace(",", "");
+            if (string.IsNullOrEmpty(s)) return 0;
+            double d;
+            if (!double.TryParse(s, NumberStyles.Number, CultureInfo.InvariantCulture, out d)
+                && !double.TryParse(s, NumberStyles.Number, CultureInfo.CurrentCulture, out d))
+                return 0;
+            return d < 0 ? 0 : d;
+        }
+
         public override void btnSave_Click(object sender, EventArgs e)
         {
             if (cbSociety.SelectedValue == null)
@@ -63,6 +75,7 @@ namespace HubBuilders.Model
 
             int societyId = Convert.ToInt32(cbSociety.SelectedValue);
             string blockName = txtBlockName.Text.Trim();
+            double monthly = ParseMonthly();
 
             // (society_id, name) unique check
             string dupQry = "SELECT COUNT(1) FROM blocks WHERE society_id=@sid AND lower(name)=lower(@name) "
@@ -93,10 +106,30 @@ namespace HubBuilders.Model
             int res = MainClass.ExecuteNonQuery(qry, p);
             if (res > 0)
             {
+                int blockId = id;
+                if (blockId <= 0)
+                {
+                    try
+                    {
+                        object oid = MainClass.ExecuteScalar(
+                            "SELECT id FROM blocks WHERE society_id=@sid AND lower(name)=lower(@name) ORDER BY id DESC LIMIT 1;",
+                            new Dictionary<string, object> { { "@sid", societyId }, { "@name", blockName } });
+                        if (oid != null && oid != DBNull.Value)
+                            blockId = Convert.ToInt32(oid);
+                    }
+                    catch { blockId = 0; }
+                }
+                if (blockId > 0)
+                {
+                    try { BlockMonthlyInstallmentStore.UpsertForBlock(blockId, monthly); }
+                    catch { }
+                }
+
                 new CustomeMessage(id == 0 ? "Block save ho gaya." : "Block update ho gaya.", "RealEstate Builders").ShowDialog();
                 id = 0;
                 cbSociety.SelectedIndex = -1;
                 txtBlockName.Clear();
+                if (txtMonthlyInstallment != null) txtMonthlyInstallment.Clear();
                 cbSociety.Focus();
             }
             else
@@ -123,6 +156,17 @@ namespace HubBuilders.Model
             {
                 cbSociety.SelectedValue = Convert.ToInt32(dt.Rows[0]["society_id"]);
                 txtBlockName.Text = Convert.ToString(dt.Rows[0]["name"]);
+            }
+
+            try
+            {
+                double m = BlockMonthlyInstallmentStore.GetAmountForBlock(editId);
+                if (txtMonthlyInstallment != null)
+                    txtMonthlyInstallment.Text = m > 0 ? m.ToString("0", CultureInfo.InvariantCulture) : "";
+            }
+            catch
+            {
+                if (txtMonthlyInstallment != null) txtMonthlyInstallment.Text = "";
             }
         }
     }

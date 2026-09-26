@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -67,7 +67,7 @@ namespace HubBuilders.ProjectConnection
             }
 
             // Return the SQLite connection string for the AppData database file
-            return $@"Data Source={dbFilePath};Version=3;";
+            return $@"Data Source={dbFilePath};Version=3;Busy Timeout=8000;Journal Mode=Wal;";
         }
     }
 }

@@ -20,6 +20,8 @@ namespace HubBuilders.Report_Form
         {
             InitializeComponent();
             BuildFields();
+            HubBuilders.ReportPdfHelper.Attach(panelButtons, btnPreview, reportViewer1, "TemporaryAllotmentLetter",
+                () => btnPreview_Click(this, EventArgs.Empty));
         }
 
         private void frmTemporaryAllotmentLetter_Load(object sender, EventArgs e)

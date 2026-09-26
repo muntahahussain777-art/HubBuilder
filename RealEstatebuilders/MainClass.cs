@@ -1,4 +1,4 @@
-﻿using HubBuilders.ProjectConnection;
+using HubBuilders.ProjectConnection;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -32,6 +32,7 @@ namespace HubBuilders
         public static void SetRole(string role)
         {
             LoggedInRole = NormalizeRole(role);
+            try { StaffAccess.Invalidate(); } catch { }
         }
 
         /// <summary>Login ke baad staff session — entries pe kaun tha yeh track hota hai.</summary>
@@ -41,6 +42,7 @@ namespace HubBuilders
             LoggedInName = string.IsNullOrWhiteSpace(displayName) ? (username ?? "") : displayName.Trim();
             LoggedInRole = NormalizeRole(role);
             try { EnsureStaffAuditSchema(); } catch { }
+            try { StaffAccess.Invalidate(); } catch { }
         }
 
         /// <summary>Logout — stale role/audit identity clear.</summary>
@@ -49,6 +51,7 @@ namespace HubBuilders
             LoggedInUsername = "";
             LoggedInName = "";
             LoggedInRole = "";
+            try { StaffAccess.Invalidate(); } catch { }
         }
 
         private static string NormalizeRole(string role)
@@ -89,6 +92,82 @@ namespace HubBuilders
                 EnsurePartnerMoneySchema();
                 EnsureExpenseCategorySchema();
                 EnsureCustomerSchema();
+                EnsureAllocationSchema(); // deal_type Installment/Reserve/Sold (old rows → Installment)
+                try { StaffAccess.EnsureSchema(); } catch { }
+                try { BlockMonthlyInstallmentStore.EnsureSchema(); } catch { }
+                try { HubSyncService.ReconcileOneActiveCustomerPlots(); } catch { }
+                try { BlockMonthlyInstallmentStore.ApplyToEmptyActive(); } catch { }
+                HubSyncService.EnsureLocalSchema();
+                try { HubDuplicateCleanup.Run(); } catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Built-in Admin login — software ke sath lock. Supabase / form se change nahi.
+        /// </summary>
+        public const string BuiltInAdminUser = "Admin";
+        public const string BuiltInAdminPass = "hubbuilder786";
+
+        public static bool IsBuiltInAdminUsername(string username)
+        {
+            return string.Equals((username ?? "").Trim(), BuiltInAdminUser, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static bool IsBuiltInAdminLogin(string username, string password)
+        {
+            return IsBuiltInAdminUsername(username)
+                && string.Equals((password ?? "").Trim(), BuiltInAdminPass, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Login hamesha local SQLite + built-in Admin. Internet na ho to bhi chale.
+        /// Admin row delete/overwrite se recover — password hamesha hubbuilder786.
+        /// </summary>
+        public static void EnsureLocalLoginUser()
+        {
+            try
+            {
+                using (var local = new SQLiteConnection(con_string))
+                {
+                    local.Open();
+                    using (var chk = new SQLiteCommand(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='users' LIMIT 1;", local))
+                    {
+                        if (chk.ExecuteScalar() == null) return;
+                    }
+                    object exists;
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT userID FROM users WHERE lower(trim(username)) = 'admin' LIMIT 1;", local))
+                        exists = cmd.ExecuteScalar();
+                    if (exists != null && exists != DBNull.Value)
+                    {
+                        using (var cmd = new SQLiteCommand(@"
+UPDATE users
+SET username=@u, upass=@p, Role=@r,
+    uName = CASE WHEN IFNULL(TRIM(uName),'')='' THEN @n ELSE uName END
+WHERE lower(trim(username)) = 'admin';", local))
+                        {
+                            cmd.Parameters.AddWithValue("@u", BuiltInAdminUser);
+                            cmd.Parameters.AddWithValue("@p", BuiltInAdminPass);
+                            cmd.Parameters.AddWithValue("@r", "Admin");
+                            cmd.Parameters.AddWithValue("@n", "Administrator");
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+                    else
+                    {
+                        using (var cmd = new SQLiteCommand(
+                            "INSERT INTO users (username, upass, uName, uphone, Role) VALUES (@u,@p,@n,'',@r);", local))
+                        {
+                            cmd.Parameters.AddWithValue("@u", BuiltInAdminUser);
+                            cmd.Parameters.AddWithValue("@p", BuiltInAdminPass);
+                            cmd.Parameters.AddWithValue("@n", "Administrator");
+                            cmd.Parameters.AddWithValue("@r", "Admin");
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+                }
             }
             catch { }
         }
@@ -210,6 +289,7 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     }
                 }
                 _staffAuditReady = true;
+                try { HubSyncService.MarkDirty(); } catch { }
             }
             catch
             {
@@ -245,6 +325,284 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             catch { }
         }
 
+        private static void AfterSuccessfulWrite(string qry, int res, long lastInsertId, System.Collections.IDictionary parameters)
+        {
+            if (res <= 0) return;
+            try
+            {
+                string head = (qry ?? "").TrimStart();
+                bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
+                bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                bool isDelete = head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
+                long idForLog = 0;
+                if (isInsert && lastInsertId > 0) idForLog = lastInsertId;
+                else if (isUpdate || isDelete) idForLog = IdFromParams(parameters);
+
+                string s = (qry ?? "").TrimStart();
+                if (s.Length >= 6
+                    && s.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
+                    && s.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0
+                    && s.IndexOf("sync_state", StringComparison.OrdinalIgnoreCase) < 0
+                    && s.IndexOf("sync_known", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    string action = isInsert ? "Insert" : isUpdate ? "Update" : isDelete ? "Delete" : null;
+                    if (action != null)
+                    {
+                        string module = ExtractSqlTableName(s, action);
+                        if (string.IsNullOrWhiteSpace(module)) module = "Unknown";
+                        string detail = idForLog > 0
+                            ? ("id=" + idForLog)
+                            : (s.Length > 180 ? s.Substring(0, 180) + "…" : s);
+                        LogStaffEntry(action, module, detail);
+                    }
+                }
+            }
+            catch { }
+            try { HubSyncService.MarkDirty(); } catch { }
+            try
+            {
+                string head = (qry ?? "").TrimStart();
+                bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
+                bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                if ((isInsert || isUpdate)
+                    && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
+                    && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
+                    && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    HubSyncService.ScheduleBackgroundPushPublic();
+                }
+            }
+            catch { }
+            try
+            {
+                string head = (qry ?? "").TrimStart();
+                bool dml = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
+                    || head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+                    || head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
+                if (dml
+                    && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
+                    && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
+                    && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
+                    HubAutoBackup.OnLocalWrite();
+            }
+            catch { }
+            try
+            {
+                string head = (qry ?? "").TrimStart();
+                bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
+                bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                bool isDelete = head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
+                if (isInsert || isUpdate || isDelete)
+                {
+                    if (head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
+                        && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        string action = isInsert ? "Insert" : isUpdate ? "Update" : "Delete";
+                        string module = ExtractSqlTableName(head, action) ?? "entry";
+                        HubSyncService.NotifyActivity(action, module);
+                    }
+                    else
+                        HubSyncService.RaiseLiveChanged();
+                }
+            }
+            catch { }
+        }
+
+        private struct DeleteTarget
+        {
+            public string Table;
+            public long LocalPk;
+            public List<string> SyncIds;
+        }
+
+        private static List<DeleteTarget> PeekDeleteSyncIds(string qry, IDictionary ht)
+        {
+            var list = new List<DeleteTarget>();
+            try
+            {
+                string s = (qry ?? "").TrimStart();
+                if (!s.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)) return list;
+                if (s.IndexOf("sync_state", StringComparison.OrdinalIgnoreCase) >= 0) return list;
+                if (s.IndexOf("sync_known", StringComparison.OrdinalIgnoreCase) >= 0) return list;
+                if (s.IndexOf("sync_hash", StringComparison.OrdinalIgnoreCase) >= 0) return list;
+                if (s.IndexOf("sync_alias", StringComparison.OrdinalIgnoreCase) >= 0) return list;
+                if (s.IndexOf("sync_pending_delete", StringComparison.OrdinalIgnoreCase) >= 0) return list;
+                if (s.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) >= 0) return list;
+                string table = ExtractSqlTableName(s, "Delete");
+                if (string.IsNullOrWhiteSpace(table)) return list;
+                string pk = HubSyncService.TablePk(table);
+                string select = System.Text.RegularExpressions.Regex.Replace(
+                    s, @"^DELETE\s+FROM", "SELECT \"" + pk + "\" FROM",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                foreach (var row in QueryDeleteTargets(select, ht))
+                {
+                    if (row.Item1 <= 0) continue;
+                    list.Add(new DeleteTarget
+                    {
+                        Table = table,
+                        LocalPk = row.Item1,
+                        SyncIds = HubSyncService.CollectCloudDeleteIds(table, row.Item1)
+                    });
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        private static List<Tuple<long, string>> QueryDeleteTargets(string sql, IDictionary ht)
+        {
+            var rows = new List<Tuple<long, string>>();
+            try
+            {
+                Action<SQLiteConnection> run = c =>
+                {
+                    using (SQLiteCommand cmd = new SQLiteCommand(sql, c))
+                    {
+                        BindIDict(cmd, ht);
+                        using (var r = cmd.ExecuteReader())
+                        {
+                            while (r.Read())
+                            {
+                                if (r.FieldCount < 1 || r.IsDBNull(0)) continue;
+                                long pk = Convert.ToInt64(r.GetValue(0));
+                                string sid = r.FieldCount > 1 && !r.IsDBNull(1)
+                                    ? Convert.ToString(r.GetValue(1) ?? "").Trim()
+                                    : "";
+                                rows.Add(Tuple.Create(pk, sid));
+                            }
+                        }
+                    }
+                };
+                if (_sharedWorkDepth > 0)
+                {
+                    lock (_conLock)
+                    {
+                        EnsureSharedOpen();
+                        run(con);
+                    }
+                }
+                else
+                {
+                    using (var local = new SQLiteConnection(con_string))
+                    {
+                        local.Open();
+                        run(local);
+                    }
+                }
+            }
+            catch { }
+            return rows;
+        }
+
+        private static List<string> QueryTextColumn(string sql, IDictionary ht)
+        {
+            var ids = new List<string>();
+            try
+            {
+                if (_sharedWorkDepth > 0)
+                {
+                    lock (_conLock)
+                    {
+                        EnsureSharedOpen();
+                        using (SQLiteCommand cmd = new SQLiteCommand(sql, con))
+                        {
+                            BindIDict(cmd, ht);
+                            using (var r = cmd.ExecuteReader())
+                            {
+                                while (r.Read())
+                                {
+                                    if (r.FieldCount < 1 || r.IsDBNull(0)) continue;
+                                    string s = Convert.ToString(r.GetValue(0) ?? "");
+                                    if (!string.IsNullOrWhiteSpace(s)) ids.Add(s.Trim());
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    using (var local = new SQLiteConnection(con_string))
+                    {
+                        local.Open();
+                        using (SQLiteCommand cmd = new SQLiteCommand(sql, local))
+                        {
+                            BindIDict(cmd, ht);
+                            using (var r = cmd.ExecuteReader())
+                            {
+                                while (r.Read())
+                                {
+                                    if (r.FieldCount < 1 || r.IsDBNull(0)) continue;
+                                    string s = Convert.ToString(r.GetValue(0) ?? "");
+                                    if (!string.IsNullOrWhiteSpace(s)) ids.Add(s.Trim());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return ids;
+        }
+
+        private static void BindIDict(SQLiteCommand cmd, IDictionary ht)
+        {
+            if (ht == null) return;
+            foreach (DictionaryEntry item in ht)
+                cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value ?? DBNull.Value);
+        }
+
+        private static void PushCloudDeletes(List<DeleteTarget> ids, int res)
+        {
+            if (res <= 0 || ids == null || ids.Count == 0) return;
+            foreach (var t in ids)
+            {
+                try { HubSyncService.SyncCloudDelete(t.Table, t.LocalPk, t.SyncIds); }
+                catch { }
+            }
+        }
+
+        private static void PushCloudUserDeletes(string qry, IDictionary ht, int res)
+        {
+            if (res <= 0) return;
+            foreach (string un in PeekDeleteUsernames(qry, ht))
+            {
+                try { HubSyncService.PushDeletedUsername(un); }
+                catch { }
+            }
+        }
+
+        private static List<string> PeekDeleteUsernames(string qry, IDictionary ht)
+        {
+            var list = new List<string>();
+            try
+            {
+                string s = (qry ?? "").TrimStart();
+                if (!s.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)) return list;
+                string table = ExtractSqlTableName(s, "Delete");
+                if (!string.Equals(table, "users", StringComparison.OrdinalIgnoreCase)) return list;
+                string select = System.Text.RegularExpressions.Regex.Replace(
+                    s, @"^DELETE\s+FROM", "SELECT username FROM",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                foreach (string un in QueryTextColumn(select, ht))
+                    if (!string.IsNullOrWhiteSpace(un)) list.Add(un.Trim());
+            }
+            catch { }
+            return list;
+        }
+
+        private static long IdFromParams(System.Collections.IDictionary parameters)
+        {
+            if (parameters == null) return 0;
+            string[] keys = { "@id", "id", "@sid", "sid", "@person_id", "person_id",
+                "@deal_id", "deal_id", "@credit_id", "credit_id", "@userID", "userID" };
+            foreach (string k in keys)
+            {
+                if (!parameters.Contains(k)) continue;
+                try { return Convert.ToInt64(parameters[k]); } catch { }
+            }
+            return 0;
+        }
+
         private static string ExtractSqlTableName(string sql, string action)
         {
             try
@@ -267,9 +625,46 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             return ExecuteScalar1(query, parameters);
         }
 
+        private static bool IsDbBusy(Exception ex)
+        {
+            string m = ex == null ? "" : (ex.Message ?? "");
+            return m.IndexOf("locked", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf("busy", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static int ExecNonQueryRetry(SQLiteConnection c, string qry, IDictionary ht, out long lastId)
+        {
+            lastId = 0;
+            Exception last = null;
+            for (int i = 0; i < 12; i++)
+            {
+                try
+                {
+                    using (SQLiteCommand cmd = new SQLiteCommand(qry, c))
+                    {
+                        cmd.CommandType = CommandType.Text;
+                        BindIDict(cmd, ht);
+                        int n = cmd.ExecuteNonQuery();
+                        lastId = c.LastInsertRowId;
+                        return n;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    if (!IsDbBusy(ex) || i == 11) throw;
+                    System.Threading.Thread.Sleep(50 * (i + 1));
+                }
+            }
+            if (last != null) throw last;
+            return 0;
+        }
+
         public static int SQL(string qry, Hashtable ht)
         {
             int res = 0;
+            long lastId = 0;
+            var delIds = PeekDeleteSyncIds(qry, ht);
             try
             {
                 if (_sharedWorkDepth > 0)
@@ -277,16 +672,7 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        using (SQLiteCommand cmd = new SQLiteCommand(qry, con))
-                        {
-                            cmd.CommandType = CommandType.Text;
-                            if (ht != null)
-                            {
-                                foreach (DictionaryEntry item in ht)
-                                    cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value ?? DBNull.Value);
-                            }
-                            res = cmd.ExecuteNonQuery();
-                        }
+                        res = ExecNonQueryRetry(con, qry, ht, out lastId);
                     }
                 }
                 else
@@ -294,20 +680,12 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        using (SQLiteCommand cmd = new SQLiteCommand(qry, local))
-                        {
-                            cmd.CommandType = CommandType.Text;
-                            if (ht != null)
-                            {
-                                foreach (DictionaryEntry item in ht)
-                                    cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value ?? DBNull.Value);
-                            }
-                            res = cmd.ExecuteNonQuery();
-                        }
+                        res = ExecNonQueryRetry(local, qry, ht, out lastId);
                     }
                 }
-                if (res > 0)
-                    TryAutoAuditFromSql(qry);
+                AfterSuccessfulWrite(qry, res, lastId, ht);
+                PushCloudDeletes(delIds, res);
+                PushCloudUserDeletes(qry, ht, res);
             }
             catch (Exception ex)
             {
@@ -335,6 +713,7 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             }
 
             gv.DataSource = dt;
+            try { StaffGridHelper.Apply(gv, dt); } catch { }
         }
 
         public static void LoadData(string qry, DataGridView gv, ListBox lb)
@@ -403,17 +782,19 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
         {
             try
             {
-                Guna.UI2.WinForms.Guna2DataGridView gv = (Guna.UI2.WinForms.Guna2DataGridView)sender;
+                if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+                var gv = sender as DataGridView;
                 if (gv == null || gv.Columns.Count == 0) return;
-
-                int count = 0;
-                foreach (DataGridViewRow row in gv.Rows)
-                {
-                    if (row.IsNewRow) continue;
-                    if (row.Cells.Count == 0) continue;
-                    count++;
-                    row.Cells[0].Value = count;
-                }
+                string colName = gv.Columns[e.ColumnIndex].Name ?? "";
+                // Sirf Sr# column — pehle har cell pe saari rows rewrite hoti thin (galat count / flicker)
+                if (!string.Equals(colName, "dgvSr", StringComparison.OrdinalIgnoreCase)
+                    && e.ColumnIndex != 0)
+                    return;
+                if (gv.Columns.Contains("dgvSr")
+                    && e.ColumnIndex != gv.Columns["dgvSr"].Index)
+                    return;
+                e.Value = (e.RowIndex + 1).ToString();
+                e.FormattingApplied = true;
             }
             catch
             {
@@ -747,23 +1128,37 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
         public static int DataInsertUpdateDelete(string qry, Hashtable ht)
         {
             int res = 0;
+            long lastId = 0;
+            var delIds = PeekDeleteSyncIds(qry, ht);
             try
             {
+                try
+                {
+                    string head = (qry ?? "").TrimStart();
+                    string act = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase) ? "add"
+                        : head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase) ? "edit"
+                        : head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase) ? "delete"
+                        : null;
+                    if (act != null
+                        && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
+                        && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
+                        && head.IndexOf("staff_role_permissions", StringComparison.OrdinalIgnoreCase) < 0
+                        && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        string table = ExtractSqlTableName(head,
+                            act == "add" ? "Insert" : act == "edit" ? "Update" : "Delete");
+                        string mod = StaffAccess.ModuleForSqlTable(table);
+                        if (!string.IsNullOrWhiteSpace(mod) && StaffAccess.Deny(mod, act))
+                            return 0;
+                    }
+                }
+                catch { }
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        using (SQLiteCommand cmd = new SQLiteCommand(qry, con))
-                        {
-                            cmd.CommandType = CommandType.Text;
-                            if (ht != null)
-                            {
-                                foreach (DictionaryEntry item in ht)
-                                    cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value ?? DBNull.Value);
-                            }
-                            res = cmd.ExecuteNonQuery();
-                        }
+                        res = ExecNonQueryRetry(con, qry, ht, out lastId);
                     }
                 }
                 else
@@ -771,20 +1166,12 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        using (SQLiteCommand cmd = new SQLiteCommand(qry, local))
-                        {
-                            cmd.CommandType = CommandType.Text;
-                            if (ht != null)
-                            {
-                                foreach (DictionaryEntry item in ht)
-                                    cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value ?? DBNull.Value);
-                            }
-                            res = cmd.ExecuteNonQuery();
-                        }
+                        res = ExecNonQueryRetry(local, qry, ht, out lastId);
                     }
                 }
-                if (res > 0)
-                    TryAutoAuditFromSql(qry);
+                AfterSuccessfulWrite(qry, res, lastId, ht);
+                PushCloudDeletes(delIds, res);
+                PushCloudUserDeletes(qry, ht, res);
             }
             catch (Exception ex)
             {
@@ -903,42 +1290,29 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
         {
             try
             {
+                int n = 0;
+                long lastId = 0;
+                var delIds = PeekDeleteSyncIds(query, parameters);
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        using (SQLiteCommand cmd = new SQLiteCommand(query, con))
-                        {
-                            if (parameters != null)
-                            {
-                                foreach (var param in parameters)
-                                    cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
-                            }
-                            int n = cmd.ExecuteNonQuery();
-                            if (n > 0)
-                                TryAutoAuditFromSql(query);
-                            return n;
-                        }
+                        n = ExecNonQueryRetry(con, query, parameters, out lastId);
                     }
                 }
-
-                using (var local = new SQLiteConnection(con_string))
+                else
                 {
-                    local.Open();
-                    using (SQLiteCommand cmd = new SQLiteCommand(query, local))
+                    using (var local = new SQLiteConnection(con_string))
                     {
-                        if (parameters != null)
-                        {
-                            foreach (var param in parameters)
-                                cmd.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
-                        }
-                        int n = cmd.ExecuteNonQuery();
-                        if (n > 0)
-                            TryAutoAuditFromSql(query);
-                        return n;
+                        local.Open();
+                        n = ExecNonQueryRetry(local, query, parameters, out lastId);
                     }
                 }
+                AfterSuccessfulWrite(query, n, lastId, parameters);
+                PushCloudDeletes(delIds, n);
+                PushCloudUserDeletes(query, parameters, n);
+                return n;
             }
             catch (Exception ex)
             {
@@ -1229,14 +1603,152 @@ WHERE type='index' AND tbl_name='customers' AND sql IS NOT NULL;", local))
         /// sirf Active allocation pe one-plot rule enforce karta hai.
         /// </summary>
         private static bool _allocationSchemaReady = false;
+
+        private static bool CustomerPlotsHasColumn(SQLiteConnection c, string col)
+        {
+            if (c == null || string.IsNullOrWhiteSpace(col)) return false;
+            try
+            {
+                using (var cmd = new SQLiteCommand("PRAGMA table_info(customer_plots);", c))
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        if (string.Equals(Convert.ToString(r["name"]), col, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static void EnsureCustomerPlotsColumn(SQLiteConnection c, string col, string sqlType)
+        {
+            if (c == null || string.IsNullOrWhiteSpace(col) || string.IsNullOrWhiteSpace(sqlType)) return;
+            if (CustomerPlotsHasColumn(c, col)) return;
+            using (var cmd = new SQLiteCommand(
+                "ALTER TABLE customer_plots ADD COLUMN \"" + col.Replace("\"", "\"\"") + "\" " + sqlType + ";", c))
+                cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>
+        /// Purani client DB safe — missing cancelled_date / deal_type / etc. add.
+        /// UI nahi; sirf ALTER ADD. Har boot pe chal sakta hai.
+        /// </summary>
+        public static void EnsureCustomerPlotsAllColumns(SQLiteConnection c)
+        {
+            if (c == null) return;
+            try
+            {
+                // Table hi na ho to yahan create nahi — EnsureAllocationSchema handle karegi
+                using (var chk = new SQLiteCommand(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='customer_plots' LIMIT 1;", c))
+                {
+                    if (chk.ExecuteScalar() == null) return;
+                }
+
+                EnsureCustomerPlotsColumn(c, "down_payment", "REAL DEFAULT 0");
+                EnsureCustomerPlotsColumn(c, "notes", "TEXT");
+                EnsureCustomerPlotsColumn(c, "broker_id", "INTEGER");
+                EnsureCustomerPlotsColumn(c, "broker_commission", "NUMERIC");
+                EnsureCustomerPlotsColumn(c, "cancelled_date", "TEXT");
+                EnsureCustomerPlotsColumn(c, "cancellation_id", "INTEGER");
+                EnsureCustomerPlotsColumn(c, "deal_type", "TEXT DEFAULT 'Installment'");
+                EnsureCustomerPlotsColumn(c, "monthly_installment", "REAL DEFAULT 0");
+                EnsureCustomerPlotsColumn(c, "sync_id", "TEXT");
+
+                try
+                {
+                    using (var cmd = new SQLiteCommand(@"
+UPDATE customer_plots
+SET deal_type = 'Installment'
+WHERE deal_type IS NULL
+   OR TRIM(COALESCE(deal_type,'')) = ''
+   OR LOWER(TRIM(deal_type)) NOT IN ('installment','reserve','sold');", c))
+                        cmd.ExecuteNonQuery();
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Active/Completed allocation ke plot Available na rahe.
+        /// Manual cancel (cancelled_date set) touch nahi.
+        /// </summary>
+        public static void RepairAllocatedPlotStatuses()
+        {
+            try
+            {
+                using (var local = new SQLiteConnection(con_string))
+                {
+                    local.Open();
+                    EnsureCustomerPlotsAllColumns(local);
+
+                    if (CustomerPlotsHasColumn(local, "cancelled_date"))
+                    {
+                        using (var cmd = new SQLiteCommand(@"
+UPDATE customer_plots
+SET status = 'Active'
+WHERE IFNULL(status,'') = 'Cancelled'
+  AND (cancelled_date IS NULL OR TRIM(IFNULL(cancelled_date,'')) = '')
+  AND IFNULL(cancellation_id,0) = 0;", local))
+                        {
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    string soldExpr = CustomerPlotsHasColumn(local, "deal_type")
+                        ? "IFNULL(cp.deal_type,'') = 'Sold'"
+                        : "0";
+
+                    using (var cmd = new SQLiteCommand(@"
+UPDATE plots
+SET status = CASE
+  WHEN EXISTS (
+    SELECT 1 FROM customer_plots cp
+    WHERE cp.plot_id = plots.id
+      AND IFNULL(cp.status,'') <> 'Cancelled'
+      AND (" + soldExpr + @")
+  ) THEN 'Sold'
+  ELSE 'Hold'
+END
+WHERE IFNULL(status,'') = 'Available'
+  AND EXISTS (
+    SELECT 1 FROM customer_plots cp
+    WHERE cp.plot_id = plots.id
+      AND IFNULL(cp.status,'') <> 'Cancelled'
+  );", local))
+                    {
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch { }
+        }
+
         public static void EnsureAllocationSchema()
         {
+            try
+            {
+                if (con.State != ConnectionState.Open)
+                    con.Open();
+                // Client purani DB: pehle columns add — warna rebuild / deal_type crash
+                EnsureCustomerPlotsAllColumns(con);
+                EnsureCustomerPlotsMonthlyInstallmentColumn(con);
+                EnsureCustomerPlotsDealTypeColumn(con);
+            }
+            catch { }
+
             if (_allocationSchemaReady) return;
 
             try
             {
                 if (con.State != ConnectionState.Open)
                     con.Open();
+
+                EnsureCustomerPlotsAllColumns(con);
 
                 using (var pragmaOff = new SQLiteCommand("PRAGMA foreign_keys = OFF;", con))
                     pragmaOff.ExecuteNonQuery();
@@ -1296,6 +1808,7 @@ WHERE type='trigger'
                             }
                         }
 
+                        // Columns pehle ADD ho chuki hain — SELECT ab safe
                         using (var cmd = new SQLiteCommand(@"
 CREATE TABLE customer_plots__new (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1303,7 +1816,7 @@ CREATE TABLE customer_plots__new (
   plot_id       INTEGER NOT NULL,
   plan_id       INTEGER,
   booking_date  TEXT    NOT NULL,
-  price         REAL    NOT NULL CHECK (price > 0),
+  price         REAL    NOT NULL CHECK (price >= 0),
   down_payment  REAL    NOT NULL DEFAULT 0 CHECK (down_payment >= 0),
   notes         TEXT,
   status        TEXT    NOT NULL DEFAULT 'Active' CHECK (status IN ('Active','Closed','Cancelled','Completed')),
@@ -1311,14 +1824,21 @@ CREATE TABLE customer_plots__new (
   broker_commission NUMERIC,
   cancelled_date TEXT,
   cancellation_id INTEGER,
+  deal_type     TEXT    NOT NULL DEFAULT 'Installment',
+  monthly_installment REAL NOT NULL DEFAULT 0,
   FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
   FOREIGN KEY (plot_id)     REFERENCES plots(id)     ON DELETE RESTRICT,
   FOREIGN KEY (plan_id)     REFERENCES plans(id)     ON DELETE SET NULL
 );
-INSERT INTO customer_plots__new
-SELECT id, customer_id, plot_id, plan_id, booking_date, price, down_payment, notes,
+INSERT INTO customer_plots__new (
+  id, customer_id, plot_id, plan_id, booking_date, price, down_payment, notes,
+  status, broker_id, broker_commission, cancelled_date, cancellation_id, deal_type, monthly_installment)
+SELECT id, customer_id, plot_id, plan_id, booking_date, price,
+       COALESCE(down_payment, 0), notes,
        CASE WHEN status='Completed' THEN 'Completed' ELSE status END,
-       broker_id, broker_commission, cancelled_date, cancellation_id
+       broker_id, broker_commission, cancelled_date, cancellation_id,
+       COALESCE(NULLIF(TRIM(deal_type),''), 'Installment'),
+       COALESCE(monthly_installment, 0)
 FROM customer_plots;
 DROP TABLE customer_plots;
 ALTER TABLE customer_plots__new RENAME TO customer_plots;
@@ -1477,11 +1997,23 @@ END;", con))
                     }
                 }
 
+                // Additive: deal_type = Installment | Reserve | Sold (purani entries → Installment)
+                EnsureCustomerPlotsDealTypeColumn(con);
+                EnsureCustomerPlotsMonthlyInstallmentColumn(con);
+
                 _allocationSchemaReady = true;
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Allocation schema update failed:\n" + ex.Message, "Schema");
+                // Columns pehle add ho chuki hon — soft warn, app band mat karo
+                try
+                {
+                    EnsureCustomerPlotsAllColumns(con);
+                    EnsureCustomerPlotsDealTypeColumn(con);
+                    _allocationSchemaReady = true;
+                }
+                catch { }
+                System.Diagnostics.Debug.WriteLine("Allocation schema: " + ex.Message);
             }
             finally
             {
@@ -1494,6 +2026,79 @@ END;", con))
 
                 ReleaseSharedIfIdle();
             }
+        }
+
+        /// <summary>
+        /// Additive only — old backup safe. Missing column add + sab purani rows Installment.
+        /// </summary>
+        private static void EnsureCustomerPlotsDealTypeColumn(SQLiteConnection c)
+        {
+            if (c == null) return;
+            try
+            {
+                bool has = false;
+                using (var cmd = new SQLiteCommand("PRAGMA table_info(customer_plots);", c))
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        if (string.Equals(Convert.ToString(r["name"]), "deal_type", StringComparison.OrdinalIgnoreCase))
+                        {
+                            has = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!has)
+                {
+                    using (var cmd = new SQLiteCommand(
+                        "ALTER TABLE customer_plots ADD COLUMN deal_type TEXT NOT NULL DEFAULT 'Installment';", c))
+                        cmd.ExecuteNonQuery();
+                }
+
+                using (var cmd = new SQLiteCommand(@"
+UPDATE customer_plots
+SET deal_type = 'Installment'
+WHERE deal_type IS NULL
+   OR TRIM(COALESCE(deal_type,'')) = ''
+   OR LOWER(TRIM(deal_type)) NOT IN ('installment','reserve','sold');
+
+UPDATE customer_plots SET deal_type = 'Installment' WHERE LOWER(TRIM(deal_type)) = 'installment';
+UPDATE customer_plots SET deal_type = 'Reserve'     WHERE LOWER(TRIM(deal_type)) = 'reserve';
+UPDATE customer_plots SET deal_type = 'Sold'        WHERE LOWER(TRIM(deal_type)) = 'sold';", c))
+                    cmd.ExecuteNonQuery();
+            }
+            catch { }
+        }
+
+        /// <summary>Additive — purani rows 0. Empty = WhatsApp message mein installment nahi.</summary>
+        private static void EnsureCustomerPlotsMonthlyInstallmentColumn(SQLiteConnection c)
+        {
+            if (c == null) return;
+            try
+            {
+                bool has = false;
+                using (var cmd = new SQLiteCommand("PRAGMA table_info(customer_plots);", c))
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        if (string.Equals(Convert.ToString(r["name"]), "monthly_installment", StringComparison.OrdinalIgnoreCase))
+                        {
+                            has = true;
+                            break;
+                        }
+                    }
+                }
+                if (!has)
+                {
+                    using (var cmd = new SQLiteCommand(
+                        "ALTER TABLE customer_plots ADD COLUMN monthly_installment REAL NOT NULL DEFAULT 0;", c))
+                        cmd.ExecuteNonQuery();
+                }
+            }
+            catch { }
         }
 
         // ── Partner Cash / Hisab (additive — purani tables touch nahi) ─────────
@@ -1709,15 +2314,9 @@ ORDER BY name;",
         {
             EnsurePartnerMoneySchema();
             var c = useCon ?? con;
-            using (var del = new SQLiteCommand(@"
-DELETE FROM partner_money
-WHERE customer_plot_id=@cp
-  AND category='Broker Commission'
-  AND IFNULL(receipt_id,0)=0;", c, tx))
-            {
-                del.Parameters.AddWithValue("@cp", customerPlotId);
-                del.ExecuteNonQuery();
-            }
+            HubSyncService.DeletePartnerMoneyWhere(c, tx,
+                "customer_plot_id=@cp AND category='Broker Commission' AND IFNULL(receipt_id,0)=0",
+                cmd => cmd.Parameters.AddWithValue("@cp", customerPlotId));
 
             if (partnerId <= 0) return;
             SetAllocationPartner(customerPlotId, partnerId, c, tx);
@@ -1808,8 +2407,24 @@ VALUES
                     cmd.Parameters.AddWithValue("@note", (object)note ?? DBNull.Value);
                     cmd.ExecuteNonQuery();
                 }
+                long newId;
                 using (var idCmd = new SQLiteCommand("SELECT last_insert_rowid();", c, tx))
-                    return Convert.ToInt64(idCmd.ExecuteScalar());
+                    newId = Convert.ToInt64(idCmd.ExecuteScalar());
+                try
+                {
+                    using (var sid = new SQLiteCommand(
+                        "UPDATE partner_money SET sync_id = lower(hex(randomblob(16))) WHERE id=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", c, tx))
+                    {
+                        sid.Parameters.AddWithValue("@id", newId);
+                        sid.ExecuteNonQuery();
+                    }
+                }
+                catch { }
+                if (ownOpen)
+                {
+                    try { HubSyncService.NotifyLocalWrite(); } catch { }
+                }
+                return newId;
             }
             finally
             {
@@ -1830,12 +2445,9 @@ VALUES
         {
             EnsurePartnerMoneySchema();
             var c = useCon ?? con;
-            using (var del = new SQLiteCommand(
-                "DELETE FROM partner_money WHERE receipt_id=@rid;", c, tx))
-            {
-                del.Parameters.AddWithValue("@rid", receiptId);
-                del.ExecuteNonQuery();
-            }
+            HubSyncService.DeletePartnerMoneyWhere(c, tx,
+                "receipt_id=@rid",
+                cmd => cmd.Parameters.AddWithValue("@rid", receiptId));
             if (partnerId <= 0 || amount <= 0) return;
 
             int? societyId = null;

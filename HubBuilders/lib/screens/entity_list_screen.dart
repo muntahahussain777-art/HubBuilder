@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../data/dummy_data.dart';
+import '../data/hub_sync.dart';
+import '../data/staff_audit.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 
@@ -38,7 +40,18 @@ class _EntityListScreenState extends State<EntityListScreen> {
   @override
   void initState() {
     super.initState();
+    HubSync.revision.addListener(_onSync);
     _reload();
+  }
+
+  @override
+  void dispose() {
+    HubSync.revision.removeListener(_onSync);
+    super.dispose();
+  }
+
+  void _onSync() {
+    if (mounted) _reload();
   }
 
   @override
@@ -51,7 +64,8 @@ class _EntityListScreenState extends State<EntityListScreen> {
 
   Future<void> _reload() async {
     setState(() => _loading = true);
-    final rows = await widget.loader();
+    final loaded = await widget.loader();
+    final rows = await StaffAudit.stampRows(loaded);
     if (!mounted) return;
     setState(() {
       _rows = rows;
@@ -72,6 +86,7 @@ class _EntityListScreenState extends State<EntityListScreen> {
               r.title.toLowerCase().contains(q) ||
               r.subtitle.toLowerCase().contains(q) ||
               r.meta.toLowerCase().contains(q) ||
+              (r.staff ?? '').toLowerCase().contains(q) ||
               (r.mobile ?? '').contains(q) ||
               (r.cnic ?? '').toLowerCase().contains(q),
         )
@@ -181,6 +196,14 @@ class _EntityListScreenState extends State<EntityListScreen> {
                                 row.subtitle,
                                 style: Theme.of(context).textTheme.bodyMedium,
                               ),
+                              if ((row.staff ?? '').trim().isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Staff: ${row.staff}',
+                                  style: Theme.of(context).textTheme.labelSmall
+                                      ?.copyWith(color: AppColors.mist),
+                                ),
+                              ],
                             ],
                           ),
                         ),

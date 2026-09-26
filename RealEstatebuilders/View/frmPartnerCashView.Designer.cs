@@ -30,6 +30,8 @@ namespace HubBuilders.View
             this.dgvamount = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvcategory = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvmode = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dgvcustomer = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dgvplot = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvnote = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvedit = new System.Windows.Forms.DataGridViewImageColumn();
             this.dgvdel = new System.Windows.Forms.DataGridViewImageColumn();
@@ -100,6 +102,8 @@ namespace HubBuilders.View
             this.dgvamount,
             this.dgvcategory,
             this.dgvmode,
+            this.dgvcustomer,
+            this.dgvplot,
             this.dgvnote,
             this.dgvedit,
             this.dgvdel});
@@ -200,6 +204,18 @@ namespace HubBuilders.View
             this.dgvmode.Name = "dgvmode";
             this.dgvmode.ReadOnly = true;
             // 
+            // dgvcustomer
+            // 
+            this.dgvcustomer.HeaderText = "Customer";
+            this.dgvcustomer.Name = "dgvcustomer";
+            this.dgvcustomer.ReadOnly = true;
+            // 
+            // dgvplot
+            // 
+            this.dgvplot.HeaderText = "Plot";
+            this.dgvplot.Name = "dgvplot";
+            this.dgvplot.ReadOnly = true;
+            // 
             // dgvnote
             // 
             this.dgvnote.HeaderText = "Note";
@@ -250,6 +266,8 @@ namespace HubBuilders.View
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvamount;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvcategory;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvmode;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dgvcustomer;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dgvplot;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvnote;
         private System.Windows.Forms.DataGridViewImageColumn dgvedit;
         private System.Windows.Forms.DataGridViewImageColumn dgvdel;

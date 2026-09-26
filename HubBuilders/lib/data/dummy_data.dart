@@ -12,6 +12,7 @@ class ListRow {
     this.note,
     this.date,
     this.city,
+    this.staff,
   });
 
   final int? id;
@@ -25,6 +26,24 @@ class ListRow {
   final String? note;
   final String? date;
   final String? city;
+  final String? staff;
+
+  ListRow copyWith({String? staff}) {
+    return ListRow(
+      title: title,
+      subtitle: subtitle,
+      meta: meta,
+      tag: tag,
+      id: id,
+      fatherName: fatherName,
+      mobile: mobile,
+      cnic: cnic,
+      note: note,
+      date: date,
+      city: city,
+      staff: staff ?? this.staff,
+    );
+  }
 }
 
 /// Backward-compatible alias used by list/form screens.

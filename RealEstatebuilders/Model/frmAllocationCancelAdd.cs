@@ -425,6 +425,8 @@ WHERE id = @pid;", MainClass.con, tx))
 
                 tx.Commit();
 
+                try { HubSyncService.NotifyLocalWrite(); } catch { }
+
                 SavedCancellationId = cancellationId;
                 SavedRefundableAmount = refundableAmount;
                 SavedDeductionAmount = deductionAmount;

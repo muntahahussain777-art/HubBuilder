@@ -792,7 +792,7 @@
       </Fields>
       <rd:DataSetInfo>
         <rd:DataSetName>InventoryStatus</rd:DataSetName>
-        <rd:SchemaPath>E:\Complete iss par kam karna he neche wala par anhi\RealEstatebuilders\RealEstatebuilders\DataSet\InventoryStatus.xsd</rd:SchemaPath>
+        <rd:SchemaPath>F:\2026\Ithad Village\Complete iss par kam karna he neche wala par anhi\RealEstatebuilders\RealEstatebuilders\DataSet\InventoryStatus.xsd</rd:SchemaPath>
         <rd:TableName>DataTable1</rd:TableName>
         <rd:TableAdapterFillMethod />
         <rd:TableAdapterGetDataMethod />

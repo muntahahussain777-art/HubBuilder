@@ -47,6 +47,8 @@ namespace HubBuilders
 
             this.KeyPreview = true;
             WireNavTooltips();
+            AddSyncPullNavButtons();
+            try { /* LiveNotice off — bar bar toast band */ } catch { }
         }
         static MainForm _obj;
         public static MainForm instance
@@ -79,6 +81,123 @@ namespace HubBuilders
             tip.SetToolTip(btnExpense, "Shortcut: Alt+E");
             tip.SetToolTip(btnReports, "Shortcut: Alt+T");
             tip.SetToolTip(btnPasswordchange, "Shortcut: Alt+W");
+        }
+
+        /// <summary>Minimal Sync/Pull/Recover — existing nav style, no redesign.</summary>
+        private void AddSyncPullNavButtons()
+        {
+            try
+            {
+                var tip = new ToolTip { ShowAlways = true, AutoPopDelay = 10000 };
+                var btnSync = MakeNavActionButton("  Sync Now", 104);
+                var btnPull = MakeNavActionButton("  Pull Now", 105);
+                var btnRecover = MakeNavActionButton("  Force Recover", 106);
+                btnRecover.FillColor = Color.FromArgb(160, 90, 30);
+                btnRecover.Size = new Size(228, 34);
+                tip.SetToolTip(btnSync, "Push local + merge from cloud (safe — no wipe)");
+                tip.SetToolTip(btnPull, "Pull from cloud into SQLite (safe — no wipe)");
+                tip.SetToolTip(btnRecover,
+                    "Missing allocate data cloud se wapas — sirf absent sync_id INSERT, duplicates skip, deleted resurrect nahi");
+                btnSync.Click += async (s, e) =>
+                {
+                    btnSync.Enabled = false;
+                    btnPull.Enabled = false;
+                    btnRecover.Enabled = false;
+                    try
+                    {
+                        bool ok = await Task.Run(() => HubSyncService.TrySyncNow());
+                        MessageBox.Show(this,
+                            ok ? "Sync complete."
+                               : "Sync abhi busy tha / incomplete. 10 sec baad Sync Now dobara dabayein (internet on rakhein).",
+                            "Sync Now", MessageBoxButtons.OK,
+                            ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    }
+                    finally
+                    {
+                        btnSync.Enabled = true;
+                        btnPull.Enabled = true;
+                        btnRecover.Enabled = true;
+                    }
+                };
+                btnPull.Click += async (s, e) =>
+                {
+                    btnSync.Enabled = false;
+                    btnPull.Enabled = false;
+                    btnRecover.Enabled = false;
+                    try
+                    {
+                        bool ok = await Task.Run(() => HubSyncService.TryPullNow());
+                        MessageBox.Show(this,
+                            ok ? "Pull complete."
+                               : "Pull abhi busy tha / incomplete. 10 sec baad Pull Now dobara dabayein (internet on rakhein).",
+                            "Pull Now", MessageBoxButtons.OK,
+                            ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    }
+                    finally
+                    {
+                        btnSync.Enabled = true;
+                        btnPull.Enabled = true;
+                        btnRecover.Enabled = true;
+                    }
+                };
+                btnRecover.Click += async (s, e) =>
+                {
+                    var ask = MessageBox.Show(this,
+                        "Cloud se missing allocate rows wapas laoga (same sync_id skip).\n"
+                        + "Local extras wipe nahi. Intentionally deleted resurrect nahi.\n\nContinue?",
+                        "Force Recover from Cloud",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question);
+                    if (ask != DialogResult.Yes) return;
+
+                    btnSync.Enabled = false;
+                    btnPull.Enabled = false;
+                    btnRecover.Enabled = false;
+                    try
+                    {
+                        string summary = "";
+                        bool ok = false;
+                        await Task.Run(() =>
+                        {
+                            ok = HubSyncService.TryForceRecoverFromCloud(out summary);
+                        });
+                        MessageBox.Show(this,
+                            ok
+                                ? (string.IsNullOrWhiteSpace(summary) ? "Recovered / Sync complete." : summary)
+                                : (string.IsNullOrWhiteSpace(summary)
+                                    ? "Recover busy/fail — 10 sec baad dobara try (internet on)."
+                                    : summary),
+                            "Force Recover",
+                            MessageBoxButtons.OK,
+                            ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    }
+                    finally
+                    {
+                        btnSync.Enabled = true;
+                        btnPull.Enabled = true;
+                        btnRecover.Enabled = true;
+                    }
+                };
+                flowLayoutPanel1.Controls.Add(btnSync);
+                flowLayoutPanel1.Controls.Add(btnPull);
+                flowLayoutPanel1.Controls.Add(btnRecover);
+            }
+            catch { }
+        }
+
+        private static Guna.UI2.WinForms.Guna2Button MakeNavActionButton(string text, int tab)
+        {
+            var b = new Guna.UI2.WinForms.Guna2Button();
+            b.AutoRoundedCorners = true;
+            b.BorderRadius = 16;
+            b.FillColor = Color.FromArgb(39, 49, 70);
+            b.Font = new Font("Segoe UI Semibold", 14.25F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            b.ForeColor = Color.White;
+            b.Size = new Size(208, 34);
+            b.TabIndex = tab;
+            b.Text = text;
+            b.TextAlign = HorizontalAlignment.Left;
+            return b;
         }
 
         private void SetActiveNav(Guna.UI2.WinForms.Guna2Button btn)
@@ -170,7 +289,14 @@ namespace HubBuilders
         {
             AppSafety.Run(() =>
             {
-                AddControls(create());
+                Form f = create();
+                string mod = StaffAccess.ModuleForForm(f);
+                if (!string.IsNullOrWhiteSpace(mod) && StaffAccess.Deny(mod, "open"))
+                {
+                    try { f.Dispose(); } catch { }
+                    return;
+                }
+                AddControls(f);
                 SetActiveNav(navBtn);
             });
         }
@@ -299,8 +425,9 @@ namespace HubBuilders
             //    }
             //    // Tutorial dekhne ke baad flag ko false set kar dein taa ke agli baar dikhaye na
             //    Properties.Settings.Default.ShowTutorial = false;
-            //    Properties.Settings.Default.Save();
+            //                Properties.Settings.Default.Save();
             //}
+            try { HubAutoBackup.Start(this); } catch { }
         }
         private async void pictureBox1_Click(object sender, EventArgs e)
         {
@@ -516,6 +643,7 @@ namespace HubBuilders
 
         private void customerToolStripMenuItem_Click(object sender, EventArgs e)
         {
+            if (StaffAccess.Deny("customers", "add")) return;
             AppSafety.Run(() =>
             {
                 frmCustomerAdd add = new frmCustomerAdd();
@@ -584,14 +712,7 @@ namespace HubBuilders
 
         private void btnPasswordchange_Click(object sender, EventArgs e)
         {
-            // Agar logged in role "Admin" nahin hai to access deny kar do
-            if (MainClass.LoggedInRole != "Admin")
-            {
-                CustomeMessage customMessageBox = new CustomeMessage("Only Admin can access the password settings!", "Access Denied");
-                DialogResult dialogResult = customMessageBox.ShowDialog();
-                return;
-            }
-
+            if (StaffAccess.Deny("users", "open")) return;
             OpenChild(() => new frmPasswordView(), btnPasswordchange);
         }
         private void dealFormToolStripMenuItem1_Click(object sender, EventArgs e)
@@ -656,12 +777,7 @@ namespace HubBuilders
 
         private void staffEntryLogToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            if (MainClass.LoggedInRole != "Admin")
-            {
-                MessageBox.Show("Only Admin can open Staff Entry Log.", "Access Denied",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
+            if (StaffAccess.Deny("staff_entry_log", "open")) return;
             AppSafety.Run(() =>
             {
                 using (var frm = new frmStaffEntryLog())

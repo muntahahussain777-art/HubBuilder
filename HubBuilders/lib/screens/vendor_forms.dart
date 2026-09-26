@@ -88,6 +88,25 @@ class _ExpenseFormScreenState extends State<ExpenseFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(context, 'Delete this expense?');
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await VendorStore.deleteExpense(widget.id!);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return AtmosphereBackground(
@@ -122,6 +141,10 @@ class _ExpenseFormScreenState extends State<ExpenseFormScreen> {
                     decoration: const InputDecoration(labelText: 'Note'),
                   ),
                   const SizedBox(height: 18),
+                  if (widget.id != null) ...[
+                    FormDeleteButton(onPressed: _saving ? null : _delete),
+                    const SizedBox(height: 12),
+                  ],
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
@@ -213,6 +236,25 @@ class _BrokerFormScreenState extends State<BrokerFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(context, 'Delete this broker?');
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await AllocateStore.deleteBroker(widget.id!);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return AtmosphereBackground(
@@ -248,6 +290,10 @@ class _BrokerFormScreenState extends State<BrokerFormScreen> {
                     onChanged: (v) => setState(() => _active = v),
                   ),
                   const SizedBox(height: 12),
+                  if (widget.id != null) ...[
+                    FormDeleteButton(onPressed: _saving ? null : _delete),
+                    const SizedBox(height: 12),
+                  ],
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
@@ -344,6 +390,28 @@ class _PersonFormScreenState extends State<PersonFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(
+      context,
+      widget.isOwner ? 'Delete this owner?' : 'Delete this partner?',
+    );
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await VendorStore.deletePerson(widget.id!);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final label = widget.isOwner ? 'Owner' : 'Partner';
@@ -375,6 +443,10 @@ class _PersonFormScreenState extends State<PersonFormScreen> {
                     decoration: const InputDecoration(labelText: 'Note'),
                   ),
                   const SizedBox(height: 18),
+                  if (widget.id != null) ...[
+                    FormDeleteButton(onPressed: _saving ? null : _delete),
+                    const SizedBox(height: 12),
+                  ],
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
@@ -394,7 +466,10 @@ class _PersonFormScreenState extends State<PersonFormScreen> {
 
 /// Deal form — SQLite Deal.
 class DealFormScreen extends StatefulWidget {
-  const DealFormScreen({super.key});
+  const DealFormScreen({super.key, this.id, this.initial});
+
+  final int? id;
+  final Map<String, String>? initial;
 
   @override
   State<DealFormScreen> createState() => _DealFormScreenState();
@@ -415,17 +490,33 @@ class _DealFormScreenState extends State<DealFormScreen> {
   @override
   void initState() {
     super.initState();
-    _date = DateTime.now();
+    final i = widget.initial ?? {};
+    _amount.text = i['amount'] ?? '';
+    _note.text = i['note'] ?? '';
+    _date = DateTime.tryParse(i['date'] ?? '') ?? DateTime.now();
     _load();
   }
 
   Future<void> _load() async {
     final s = await PlotInventoryStore.societies();
     final o = await VendorStore.owners();
+    final i = widget.initial ?? {};
+    final sid = int.tryParse(i['society_id'] ?? '');
+    final oid = int.tryParse(i['owner_id'] ?? '');
     if (!mounted) return;
     setState(() {
       _societies = s;
       _owners = o;
+      if (sid != null) {
+        for (final x in s) {
+          if (x.id == sid) _society = x;
+        }
+      }
+      if (oid != null) {
+        for (final x in o) {
+          if (x.id == oid) _owner = x;
+        }
+      }
       _loading = false;
     });
   }
@@ -447,13 +538,24 @@ class _DealFormScreenState extends State<DealFormScreen> {
     }
     setState(() => _saving = true);
     try {
-      await VendorStore.insertDeal(
-        societyId: _society!.id,
-        ownerId: _owner!.id,
-        amount: amount,
-        dealDate: _fmt.format(_date),
-        note: _note.text,
-      );
+      if (widget.id != null) {
+        await VendorStore.updateDeal(
+          id: widget.id!,
+          societyId: _society!.id,
+          ownerId: _owner!.id,
+          amount: amount,
+          dealDate: _fmt.format(_date),
+          note: _note.text,
+        );
+      } else {
+        await VendorStore.insertDeal(
+          societyId: _society!.id,
+          ownerId: _owner!.id,
+          amount: amount,
+          dealDate: _fmt.format(_date),
+          note: _note.text,
+        );
+      }
       if (mounted) Navigator.pop(context, true);
     } catch (e) {
       if (mounted) {
@@ -466,12 +568,33 @@ class _DealFormScreenState extends State<DealFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(context, 'Delete this deal?');
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await VendorStore.deleteDeal(widget.id!);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return AtmosphereBackground(
       child: Scaffold(
         backgroundColor: Colors.transparent,
-        appBar: AppBar(title: const Text('Add Deal')),
+        appBar: AppBar(
+          title: Text(widget.id == null ? 'Add Deal' : 'Edit Deal'),
+        ),
         body: _loading
             ? const Center(child: CircularProgressIndicator())
             : ListView(
@@ -524,6 +647,10 @@ class _DealFormScreenState extends State<DealFormScreen> {
                           decoration: const InputDecoration(labelText: 'Note'),
                         ),
                         const SizedBox(height: 18),
+                        if (widget.id != null) ...[
+                          FormDeleteButton(onPressed: _saving ? null : _delete),
+                          const SizedBox(height: 12),
+                        ],
                         SizedBox(
                           width: double.infinity,
                           child: ElevatedButton(
@@ -543,7 +670,10 @@ class _DealFormScreenState extends State<DealFormScreen> {
 
 /// Credit form — SQLite Credit (resolves latest Deal).
 class CreditFormScreen extends StatefulWidget {
-  const CreditFormScreen({super.key});
+  const CreditFormScreen({super.key, this.id, this.initial});
+
+  final int? id;
+  final Map<String, String>? initial;
 
   @override
   State<CreditFormScreen> createState() => _CreditFormScreenState();
@@ -565,6 +695,9 @@ class _CreditFormScreenState extends State<CreditFormScreen> {
   @override
   void initState() {
     super.initState();
+    final i = widget.initial ?? {};
+    _amount.text = i['amount'] ?? '';
+    _note.text = i['note'] ?? '';
     _load();
   }
 
@@ -572,11 +705,30 @@ class _CreditFormScreenState extends State<CreditFormScreen> {
     final s = await PlotInventoryStore.societies();
     final o = await VendorStore.owners();
     final p = await VendorStore.partners();
+    final i = widget.initial ?? {};
+    final sid = int.tryParse(i['society_id'] ?? '');
+    final oid = int.tryParse(i['owner_id'] ?? '');
+    final pid = int.tryParse(i['partner_id'] ?? '');
     if (!mounted) return;
     setState(() {
       _societies = s;
       _owners = o;
       _partners = p;
+      if (sid != null) {
+        for (final x in s) {
+          if (x.id == sid) _society = x;
+        }
+      }
+      if (oid != null) {
+        for (final x in o) {
+          if (x.id == oid) _owner = x;
+        }
+      }
+      if (pid != null) {
+        for (final x in p) {
+          if (x.id == pid) _partner = x;
+        }
+      }
       _loading = false;
     });
   }
@@ -617,13 +769,24 @@ class _CreditFormScreenState extends State<CreditFormScreen> {
         }
         return;
       }
-      await VendorStore.insertCredit(
-        dealId: dealId,
-        partnerId: _partner!.id,
-        amount: amount,
-        payDate: _fmt.format(DateTime.now()),
-        note: _note.text,
-      );
+      if (widget.id != null) {
+        await VendorStore.updateCredit(
+          id: widget.id!,
+          dealId: dealId,
+          partnerId: _partner!.id,
+          amount: amount,
+          payDate: widget.initial?['date'] ?? _fmt.format(DateTime.now()),
+          note: _note.text,
+        );
+      } else {
+        await VendorStore.insertCredit(
+          dealId: dealId,
+          partnerId: _partner!.id,
+          amount: amount,
+          payDate: _fmt.format(DateTime.now()),
+          note: _note.text,
+        );
+      }
       if (mounted) Navigator.pop(context, true);
     } catch (e) {
       if (mounted) {
@@ -636,12 +799,33 @@ class _CreditFormScreenState extends State<CreditFormScreen> {
     }
   }
 
+  Future<void> _delete() async {
+    if (widget.id == null) return;
+    final ok = await confirmDelete(context, 'Delete this credit?');
+    if (!ok || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await VendorStore.deleteCredit(widget.id!);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return AtmosphereBackground(
       child: Scaffold(
         backgroundColor: Colors.transparent,
-        appBar: AppBar(title: const Text('Add Credit')),
+        appBar: AppBar(
+          title: Text(widget.id == null ? 'Add Credit' : 'Edit Credit'),
+        ),
         body: _loading
             ? const Center(child: CircularProgressIndicator())
             : ListView(
@@ -710,6 +894,10 @@ class _CreditFormScreenState extends State<CreditFormScreen> {
                           decoration: const InputDecoration(labelText: 'Note'),
                         ),
                         const SizedBox(height: 18),
+                        if (widget.id != null) ...[
+                          FormDeleteButton(onPressed: _saving ? null : _delete),
+                          const SizedBox(height: 12),
+                        ],
                         SizedBox(
                           width: double.infinity,
                           child: ElevatedButton(

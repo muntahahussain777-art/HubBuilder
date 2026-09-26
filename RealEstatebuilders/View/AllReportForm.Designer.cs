@@ -1,4 +1,4 @@
-﻿namespace HubBuilders.View
+namespace HubBuilders.View
 {
     partial class AllReportForm
     {
@@ -313,7 +313,7 @@
             this.groupBox1.ForeColor = System.Drawing.Color.White;
             this.groupBox1.Location = new System.Drawing.Point(12, 13);
             this.groupBox1.Name = "groupBox1";
-            this.groupBox1.Size = new System.Drawing.Size(1002, 615);
+            this.groupBox1.Size = new System.Drawing.Size(1002, 670);
             this.groupBox1.TabIndex = 67;
             this.groupBox1.TabStop = false;
             this.groupBox1.Text = "     Reporting    ";
@@ -611,7 +611,7 @@
             this.groupBox2.Controls.Add(this.btnCustomer);
             this.groupBox2.Font = new System.Drawing.Font("Segoe UI", 15.75F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.groupBox2.ForeColor = System.Drawing.Color.White;
-            this.groupBox2.Location = new System.Drawing.Point(12, 640);
+            this.groupBox2.Location = new System.Drawing.Point(12, 690);
             this.groupBox2.Name = "groupBox2";
             this.groupBox2.Size = new System.Drawing.Size(1002, 99);
             this.groupBox2.TabIndex = 68;
@@ -622,7 +622,7 @@
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(9F, 21F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(1026, 755);
+            this.ClientSize = new System.Drawing.Size(1026, 805);
             this.Controls.Add(this.groupBox1);
             this.Controls.Add(this.groupBox2);
             this.Name = "AllReportForm";

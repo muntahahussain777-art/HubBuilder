@@ -1,4 +1,4 @@
-﻿using HubBuilders.Model;
+using HubBuilders.Model;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -56,6 +56,26 @@ namespace HubBuilders.Report_Form
                 {
                     MessageBox.Show("Username, Password, Name lazmi hain.");
                     return;
+                }
+
+                if (MainClass.IsBuiltInAdminUsername(u))
+                {
+                    MessageBox.Show("Admin login software ke sath lock hai. Change nahi ho sakta.",
+                        "Admin", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                if (id > 0)
+                {
+                    DataTable cur = MainClass.GetData(
+                        "SELECT username FROM users WHERE userID = @id",
+                        new Dictionary<string, object> { { "@id", id } });
+                    if (cur != null && cur.Rows.Count > 0
+                        && MainClass.IsBuiltInAdminUsername(Convert.ToString(cur.Rows[0]["username"])))
+                    {
+                        MessageBox.Show("Admin login software ke sath lock hai. Change nahi ho sakta.",
+                            "Admin", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
                 }
 
                 string qry;

@@ -1,4 +1,4 @@
-﻿// =========================
+// =========================
 // RealEstatebuilders.View.frmAllocatePlotFormView  (FINAL STABLE)
 // =========================
 using HubBuilders.Model;
@@ -58,11 +58,24 @@ namespace HubBuilders.View
             };
         }
 
+        private Label _lblAllocCount;
+
         private void frmAllocatePlotFormView_Load(object sender, EventArgs e)
         {
             try
             {
                 MainClass.EnsureAllocationSchema();
+                try
+                {
+                    using (var c = new System.Data.SQLite.SQLiteConnection(MainClass.con_string))
+                    {
+                        c.Open();
+                        MainClass.EnsureCustomerPlotsAllColumns(c);
+                    }
+                }
+                catch { }
+                EnsureAllocCountLabel();
+                try { if (txtSearch != null) txtSearch.Text = ""; } catch { }
 
                 guna2DataGridView1.DataBindingComplete += (s, ev) =>
                 {
@@ -72,6 +85,7 @@ namespace HubBuilders.View
                         ReorderActionColumns();
                         BumpCustomerFont();
                         ApplyStatusRowColors(); // optional but best
+                        UpdateAllocCountLabel();
                     }
                     catch (Exception ex2) { ShowError("Post-bind failed.\n\n" + ex2.Message); }
                 };
@@ -161,6 +175,17 @@ namespace HubBuilders.View
         {
             try
             {
+                try { MainClass.EnsureAllocationSchema(); } catch { }
+                try
+                {
+                    using (var c = new SQLiteConnection(MainClass.con_string))
+                    {
+                        c.Open();
+                        MainClass.EnsureCustomerPlotsAllColumns(c);
+                    }
+                }
+                catch { }
+                try { MainClass.RepairAllocatedPlotStatuses(); } catch { }
                 string search = (txtSearch?.Text ?? "").Trim();
 
                 string qry = $@"
@@ -174,6 +199,7 @@ SELECT
     p.plot_no           AS PlotNo,
     a.price             AS Price,
     a.booking_date      AS BookingDate,
+    COALESCE(NULLIF(TRIM(a.deal_type),''),'Installment') AS DealType,
     a.status            AS Status
 FROM {T_ALLOC} a
 JOIN customers   c  ON c.id  = a.customer_id
@@ -182,11 +208,13 @@ JOIN societies   s  ON s.id  = p.society_id
 JOIN blocks      b  ON b.id  = p.block_id
 JOIN plot_types  pt ON pt.id = p.plot_type_id
 WHERE 
-    (LOWER(c.name) LIKE '%' || LOWER(@q) || '%' OR
+    IFNULL(a.status,'') <> 'Cancelled'
+    AND (LOWER(c.name) LIKE '%' || LOWER(@q) || '%' OR
      c.{CUST_MOBILE_COL} LIKE '%' || @q || '%' OR
      LOWER(p.plot_no) LIKE '%' || LOWER(@q) || '%' OR
      LOWER(s.name) LIKE '%' || LOWER(@q) || '%' OR
-     LOWER(b.name) LIKE '%' || LOWER(@q) || '%')
+     LOWER(b.name) LIKE '%' || LOWER(@q) || '%' OR
+     LOWER(COALESCE(a.deal_type,'')) LIKE '%' || LOWER(@q) || '%')
 ORDER BY a.id DESC;";
 
                 EnsureRuntimeColumns();
@@ -201,6 +229,8 @@ ORDER BY a.id DESC;";
                 lb.Items.Add(dgvPlotNo);
                 lb.Items.Add(dgvPrice);
                 lb.Items.Add(dgvDate);
+                if (guna2DataGridView1.Columns.Contains("dgvDealType"))
+                    lb.Items.Add(guna2DataGridView1.Columns["dgvDealType"]);
                 lb.Items.Add(dgvStatus);
 
                 var prms = new Dictionary<string, object> { { "@q", search } };
@@ -209,11 +239,66 @@ ORDER BY a.id DESC;";
                 EnsureRuntimeColumns();
                 ReorderActionColumns();
                 BumpCustomerFont();
+                UpdateAllocCountLabel();
             }
             catch (Exception ex)
             {
                 ShowError("Fetching allocations failed.\n\n" + ex.Message);
             }
+        }
+
+        private void EnsureAllocCountLabel()
+        {
+            if (_lblAllocCount != null && !_lblAllocCount.IsDisposed) return;
+            _lblAllocCount = new Label
+            {
+                AutoSize = true,
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI Semibold", 11F, FontStyle.Bold),
+                BackColor = Color.Transparent,
+                Location = new Point(Math.Max(20, (txtSearch?.Right ?? 400) + 16), Math.Max(12, (txtSearch?.Top ?? 20))),
+                Name = "lblAllocCount",
+                Text = "Kul: —"
+            };
+            Controls.Add(_lblAllocCount);
+            _lblAllocCount.BringToFront();
+        }
+
+        /// <summary>Report jaisa clear count — Installment + Reserve + Sold = Kul (Allocate).</summary>
+        private void UpdateAllocCountLabel()
+        {
+            try
+            {
+                EnsureAllocCountLabel();
+                int installment = 0, reserve = 0, sold = 0, kul = 0;
+                var dt = MainClass.ExecuteSelectQuery(@"
+SELECT
+  SUM(CASE WHEN LOWER(TRIM(IFNULL(deal_type,'')))='sold' THEN 1 ELSE 0 END) AS sold,
+  SUM(CASE WHEN LOWER(TRIM(IFNULL(deal_type,'')))='reserve' THEN 1 ELSE 0 END) AS reserve,
+  SUM(CASE WHEN LOWER(TRIM(IFNULL(deal_type,''))) NOT IN ('sold','reserve') THEN 1 ELSE 0 END) AS installment,
+  COUNT(1) AS kul
+FROM customer_plots
+WHERE IFNULL(status,'') <> 'Cancelled';", null);
+                if (dt != null && dt.Rows.Count > 0)
+                {
+                    var r = dt.Rows[0];
+                    sold = Convert.ToInt32(r["sold"] ?? 0);
+                    reserve = Convert.ToInt32(r["reserve"] ?? 0);
+                    installment = Convert.ToInt32(r["installment"] ?? 0);
+                    kul = Convert.ToInt32(r["kul"] ?? 0);
+                }
+                int gridN = 0;
+                try { gridN = guna2DataGridView1?.Rows?.Count ?? 0; } catch { }
+                _lblAllocCount.Text =
+                    "Kul " + kul +
+                    "  =  Installment " + installment +
+                    "  +  Reserve " + reserve +
+                    "  +  Sold " + sold +
+                    "   |   List " + gridN;
+                if (!string.IsNullOrWhiteSpace(txtSearch?.Text))
+                    _lblAllocCount.Text += "  (search filter on — clear search for full Kul)";
+            }
+            catch { }
         }
 
         // ------------------ Toolbar ------------------
@@ -360,29 +445,38 @@ WHERE a.id=@id;",
 
                         try
                         {
-                            var recObj = MainClass.ExecuteScalar(
-                                "SELECT COUNT(*) FROM receipts WHERE customer_plot_id=@id;",
-                                new Dictionary<string, object> { { "@id", allocId } });
-                            var ledObj = MainClass.ExecuteScalar(
-                                "SELECT COUNT(*) FROM ledger WHERE customer_plot_id=@id;",
-                                new Dictionary<string, object> { { "@id", allocId } });
-                            long recCount = Convert.ToInt64(recObj ?? 0);
-                            long ledCount = Convert.ToInt64(ledObj ?? 0);
-                            if (recCount > 0 || ledCount > 0)
-                            {
-                                ShowError(
-                                    "Allocation delete allow nahi hai kyun ke linked records mojood hain:\n" +
-                                    (recCount > 0 ? "- Receipts: " + recCount + "\n" : "") +
-                                    (ledCount > 0 ? "- Ledger: " + ledCount + "\n" : "") +
-                                    "Pehle Cancel use karein ya receipts/ledger clear karein.");
-                                return;
-                            }
+                            var cascade = HubSyncService.CollectAllocationCascade(allocId);
 
                             MainClass.AcquireSharedConnection();
                             SQLiteTransaction tx = null;
                             try
                             {
                                 tx = MainClass.con.BeginTransaction();
+
+                                using (var cmd = new SQLiteCommand(
+                                    "DELETE FROM partner_money WHERE customer_plot_id=@id;", MainClass.con, tx))
+                                {
+                                    cmd.Parameters.AddWithValue("@id", allocId);
+                                    try { cmd.ExecuteNonQuery(); } catch { }
+                                }
+                                using (var cmd = new SQLiteCommand(
+                                    "DELETE FROM receipts WHERE customer_plot_id=@id;", MainClass.con, tx))
+                                {
+                                    cmd.Parameters.AddWithValue("@id", allocId);
+                                    cmd.ExecuteNonQuery();
+                                }
+                                using (var cmd = new SQLiteCommand(
+                                    "DELETE FROM ledger WHERE customer_plot_id=@id;", MainClass.con, tx))
+                                {
+                                    cmd.Parameters.AddWithValue("@id", allocId);
+                                    cmd.ExecuteNonQuery();
+                                }
+                                using (var cmd = new SQLiteCommand(
+                                    "DELETE FROM customer_plot_partners WHERE customer_plot_id=@id;", MainClass.con, tx))
+                                {
+                                    cmd.Parameters.AddWithValue("@id", allocId);
+                                    try { cmd.ExecuteNonQuery(); } catch { }
+                                }
 
                                 int del;
                                 using (var cmd = new SQLiteCommand(
@@ -413,6 +507,8 @@ WHERE a.id=@id;",
 
                                 tx.Commit();
                                 tx = null;
+                                try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
+                                try { HubSyncService.NotifyLocalWrite(); } catch { }
                                 ShowInfo("Allocation delete ho gaya.");
                                 GetData();
                             }
@@ -620,6 +716,8 @@ WHERE a.id=@id;",
                 var dt = MainClass.ExecuteSelectQuery(@"
 SELECT a.id, a.customer_id, a.plot_id, a.price, a.booking_date, a.notes, a.status,
        a.broker_id, a.broker_commission,
+       COALESCE(a.monthly_installment, 0) AS monthly_installment,
+       COALESCE(NULLIF(TRIM(a.deal_type),''),'Installment') AS deal_type,
        p.society_id, p.block_id, p.plot_type_id
 FROM customer_plots a
 JOIN plots p ON p.id = a.plot_id
@@ -651,6 +749,17 @@ WHERE a.id=@id;",
                 TryToInt(r["broker_id"], out curBrokerId);
                 decimal curBrokerComm = 0m;
                 try { if (r["broker_commission"] != DBNull.Value) curBrokerComm = Convert.ToDecimal(r["broker_commission"]); } catch { }
+                decimal curMonthly = 0m;
+                try { if (r.Table.Columns.Contains("monthly_installment") && r["monthly_installment"] != DBNull.Value) curMonthly = Convert.ToDecimal(r["monthly_installment"]); } catch { }
+                string curDealType = "Installment";
+                try
+                {
+                    string dtRaw = Convert.ToString(r["deal_type"] ?? "").Trim();
+                    if (string.Equals(dtRaw, "Reserve", StringComparison.OrdinalIgnoreCase)) curDealType = "Reserve";
+                    else if (string.Equals(dtRaw, "Sold", StringComparison.OrdinalIgnoreCase)) curDealType = "Sold";
+                    else curDealType = "Installment";
+                }
+                catch { }
                 string curBpKey = curBrokerId > 0 ? ("B:" + curBrokerId) : null;
                 if (string.IsNullOrEmpty(curBpKey))
                 {
@@ -661,7 +770,8 @@ WHERE a.id=@id;",
                 Form dlg = BuildEditDialog(
                     out ComboBox cbCustomer, out ComboBox cbSoc, out ComboBox cbBlock, out ComboBox cbType, out ComboBox cbPlot,
                     out NumericUpDown numPrice, out DateTimePicker dtpBook, out TextBox txtNotes, out ComboBox cbStatus,
-                    out ComboBox cbBroker, out NumericUpDown numBrokerComm);
+                    out ComboBox cbBroker, out NumericUpDown numBrokerComm, out ComboBox cbDealType,
+                    out NumericUpDown numMonthly);
 
                 LoadCustomers(cbCustomer, curCustomerId);
                 LoadSocieties(cbSoc, curSocId);
@@ -701,6 +811,10 @@ WHERE a.id=@id;",
                                       (curBrokerComm > numBrokerComm.Maximum) ? numBrokerComm.Maximum :
                                       curBrokerComm;
 
+                try { cbDealType.SelectedItem = curDealType; } catch { cbDealType.SelectedIndex = 0; }
+                numMonthly.Value = (curMonthly < numMonthly.Minimum) ? numMonthly.Minimum :
+                                   (curMonthly > numMonthly.Maximum) ? numMonthly.Maximum : curMonthly;
+
                 if (dlg.ShowDialog() != DialogResult.OK) { dlg.Dispose(); return; }
 
                 if (!TryGetId(cbCustomer, out int newCustId)) { ShowInfo("Customer required."); return; }
@@ -708,16 +822,28 @@ WHERE a.id=@id;",
                 if (!TryGetId(cbBlock, out int newBid)) { ShowInfo("Block required."); return; }
                 if (!TryGetId(cbType, out int newPtid)) { ShowInfo("Plot Type required."); return; }
                 if (!TryGetId(cbPlot, out int newPlotId)) { ShowInfo("Plot required."); return; }
-                if (!MainClass.TryParseBrokerPartnerKey(cbBroker.SelectedValue, out string bpKind, out int bpId))
-                { ShowInfo("Broker ya Partner required."); return; }
-                int newBrokerId = bpKind == "B" ? bpId : 0;
+
+                // Broker / price / commission optional (0 allowed) — old backup compatible
+                string bpKind = "";
+                int bpId = 0;
+                MainClass.TryParseBrokerPartnerKey(cbBroker.SelectedValue, out bpKind, out bpId);
+                int newBrokerId = (bpKind == "B" && bpId > 0) ? bpId : 0;
                 decimal newBrokerComm = numBrokerComm.Value;
-                if (newBrokerComm < 0) { ShowInfo("Broker commission 0 ya us se zyada honi chahiye."); return; }
+                if (newBrokerComm < 0) newBrokerComm = 0;
 
                 string newStatus = Convert.ToString(cbStatus.SelectedItem ?? curStatus);
                 decimal newPrice = numPrice.Value;
+                if (newPrice < 0) newPrice = 0;
                 string newDate = dtpBook.Value.ToString("yyyy-MM-dd");
                 string newNotes = (txtNotes.Text ?? "").Trim();
+                string newDealType = "Installment";
+                try
+                {
+                    string s = Convert.ToString(cbDealType.SelectedItem ?? "").Trim();
+                    if (string.Equals(s, "Reserve", StringComparison.OrdinalIgnoreCase)) newDealType = "Reserve";
+                    else if (string.Equals(s, "Sold", StringComparison.OrdinalIgnoreCase)) newDealType = "Sold";
+                }
+                catch { }
 
                 if (string.Equals(curStatus, "Completed", StringComparison.OrdinalIgnoreCase) &&
                     (newStatus != "Completed" || newPlotId != curPlotId))
@@ -730,23 +856,24 @@ WHERE a.id=@id;",
                     allocId, curPlotId, newPlotId,
                     curStatus, newStatus,
                     newCustId, newPrice, newDate, newNotes,
-                    newBrokerId, newBrokerComm);
+                    newBrokerId, newBrokerComm, newDealType, numMonthly.Value);
 
                 if (err == null)
                 {
                     try
                     {
-                        if (bpKind == "P")
+                        if (bpKind == "P" && bpId > 0)
                         {
                             MainClass.SyncAllocationPartnerCommission(allocId, bpId, newBrokerComm, newDate);
                         }
                         else
                         {
-                            // Broker select: sirf pehli partner-commission clear
+                            // No partner: clear any previous partner-commission entry
                             MainClass.SyncAllocationPartnerCommission(allocId, 0, 0, newDate);
                         }
                     }
                     catch { }
+                    try { HubSyncService.NotifyLocalWrite(); } catch { }
                     ShowInfo("Allocation update ho gaya.");
                     GetData();
                 }
@@ -864,12 +991,7 @@ WHERE a.id=@id;",
                 }
 
                 decimal newPrice = numPrice.Value;
-                if (newPrice <= 0)
-                {
-                    ShowInfo("Price 0 se zyada honi chahiye.");
-                    dlg.Dispose();
-                    return;
-                }
+                if (newPrice < 0) newPrice = 0;
 
                 string newNotes = (txtNotes.Text ?? "").Trim();
                 string newPlotNo = cbPlot.Text;
@@ -890,6 +1012,7 @@ WHERE a.id=@id;",
 
                 if (err == null)
                 {
+                    try { HubSyncService.NotifyLocalWrite(); } catch { }
                     ShowInfo(
                         "Transfer successful.\n\n" +
                         "• Plot " + oldPlotNo + " → " + newPlotNo + "\n" +
@@ -908,11 +1031,17 @@ WHERE a.id=@id;",
         private void LoadPlotsForTransfer(ComboBox cb, int sid, int bid, int ptid, int currentPlotId)
         {
             // Sirf Available plots (current show nahi — transfer ke liye naya chahiye)
+            try { MainClass.RepairAllocatedPlotStatuses(); } catch { }
             var dt = MainClass.ExecuteSelectQuery(@"
 SELECT id, plot_no
 FROM plots
 WHERE society_id=@sid AND block_id=@bid AND plot_type_id=@ptid
   AND status='Available' AND id<>@curr
+  AND NOT EXISTS (
+    SELECT 1 FROM customer_plots cp
+    WHERE cp.plot_id = plots.id
+      AND IFNULL(cp.status,'') = 'Active'
+  )
 ORDER BY plot_no;",
                 new Hashtable { { "@sid", sid }, { "@bid", bid }, { "@ptid", ptid }, { "@curr", currentPlotId } });
 
@@ -1230,8 +1359,14 @@ WHERE id=@id;", MainClass.con, tx))
             int allocId, int oldPlotId, int newPlotId,
             string oldStatus, string newStatus,
             int newCustomerId, decimal newPrice, string newBookingDate, string newNotes,
-            int newBrokerId, decimal newBrokerComm)
+            int newBrokerId, decimal newBrokerComm, string newDealType, decimal newMonthly = 0)
         {
+            if (string.IsNullOrWhiteSpace(newDealType)) newDealType = "Installment";
+            if (string.Equals(newDealType, "Reserve", StringComparison.OrdinalIgnoreCase)) newDealType = "Reserve";
+            else if (string.Equals(newDealType, "Sold", StringComparison.OrdinalIgnoreCase)) newDealType = "Sold";
+            else newDealType = "Installment";
+            string plotDealStatus = newDealType == "Sold" ? "Sold" : "Hold";
+
             MainClass.AcquireSharedConnection();
             SQLiteTransaction tx = null;
             try
@@ -1253,18 +1388,19 @@ WHERE id=@id;", MainClass.con, tx))
 
                     int held;
                     using (var cmd = new SQLiteCommand(
-                        "UPDATE plots SET status='Hold' WHERE id=@id AND status='Available';",
+                        "UPDATE plots SET status=@st WHERE id=@id AND status='Available';",
                         MainClass.con, tx))
                     {
+                        cmd.Parameters.AddWithValue("@st", plotDealStatus);
                         cmd.Parameters.AddWithValue("@id", newPlotId);
                         held = cmd.ExecuteNonQuery();
                     }
-                    if (held <= 0) return "New plot ko Hold nahi kar paaye.";
+                    if (held <= 0) return "New plot ko Hold/Sold nahi kar paaye.";
 
                     if (string.Equals(oldStatus, "Active", StringComparison.OrdinalIgnoreCase))
                     {
                         using (var cmd = new SQLiteCommand(
-                            "UPDATE plots SET status='Available' WHERE id=@id AND status='Hold';",
+                            "UPDATE plots SET status='Available' WHERE id=@id AND status IN ('Hold','Sold');",
                             MainClass.con, tx))
                         {
                             cmd.Parameters.AddWithValue("@id", oldPlotId);
@@ -1283,7 +1419,7 @@ WHERE id=@id;", MainClass.con, tx))
                     if (upPlot <= 0) return "Allocation me plot update fail.";
 
                     using (var cmd = new SQLiteCommand(
-                        "UPDATE plots SET status='Available' WHERE id=@id AND status='Hold';",
+                        "UPDATE plots SET status='Available' WHERE id=@id AND status IN ('Hold','Sold');",
                         MainClass.con, tx))
                     {
                         cmd.Parameters.AddWithValue("@id", oldPlotId);
@@ -1296,7 +1432,7 @@ WHERE id=@id;", MainClass.con, tx))
                     if (oldStatus == "Active" && newStatus == "Cancelled")
                     {
                         using (var cmd = new SQLiteCommand(
-                            "UPDATE plots SET status='Available' WHERE id=@pid AND status IN ('Hold');",
+                            "UPDATE plots SET status='Available' WHERE id=@pid AND status IN ('Hold','Sold');",
                             MainClass.con, tx))
                         {
                             cmd.Parameters.AddWithValue("@pid", newPlotId);
@@ -1306,7 +1442,7 @@ WHERE id=@id;", MainClass.con, tx))
                     else if (oldStatus == "Active" && newStatus == "Completed")
                     {
                         using (var cmd = new SQLiteCommand(
-                            "UPDATE plots SET status='Sold' WHERE id=@pid AND status IN ('Hold','Available');",
+                            "UPDATE plots SET status='Sold' WHERE id=@pid AND status IN ('Hold','Available','Sold');",
                             MainClass.con, tx))
                         {
                             cmd.Parameters.AddWithValue("@pid", newPlotId);
@@ -1317,15 +1453,27 @@ WHERE id=@id;", MainClass.con, tx))
                     {
                         int ok;
                         using (var cmd = new SQLiteCommand(
-                            "UPDATE plots SET status='Hold' WHERE id=@pid AND status='Available';",
+                            "UPDATE plots SET status=@st WHERE id=@pid AND status='Available';",
                             MainClass.con, tx))
                         {
+                            cmd.Parameters.AddWithValue("@st", plotDealStatus);
                             cmd.Parameters.AddWithValue("@pid", newPlotId);
                             ok = cmd.ExecuteNonQuery();
                         }
-                        if (ok <= 0) return "Plot ko Hold nahi kar paaye.";
+                        if (ok <= 0) return "Plot ko Hold/Sold nahi kar paaye.";
                     }
                     else if (oldStatus == "Completed") return "Completed allocation ka status change allow nahi.";
+                }
+                else if (string.Equals(newStatus, "Active", StringComparison.OrdinalIgnoreCase) && newPlotId == oldPlotId)
+                {
+                    using (var cmd = new SQLiteCommand(
+                        "UPDATE plots SET status=@st WHERE id=@pid AND status IN ('Hold','Sold','Available');",
+                        MainClass.con, tx))
+                    {
+                        cmd.Parameters.AddWithValue("@st", plotDealStatus);
+                        cmd.Parameters.AddWithValue("@pid", newPlotId);
+                        cmd.ExecuteNonQuery();
+                    }
                 }
 
                 int up;
@@ -1337,7 +1485,9 @@ WHERE id=@id;", MainClass.con, tx))
                            notes=@notes, 
                            status=@st,
                            broker_id=@bid,
-                           broker_commission=@bcomm
+                           broker_commission=@bcomm,
+                           deal_type=@deal,
+                           monthly_installment=@monthly
                        WHERE id=@id;", MainClass.con, tx))
                 {
                     cmd.Parameters.AddWithValue("@cid", newCustomerId);
@@ -1347,6 +1497,8 @@ WHERE id=@id;", MainClass.con, tx))
                     cmd.Parameters.AddWithValue("@st", newStatus);
                     cmd.Parameters.AddWithValue("@bid", newBrokerId > 0 ? (object)newBrokerId : DBNull.Value);
                     cmd.Parameters.AddWithValue("@bcomm", newBrokerComm);
+                    cmd.Parameters.AddWithValue("@deal", newDealType);
+                    cmd.Parameters.AddWithValue("@monthly", newMonthly < 0 ? 0 : newMonthly);
                     cmd.Parameters.AddWithValue("@id", allocId);
                     up = cmd.ExecuteNonQuery();
                 }
@@ -1372,7 +1524,8 @@ WHERE id=@id;", MainClass.con, tx))
         private Form BuildEditDialog(
             out ComboBox cbCustomer, out ComboBox cbSoc, out ComboBox cbBlock, out ComboBox cbType, out ComboBox cbPlot,
             out NumericUpDown numPrice, out DateTimePicker dtpBook, out TextBox txtNotes, out ComboBox cbStatus,
-            out ComboBox cbBroker, out NumericUpDown numBrokerComm)
+            out ComboBox cbBroker, out NumericUpDown numBrokerComm, out ComboBox cbDealType,
+            out NumericUpDown numMonthly)
         {
             var f = new Form
             {
@@ -1383,7 +1536,7 @@ WHERE id=@id;", MainClass.con, tx))
                 MaximizeBox = false,
                 ShowInTaskbar = false,
                 Width = 620,
-                Height = 460,
+                Height = 540,
                 Padding = new Padding(14),
                 AutoScaleMode = AutoScaleMode.Font
             };
@@ -1393,7 +1546,7 @@ WHERE id=@id;", MainClass.con, tx))
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 ColumnCount = 4,
-                RowCount = 7,
+                RowCount = 8,
                 GrowStyle = TableLayoutPanelGrowStyle.AddRows
             };
 
@@ -1410,7 +1563,9 @@ WHERE id=@id;", MainClass.con, tx))
 
             cbCustomer = Cb(); cbSoc = Cb(); cbBlock = Cb(); cbType = Cb(); cbPlot = Cb();
             numPrice = Num(); dtpBook = Dtp(); cbStatus = Cb(); txtNotes = TbMulti();
-            cbBroker = Cb(); numBrokerComm = Num();
+            cbBroker = Cb(); numBrokerComm = Num(); cbDealType = Cb(); numMonthly = Num();
+            cbDealType.Items.AddRange(new object[] { "Installment", "Reserve", "Sold" });
+            cbDealType.SelectedIndex = 0;
 
             grid.Controls.Add(L("Customer"), 0, 0); grid.Controls.Add(cbCustomer, 1, 0);
             grid.Controls.Add(L("Plot Type"), 2, 0); grid.Controls.Add(cbType, 3, 0);
@@ -1422,7 +1577,9 @@ WHERE id=@id;", MainClass.con, tx))
             grid.Controls.Add(L("Status"), 2, 3); grid.Controls.Add(cbStatus, 3, 3);
             grid.Controls.Add(L("Broker"), 0, 4); grid.Controls.Add(cbBroker, 1, 4);
             grid.Controls.Add(L("Broker Commission"), 2, 4); grid.Controls.Add(numBrokerComm, 3, 4);
-            grid.Controls.Add(L("Notes"), 0, 5); grid.Controls.Add(txtNotes, 1, 5); grid.SetColumnSpan(txtNotes, 3);
+            grid.Controls.Add(L("Deal Type"), 0, 5); grid.Controls.Add(cbDealType, 1, 5);
+            grid.Controls.Add(L("Monthly Installment"), 2, 5); grid.Controls.Add(numMonthly, 3, 5);
+            grid.Controls.Add(L("Notes"), 0, 6); grid.Controls.Add(txtNotes, 1, 6); grid.SetColumnSpan(txtNotes, 3);
 
             var pnlButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, AutoSize = true, WrapContents = false };
             var btnOK = new Button { Text = "Save", Width = 90, DialogResult = DialogResult.OK, Margin = new Padding(8, 8, 0, 0) };
@@ -1484,6 +1641,7 @@ WHERE id=@id;", MainClass.con, tx))
         }
         private void LoadPlots(ComboBox cb, int sid, int bid, int ptid, int currentPlotId)
         {
+            try { MainClass.RepairAllocatedPlotStatuses(); } catch { }
             var dt = MainClass.ExecuteSelectQuery(@"
         SELECT id, plot_no FROM (
             SELECT id, plot_no, 0 AS sortKey FROM plots WHERE id=@curr
@@ -1491,6 +1649,11 @@ WHERE id=@id;", MainClass.con, tx))
             SELECT id, plot_no, 1 AS sortKey
             FROM plots
             WHERE society_id=@sid AND block_id=@bid AND plot_type_id=@ptid AND status='Available'
+              AND NOT EXISTS (
+                SELECT 1 FROM customer_plots cp
+                WHERE cp.plot_id = plots.id
+                  AND IFNULL(cp.status,'') = 'Active'
+              )
         ) t
         GROUP BY id, plot_no, sortKey
         ORDER BY sortKey, plot_no;",
@@ -1729,6 +1892,21 @@ Agar koi sawal ho to reply karein.";
                         Visible = true
                     };
                     gv.Columns.Add(col);
+                }
+
+                if (!gv.Columns.Contains("dgvDealType"))
+                {
+                    var col = new DataGridViewTextBoxColumn
+                    {
+                        Name = "dgvDealType",
+                        HeaderText = "Deal Type",
+                        DataPropertyName = "DealType",
+                        Width = 100,
+                        Visible = true
+                    };
+                    int ix = gv.Columns.Contains("dgvStatus") ? gv.Columns["dgvStatus"].DisplayIndex : gv.Columns.Count;
+                    gv.Columns.Add(col);
+                    try { col.DisplayIndex = Math.Max(0, ix); } catch { }
                 }
 
                 if (!gv.Columns.Contains("dgvwa"))

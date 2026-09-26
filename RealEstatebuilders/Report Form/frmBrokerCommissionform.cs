@@ -80,7 +80,7 @@ namespace HubBuilders.Report_Form
 
                 string sql = @"
 SELECT
-  b.name                               AS broker,
+  IFNULL(b.name, '(No Broker)')        AS broker,
   pt.code                              AS plot_type,
   s.name                               AS society,
   bl.name                              AS block,
@@ -89,17 +89,18 @@ SELECT
   IFNULL(cp.broker_commission, 0)      AS broker_commission,
   cp.booking_date
 FROM customer_plots cp
-JOIN brokers    b  ON b.id  = cp.broker_id
+LEFT JOIN brokers    b  ON b.id  = cp.broker_id
 JOIN plots      p  ON p.id  = cp.plot_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
 JOIN blocks     bl ON bl.id = p.block_id
 JOIN societies  s  ON s.id  = p.society_id
 WHERE cp.status = 'Active'
+  AND (IFNULL(cp.broker_id,0) > 0 OR IFNULL(cp.broker_commission,0) <> 0)
   AND (@from IS NULL OR DATE(cp.booking_date) >= DATE(@from))
   AND (@to   IS NULL OR DATE(cp.booking_date)  < DATE(@to, '+1 day'))
   AND (
        @kw = '' 
-       OR b.name  LIKE @kwLike COLLATE NOCASE
+       OR IFNULL(b.name,'')  LIKE @kwLike COLLATE NOCASE
        OR pt.code LIKE @kwLike COLLATE NOCASE
        OR p.plot_no LIKE @kwLike COLLATE NOCASE
   )

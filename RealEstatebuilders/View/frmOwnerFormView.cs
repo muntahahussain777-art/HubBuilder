@@ -1,4 +1,4 @@
-﻿using HubBuilders.Model;
+using HubBuilders.Model;
 using HubBuilders; // MainClass
 using System;
 using System.Collections.Generic;
@@ -18,12 +18,7 @@ namespace HubBuilders.View
         {
             try
             {
-                if (MainClass.LoggedInRole != "Admin")
-                {
-                    btnAdd.Enabled = false;  // Add button disable
-                    guna2DataGridView1.Columns["dgvedit"].Visible = false; // Edit Button Hide
-                    guna2DataGridView1.Columns["dgvdel"].Visible = false;  // Delete Button Hide
-                }
+                /* StaffAccess ApplyStaffAccessUi handles Add/Edit/Delete visibility */
                 LoadData(); }
             catch (Exception ex) { ShowError("Form load failed.\n\n" + ex.Message); }
         }
@@ -118,12 +113,7 @@ ORDER BY person_id DESC;";
                 if (col == "dgvedit")
                 {
                     // ADMIN-ONLY
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        CustomeMessage msg = new CustomeMessage("Only Admin can edit owners!", "Access Denied");
-                        msg.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "edit")) return;
 
                     if (!TryGetSelectedId(out int id)) { ShowError("Invalid selection. ID missing."); return; }
 
@@ -139,12 +129,7 @@ ORDER BY person_id DESC;";
                 if (col == "dgvdel")
                 {
                     // ADMIN-ONLY
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        CustomeMessage msg = new CustomeMessage("Only Admin can delete owners!", "Access Denied");
-                        msg.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "delete")) return;
 
                     if (!TryGetSelectedId(out int id)) { ShowError("Invalid selection. ID missing."); return; }
                     if (!AskYesNo("Delete this owner?\n\nNote: Agar Deal me reference ho to delete fail hoga.", "Delete Confirmation")) return;

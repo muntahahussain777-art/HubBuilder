@@ -252,3 +252,93 @@ class SoftPanel extends StatelessWidget {
     );
   }
 }
+
+Future<bool> confirmDelete(BuildContext context, String message) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: AppColors.panel,
+      title: const Text('Confirm'),
+      content: Text(message),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('No'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Yes'),
+        ),
+      ],
+    ),
+  );
+  return ok == true;
+}
+
+/// Same InputDecoration as other fields — only adds eye to show/hide password.
+class HubPasswordField extends StatelessWidget {
+  const HubPasswordField({
+    super.key,
+    required this.controller,
+    required this.label,
+    required this.obscure,
+    required this.onToggle,
+    this.prefixIcon,
+    this.readOnly = false,
+    this.onSubmitted,
+    this.enableSuggestions = true,
+    this.autocorrect = true,
+    this.autofillHints,
+  });
+
+  final TextEditingController controller;
+  final String label;
+  final bool obscure;
+  final VoidCallback onToggle;
+  final IconData? prefixIcon;
+  final bool readOnly;
+  final ValueChanged<String>? onSubmitted;
+  final bool enableSuggestions;
+  final bool autocorrect;
+  final Iterable<String>? autofillHints;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: controller,
+      obscureText: obscure,
+      readOnly: readOnly,
+      onSubmitted: onSubmitted,
+      enableSuggestions: enableSuggestions,
+      autocorrect: autocorrect,
+      autofillHints: autofillHints,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: prefixIcon == null ? null : Icon(prefixIcon),
+        suffixIcon: IconButton(
+          tooltip: obscure ? 'Password dekhein' : 'Password chhupayein',
+          onPressed: onToggle,
+          icon: Icon(obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+        ),
+      ),
+    );
+  }
+}
+
+class FormDeleteButton extends StatelessWidget {
+  const FormDeleteButton({super.key, required this.onPressed});
+
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton(
+        style: OutlinedButton.styleFrom(foregroundColor: AppColors.danger),
+        onPressed: onPressed,
+        child: const Text('Delete'),
+      ),
+    );
+  }
+}

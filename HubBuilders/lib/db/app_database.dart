@@ -2,6 +2,10 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
+import '../data/hub_duplicate_cleanup.dart';
+import '../data/staff_access.dart';
+import '../data/block_monthly_store.dart';
+
 /// SQLite layer aligned with C# RealEstateBuilders AppData schema.
 /// Empty on first run — no dummy seed data.
 class AppDatabase {
@@ -38,8 +42,8 @@ class AppDatabase {
         await _createTriggers(db);
         // Default admin user (plaintext, same as C# users.upass).
         await db.insert('users', {
-          'username': 'admin',
-          'upass': '1234',
+          'username': 'Admin',
+          'upass': 'hubbuilder786',
           'uName': 'Administrator',
           'uphone': '',
           'Role': 'Admin',
@@ -58,7 +62,244 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
   staff_role TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime'))
 )''');
+    await ensurePartnerMoneySchema(db);
+    await ensureExpenseCategorySchema(db);
+    await ensureOverpayTriggers(db);
+    await ensureIndexes(db);
+    await ensureCustomerPlotsDealType(db);
+    await ensureCustomerPlotsMonthlyInstallment(db);
+    await ensureDefaultAdmin(db);
+    try {
+      await HubDuplicateCleanup.run(db);
+    } catch (_) {}
+    _db = db;
+    await StaffAccess.ensureSchema();
+    await BlockMonthlyStore.ensureSchema();
+    try {
+      await BlockMonthlyStore.applyToEmptyActive();
+    } catch (_) {}
     return db;
+  }
+
+  /// Additive: Installment | Reserve | Sold — purani rows → Installment.
+  static Future<void> ensureCustomerPlotsDealType([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    final cols = await db.rawQuery('PRAGMA table_info(customer_plots)');
+    final has = cols.any(
+      (c) => (c['name'] as String?)?.toLowerCase() == 'deal_type',
+    );
+    if (!has) {
+      await db.execute(
+        "ALTER TABLE customer_plots ADD COLUMN deal_type TEXT NOT NULL DEFAULT 'Installment'",
+      );
+    }
+    await db.execute('''
+UPDATE customer_plots
+SET deal_type = 'Installment'
+WHERE deal_type IS NULL
+   OR TRIM(COALESCE(deal_type,'')) = ''
+   OR LOWER(TRIM(deal_type)) NOT IN ('installment','reserve','sold')
+''');
+    await db.execute(
+      "UPDATE customer_plots SET deal_type = 'Installment' WHERE LOWER(TRIM(deal_type)) = 'installment'",
+    );
+    await db.execute(
+      "UPDATE customer_plots SET deal_type = 'Reserve' WHERE LOWER(TRIM(deal_type)) = 'reserve'",
+    );
+    await db.execute(
+      "UPDATE customer_plots SET deal_type = 'Sold' WHERE LOWER(TRIM(deal_type)) = 'sold'",
+    );
+  }
+
+  /// Additive: monthly installment amount. Old rows stay 0 (WhatsApp skip).
+  static Future<void> ensureCustomerPlotsMonthlyInstallment([
+    Database? existing,
+  ]) async {
+    final db = existing ?? await instance.database;
+    final cols = await db.rawQuery('PRAGMA table_info(customer_plots)');
+    final has = cols.any(
+      (c) => (c['name'] as String?)?.toLowerCase() == 'monthly_installment',
+    );
+    if (!has) {
+      await db.execute(
+        'ALTER TABLE customer_plots ADD COLUMN monthly_installment REAL NOT NULL DEFAULT 0',
+      );
+    }
+  }
+
+  /// Built-in Admin — software lock. Password form / cloud overwrite nahi.
+  static Future<void> ensureDefaultAdmin([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    try {
+      final rows = await db.query(
+        'users',
+        where: "lower(trim(username)) = 'admin'",
+      );
+      if (rows.isNotEmpty) {
+        await db.rawUpdate(
+          '''
+UPDATE users
+SET username = ?, upass = ?, Role = ?,
+    uName = CASE WHEN IFNULL(TRIM(uName),'')='' THEN ? ELSE uName END
+WHERE lower(trim(username)) = 'admin'
+''',
+          ['Admin', 'hubbuilder786', 'Admin', 'Administrator'],
+        );
+        return;
+      }
+      await db.insert('users', {
+        'username': 'Admin',
+        'upass': 'hubbuilder786',
+        'uName': 'Administrator',
+        'uphone': '',
+        'Role': 'Admin',
+      });
+    } catch (_) {}
+  }
+
+  /// Same tables as WinForms MainClass.EnsurePartnerMoneySchema (additive).
+  static Future<void> ensurePartnerMoneySchema([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS customer_plot_partners (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_plot_id INTEGER NOT NULL UNIQUE,
+  partner_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+)''');
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS partner_money (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  partner_id INTEGER NOT NULL,
+  txn_date TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  amount REAL NOT NULL,
+  mode TEXT,
+  category TEXT,
+  customer_plot_id INTEGER,
+  receipt_id INTEGER,
+  society_id INTEGER,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+)''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_pm_partner ON partner_money(partner_id, txn_date)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_pm_receipt ON partner_money(receipt_id)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_cpp_cp ON customer_plot_partners(customer_plot_id)',
+    );
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS partner_money_categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  direction TEXT NOT NULL DEFAULT 'Both'
+)''');
+    const seeds = [
+      ('Receipt', 'In'),
+      ('Manual In', 'In'),
+      ('Broker Commission', 'In'),
+      ('Zameen / Land', 'Out'),
+      ('Office Expense', 'Out'),
+      ('Staff Salary', 'Out'),
+      ('Apne paas rakha', 'Out'),
+      ('Other', 'Both'),
+    ];
+    for (final s in seeds) {
+      await db.rawInsert(
+        'INSERT OR IGNORE INTO partner_money_categories (name, direction) VALUES (?, ?)',
+        [s.$1, s.$2],
+      );
+    }
+  }
+
+  static Future<void> ensureExpenseCategorySchema([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS expense_categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE
+)''');
+    await db.execute('''
+INSERT OR IGNORE INTO expense_categories (name)
+SELECT DISTINCT TRIM(Category) FROM Expensetbl
+WHERE Category IS NOT NULL AND TRIM(Category) <> ''
+''');
+  }
+
+  static Future<void> ensureOverpayTriggers([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await db.execute('DROP TRIGGER IF EXISTS trg_receipts_no_overpay_insert');
+    await db.execute('DROP TRIGGER IF EXISTS trg_receipts_no_overpay_update');
+    await db.execute('''
+CREATE TRIGGER trg_receipts_no_overpay_insert
+BEFORE INSERT ON receipts
+BEGIN
+  SELECT CASE
+    WHEN NEW.amount > (
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT SUM(CASE WHEN txn_type IN ('Booking','InstallmentDue','Surcharge')
+                          THEN debit ELSE 0 END)
+          FROM ledger WHERE customer_plot_id = NEW.customer_plot_id
+        ),0) > 0
+        THEN COALESCE((
+          SELECT SUM(CASE WHEN txn_type IN ('Booking','InstallmentDue','Surcharge')
+                          THEN debit ELSE 0 END)
+          FROM ledger WHERE customer_plot_id = NEW.customer_plot_id
+        ),0)
+        ELSE COALESCE((SELECT price FROM customer_plots WHERE id = NEW.customer_plot_id),0)
+      END
+      - COALESCE((SELECT SUM(amount) FROM receipts WHERE customer_plot_id = NEW.customer_plot_id),0)
+    )
+    THEN RAISE(ABORT, 'Receipt amount exceeds remaining due')
+  END;
+END''');
+    await db.execute('''
+CREATE TRIGGER trg_receipts_no_overpay_update
+BEFORE UPDATE OF amount, customer_plot_id ON receipts
+BEGIN
+  SELECT CASE
+    WHEN NEW.amount > (
+      SELECT CASE
+        WHEN COALESCE((
+          SELECT SUM(CASE WHEN txn_type IN ('Booking','InstallmentDue','Surcharge')
+                          THEN debit ELSE 0 END)
+          FROM ledger WHERE customer_plot_id = NEW.customer_plot_id
+        ),0) > 0
+        THEN COALESCE((
+          SELECT SUM(CASE WHEN txn_type IN ('Booking','InstallmentDue','Surcharge')
+                          THEN debit ELSE 0 END)
+          FROM ledger WHERE customer_plot_id = NEW.customer_plot_id
+        ),0)
+        ELSE COALESCE((SELECT price FROM customer_plots WHERE id = NEW.customer_plot_id),0)
+      END
+      - COALESCE((
+          SELECT SUM(amount) FROM receipts
+          WHERE customer_plot_id = NEW.customer_plot_id AND id != NEW.id
+        ),0)
+    )
+    THEN RAISE(ABORT, 'Receipt amount exceeds remaining due')
+  END;
+END''');
+  }
+
+  static Future<void> ensureIndexes([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_cp_customer ON customer_plots(customer_id)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_cp_status ON customer_plots(status)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_cp_plot ON customer_plots(plot_id)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS IX_customer_plots_broker ON customer_plots(broker_id)',
+    );
   }
 
   Future<void> _createSchema(Database db) async {
@@ -120,7 +361,7 @@ CREATE TABLE customers (
   name TEXT NOT NULL,
   father_name TEXT,
   mobile TEXT,
-  cnic TEXT UNIQUE,
+  cnic TEXT,
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )''');
@@ -142,7 +383,7 @@ CREATE TABLE customer_plots (
   plot_id INTEGER NOT NULL,
   plan_id INTEGER,
   booking_date TEXT,
-  price REAL NOT NULL CHECK(price > 0),
+  price REAL NOT NULL CHECK(price >= 0),
   down_payment REAL NOT NULL DEFAULT 0 CHECK(down_payment >= 0),
   notes TEXT,
   status TEXT NOT NULL DEFAULT 'Active'
@@ -151,6 +392,7 @@ CREATE TABLE customer_plots (
   broker_commission REAL,
   cancelled_date TEXT,
   cancellation_id INTEGER,
+  deal_type TEXT NOT NULL DEFAULT 'Installment',
   FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
   FOREIGN KEY (plot_id) REFERENCES plots(id) ON DELETE RESTRICT,
   FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL,
@@ -264,6 +506,28 @@ CREATE TABLE allocation_cancellations (
   }
 
   Future<void> _createTriggers(Database db) async {
+    await ensurePlotAllocTriggers(db);
+  }
+
+  /// Drop abort-triggers so cloud rows can land; restore after pull.
+  static Future<void> suspendSyncTriggers([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await db.execute('DROP TRIGGER IF EXISTS trg_receipts_no_overpay_insert');
+    await db.execute('DROP TRIGGER IF EXISTS trg_receipts_no_overpay_update');
+    await db.execute('DROP TRIGGER IF EXISTS trg_cp_one_active_plot_ins');
+    await db.execute('DROP TRIGGER IF EXISTS trg_cp_one_active_plot_upd');
+  }
+
+  static Future<void> restoreSyncTriggers([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await ensureOverpayTriggers(db);
+    await ensurePlotAllocTriggers(db);
+  }
+
+  static Future<void> ensurePlotAllocTriggers([Database? existing]) async {
+    final db = existing ?? await instance.database;
+    await db.execute('DROP TRIGGER IF EXISTS trg_cp_one_active_plot_ins');
+    await db.execute('DROP TRIGGER IF EXISTS trg_cp_one_active_plot_upd');
     await db.execute('''
 CREATE TRIGGER trg_cp_one_active_plot_ins
 BEFORE INSERT ON customer_plots
@@ -277,7 +541,6 @@ BEGIN
     THEN RAISE(ABORT, 'Plot already has an Active allocation')
   END;
 END''');
-
     await db.execute('''
 CREATE TRIGGER trg_cp_one_active_plot_upd
 BEFORE UPDATE OF status, plot_id ON customer_plots

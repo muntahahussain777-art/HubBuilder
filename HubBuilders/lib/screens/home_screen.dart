@@ -1,17 +1,63 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
+import '../data/dashboard_store.dart';
+import '../data/hub_sync.dart';
 import '../data/nav_items.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.onOpen});
 
   final ValueChanged<HubRoute> onOpen;
 
   @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  DashboardStats? _stats;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    HubSync.revision.addListener(_onSync);
+    _load();
+  }
+
+  @override
+  void dispose() {
+    HubSync.revision.removeListener(_onSync);
+    super.dispose();
+  }
+
+  void _onSync() {
+    if (mounted) _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    final s = await DashboardStore.load();
+    if (!mounted) return;
+    setState(() {
+      _stats = s;
+      _loading = false;
+    });
+  }
+
+  String _fmtReceipts(double v) {
+    if (v >= 1000000) return '${(v / 1000000).toStringAsFixed(1)}M';
+    if (v >= 1000) return NumberFormat('#,##0').format(v);
+    return v.toStringAsFixed(0);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final shortcuts = sidebarItems.where((e) => e.route != HubRoute.home).take(8);
+    final shortcuts =
+        sidebarItems.where((e) => e.route != HubRoute.home).take(8);
+    final s = _stats;
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
@@ -40,17 +86,17 @@ class HomeScreen extends StatelessWidget {
                 runSpacing: 10,
                 children: [
                   ElevatedButton.icon(
-                    onPressed: () => onOpen(HubRoute.customer),
+                    onPressed: () => widget.onOpen(HubRoute.customer),
                     icon: const Icon(Icons.people_outline, size: 18),
                     label: const Text('Customers'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: () => onOpen(HubRoute.allocate),
+                    onPressed: () => widget.onOpen(HubRoute.allocate),
                     icon: const Icon(Icons.assignment_outlined, size: 18),
                     label: const Text('Allocate'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: () => onOpen(HubRoute.reports),
+                    onPressed: () => widget.onOpen(HubRoute.reports),
                     icon: const Icon(Icons.assessment_outlined, size: 18),
                     label: const Text('Reports'),
                   ),
@@ -62,18 +108,41 @@ class HomeScreen extends StatelessWidget {
         const SizedBox(height: 18),
         const SectionHeader(
           title: 'Today at a glance',
-          subtitle: 'Shortcuts into main modules',
+          subtitle: 'Live counts from database',
         ),
         const SizedBox(height: 12),
-        Row(
-          children: const [
-            Expanded(child: _StatTile(label: 'Available', value: '126', tip: 'Plots')),
-            SizedBox(width: 10),
-            Expanded(child: _StatTile(label: 'Bookings', value: '84', tip: 'Allocated')),
-            SizedBox(width: 10),
-            Expanded(child: _StatTile(label: 'Receipts', value: '2.1M', tip: 'This month')),
-          ],
-        ),
+        if (_loading)
+          const SoftPanel(
+            child: Center(child: CircularProgressIndicator()),
+          )
+        else
+          Row(
+            children: [
+              Expanded(
+                child: _StatTile(
+                  label: 'Available',
+                  value: '${s?.availablePlots ?? 0}',
+                  tip: 'Plots',
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _StatTile(
+                  label: 'Bookings',
+                  value: '${s?.activeBookings ?? 0}',
+                  tip: 'Allocated',
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _StatTile(
+                  label: 'Receipts',
+                  value: _fmtReceipts(s?.monthReceipts ?? 0),
+                  tip: 'This month',
+                ),
+              ),
+            ],
+          ),
         const SizedBox(height: 22),
         const SectionHeader(
           title: 'Modules',
@@ -84,7 +153,7 @@ class HomeScreen extends StatelessWidget {
           (item) => Padding(
             padding: const EdgeInsets.only(bottom: 10),
             child: SoftPanel(
-              onTap: () => onOpen(item.route),
+              onTap: () => widget.onOpen(item.route),
               child: Row(
                 children: [
                   Container(
@@ -140,7 +209,10 @@ class _StatTile extends StatelessWidget {
                   color: AppColors.tealBright,
                 ),
           ),
-          Text(tip, style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontSize: 11)),
+          Text(
+            tip,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontSize: 11),
+          ),
         ],
       ),
     );

@@ -64,6 +64,15 @@ abstract final class VendorStore {
     return n > 0;
   }
 
+  static Future<bool> deleteExpense(int id) async {
+    final n = await StaffAudit.delete(
+      'Expensetbl',
+      where: 'sid = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
   // ── Person (owners / partners) ───────────────────────────────
 
   static Future<List<ListRow>> ownerRows() async {
@@ -173,6 +182,15 @@ abstract final class VendorStore {
     return n > 0;
   }
 
+  static Future<bool> deletePerson(int id) async {
+    final n = await StaffAudit.delete(
+      'Person',
+      where: 'person_id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
   // ── Deal ─────────────────────────────────────────────────────
 
   static Future<List<ListRow>> dealRows() async {
@@ -214,6 +232,51 @@ ORDER BY d.deal_id DESC
           DateTime.now().toIso8601String().split('T').first,
       'note': note?.trim(),
     });
+  }
+
+  static Future<Map<String, Object?>?> dealById(int id) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'Deal',
+      where: 'deal_id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first;
+  }
+
+  static Future<bool> updateDeal({
+    required int id,
+    required int societyId,
+    required int ownerId,
+    required double amount,
+    String? dealDate,
+    String? note,
+  }) async {
+    final n = await StaffAudit.update(
+      'Deal',
+      {
+        'society_id': societyId,
+        'owner_id': ownerId,
+        'amount': amount,
+        'deal_date': dealDate ??
+            DateTime.now().toIso8601String().split('T').first,
+        'note': note?.trim(),
+      },
+      where: 'deal_id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
+  static Future<bool> deleteDeal(int id) async {
+    final n = await StaffAudit.delete(
+      'Deal',
+      where: 'deal_id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
   }
 
   // ── Credit ───────────────────────────────────────────────────
@@ -279,18 +342,88 @@ ORDER BY c.credit_id DESC
       'note': note?.trim(),
     });
   }
+
+  static Future<Map<String, Object?>?> creditById(int id) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.rawQuery(
+      '''
+SELECT c.*, d.society_id, d.owner_id
+FROM Credit c
+JOIN Deal d ON d.deal_id = c.deal_id
+WHERE c.credit_id = ?
+LIMIT 1''',
+      [id],
+    );
+    if (rows.isEmpty) return null;
+    return rows.first;
+  }
+
+  static Future<bool> updateCredit({
+    required int id,
+    required int dealId,
+    required int partnerId,
+    required double amount,
+    String? payDate,
+    String? note,
+  }) async {
+    final n = await StaffAudit.update(
+      'Credit',
+      {
+        'deal_id': dealId,
+        'partner_id': partnerId,
+        'amount': amount,
+        'pay_date': payDate ??
+            DateTime.now().toIso8601String().split('T').first,
+        'note': note?.trim(),
+      },
+      where: 'credit_id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
+  static Future<bool> deleteCredit(int id) async {
+    final n = await StaffAudit.delete(
+      'Credit',
+      where: 'credit_id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
 }
 
 abstract final class AuthStore {
+  static const builtInAdminUser = 'Admin';
+  static const builtInAdminPass = 'hubbuilder786';
+
+  static bool isBuiltInAdminUsername(String? username) =>
+      (username ?? '').trim().toLowerCase() == 'admin';
+
+  static bool isBuiltInAdminLogin(String username, String password) =>
+      isBuiltInAdminUsername(username) &&
+      password.trim() == builtInAdminPass;
+
   static Future<({bool ok, String? role, String message})> login({
     required String username,
     required String password,
   }) async {
     final db = await AppDatabase.instance.database;
+    await AppDatabase.ensureDefaultAdmin(db);
+    final u = username.trim();
+    final p = password.trim();
+    if (isBuiltInAdminLogin(u, p)) {
+      StaffAudit.setSession(
+        username: builtInAdminUser,
+        displayName: 'Administrator',
+        role: 'Admin',
+      );
+      await StaffAudit.ensureTable();
+      return (ok: true, role: 'Admin', message: 'OK');
+    }
     final rows = await db.query(
       'users',
-      where: 'username = ? AND upass = ?',
-      whereArgs: [username.trim(), password],
+      where: 'lower(trim(username)) = lower(trim(?)) AND trim(upass) = trim(?)',
+      whereArgs: [u, p],
     );
     if (rows.isEmpty) {
       return (ok: false, role: null, message: 'Invalid username or password.');
@@ -316,7 +449,7 @@ abstract final class AuthStore {
     final db = await AppDatabase.instance.database;
     final rows = await db.query(
       'users',
-      where: 'username = ?',
+      where: 'lower(trim(username)) = lower(trim(?))',
       whereArgs: [username.trim()],
     );
     if (rows.isEmpty) {
@@ -340,20 +473,27 @@ abstract final class AuthStore {
     if (newPassword.trim().isEmpty) {
       return (ok: false, message: 'New password required.');
     }
+    if (isBuiltInAdminUsername(username)) {
+      return (
+        ok: false,
+        message: 'Admin login software ke sath lock hai. Change nahi ho sakta.',
+      );
+    }
     final db = await AppDatabase.instance.database;
     final rows = await db.query(
       'users',
-      where: 'username = ? AND upass = ?',
-      whereArgs: [username.trim(), currentPassword],
+      where: 'lower(trim(username)) = lower(trim(?)) AND upass = ?',
+      whereArgs: [username.trim(), currentPassword.trim()],
     );
     if (rows.isEmpty) {
       return (ok: false, message: 'Current password incorrect.');
     }
+    final exact = (rows.first['username'] ?? username).toString();
     final n = await StaffAudit.update(
       'users',
-      {'upass': newPassword},
+      {'upass': newPassword.trim()},
       where: 'username = ?',
-      whereArgs: [username.trim()],
+      whereArgs: [exact],
     );
     if (n <= 0) return (ok: false, message: 'Update failed.');
     return (ok: true, message: 'Password updated.');
@@ -363,6 +503,51 @@ abstract final class AuthStore {
     final db = await AppDatabase.instance.database;
     return db.query('users', orderBy: 'userID');
   }
+
+  static Future<String> passwordOf(String username) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.query(
+      'users',
+      columns: ['upass'],
+      where: 'lower(trim(username)) = lower(trim(?))',
+      whereArgs: [username.trim()],
+      limit: 1,
+    );
+    if (rows.isEmpty) return '';
+    return (rows.first['upass'] ?? '').toString();
+  }
+
+  static Future<({bool ok, String message})> setUserPassword({
+    required int userId,
+    required String newPassword,
+  }) async {
+    if (newPassword.trim().isEmpty) {
+      return (ok: false, message: 'New password required.');
+    }
+    final db = await AppDatabase.instance.database;
+    final check = await db.query(
+      'users',
+      columns: ['username'],
+      where: 'userID = ?',
+      whereArgs: [userId],
+      limit: 1,
+    );
+    if (check.isNotEmpty &&
+        isBuiltInAdminUsername((check.first['username'] ?? '').toString())) {
+      return (
+        ok: false,
+        message: 'Admin login software ke sath lock hai. Change nahi ho sakta.',
+      );
+    }
+    final n = await StaffAudit.update(
+      'users',
+      {'upass': newPassword.trim()},
+      where: 'userID = ?',
+      whereArgs: [userId],
+    );
+    if (n <= 0) return (ok: false, message: 'Update failed.');
+    return (ok: true, message: 'Password updated.');
+  }
 }
 
 /// List helpers for master data modules.
@@ -371,19 +556,19 @@ abstract final class MasterListStore {
     final db = await AppDatabase.instance.database;
     final rows = await db.query('customers', orderBy: 'id DESC');
     return rows.map((r) {
-      final name = r['name'] as String? ?? '';
-      final father = r['father_name'] as String? ?? '';
-      final mobile = r['mobile'] as String? ?? '';
-      final cnic = r['cnic'] as String? ?? '';
-      final created = r['created_at'] as String? ?? '';
+      final name = '${r['name'] ?? ''}';
+      final father = '${r['father_name'] ?? ''}';
+      final mobile = '${r['mobile'] ?? ''}';
+      final cnic = '${r['cnic'] ?? ''}';
+      final created = '${r['created_at'] ?? ''}';
       final date = created.length >= 10 ? created.substring(0, 10) : created;
       return ListRow(
-        id: r['id'] as int?,
+        id: int.tryParse('${r['id'] ?? ''}'),
         title: name,
         fatherName: father,
         mobile: mobile,
         cnic: cnic,
-        note: r['notes'] as String?,
+        note: r['notes']?.toString(),
         date: date,
         subtitle: 'FatherName: $father · Mobile: $mobile',
         meta: 'CNIC $cnic',

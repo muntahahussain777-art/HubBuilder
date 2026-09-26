@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../data/biometric_settings.dart';
+import '../data/hub_sync.dart';
 import '../data/vendor_store.dart';
 import '../db/app_database.dart';
 import '../theme/app_colors.dart';
@@ -16,12 +19,12 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen>
     with SingleTickerProviderStateMixin {
-  final _user = TextEditingController(text: 'admin');
-  final _pass = TextEditingController(text: '1234');
+  final _user = TextEditingController();
+  final _pass = TextEditingController();
   late final AnimationController _pulse;
-  bool _obscure = true;
   bool _loading = false;
   bool _fpAvailable = false;
+  bool _hidePass = true;
   String? _error;
 
   @override
@@ -76,6 +79,8 @@ class _LoginScreenState extends State<LoginScreen>
       });
       return;
     }
+    unawaited(HubSync.start());
+    if (!mounted) return;
     _goHome();
   }
 
@@ -93,6 +98,8 @@ class _LoginScreenState extends State<LoginScreen>
       });
       return;
     }
+    unawaited(HubSync.start());
+    if (!mounted) return;
     _goHome();
   }
 
@@ -134,29 +141,26 @@ class _LoginScreenState extends State<LoginScreen>
                           const SizedBox(height: 22),
                           TextField(
                             controller: _user,
+                            autocorrect: false,
+                            enableSuggestions: false,
+                            autofillHints: const [],
                             decoration: const InputDecoration(
                               labelText: 'Username',
                               prefixIcon: Icon(Icons.person_outline),
                             ),
                           ),
                           const SizedBox(height: 14),
-                          TextField(
+                          HubPasswordField(
                             controller: _pass,
-                            obscureText: _obscure,
+                            label: 'Password',
+                            obscure: _hidePass,
+                            onToggle: () =>
+                                setState(() => _hidePass = !_hidePass),
+                            prefixIcon: Icons.lock_outline,
                             onSubmitted: (_) => _enter(),
-                            decoration: InputDecoration(
-                              labelText: 'Password',
-                              prefixIcon: const Icon(Icons.lock_outline),
-                              suffixIcon: IconButton(
-                                onPressed: () =>
-                                    setState(() => _obscure = !_obscure),
-                                icon: Icon(
-                                  _obscure
-                                      ? Icons.visibility_outlined
-                                      : Icons.visibility_off_outlined,
-                                ),
-                              ),
-                            ),
+                            enableSuggestions: false,
+                            autocorrect: false,
+                            autofillHints: const [],
                           ),
                           if (_error != null) ...[
                             const SizedBox(height: 10),
@@ -187,15 +191,6 @@ class _LoginScreenState extends State<LoginScreen>
                               label: const Text('Fingerprint se login'),
                             ),
                           ],
-                          const SizedBox(height: 12),
-                          Text(
-                            'Default: admin / 1234',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(fontSize: 12),
-                          ),
                         ],
                       ),
                     ),

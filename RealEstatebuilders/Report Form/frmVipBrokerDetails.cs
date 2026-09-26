@@ -392,8 +392,8 @@ namespace HubBuilders.Report_Form
 
             string sql = @"
 SELECT
-  b.id AS broker_id,
-  b.name AS broker_name,
+  IFNULL(b.id, 0) AS broker_id,
+  IFNULL(b.name,'(No Broker)') AS broker_name,
   IFNULL(b.phone,'') AS broker_phone,
   c.name AS customer_name,
   IFNULL(c.mobile,'') AS customer_mobile,
@@ -405,20 +405,21 @@ SELECT
   IFNULL(cp.broker_commission,0) AS broker_commission,
   IFNULL(cp.booking_date,'') AS booking_date
 FROM customer_plots cp
-JOIN brokers    b  ON b.id  = cp.broker_id
+LEFT JOIN brokers    b  ON b.id  = cp.broker_id
 JOIN customers  c  ON c.id  = cp.customer_id
 JOIN plots      p  ON p.id  = cp.plot_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
 JOIN blocks     bl ON bl.id = p.block_id
 JOIN societies  s  ON s.id  = p.society_id
 WHERE cp.status = 'Active'
+  AND (IFNULL(cp.broker_id,0) > 0 OR IFNULL(cp.broker_commission,0) <> 0)
   AND DATE(cp.booking_date) >= DATE(@from)
   AND DATE(cp.booking_date) <= DATE(@to)
   AND (@societyId = 0 OR p.society_id = @societyId)
   AND (@brokerId = 0 OR cp.broker_id = @brokerId)
   AND (
        @kw = ''
-       OR b.name LIKE @kwLike COLLATE NOCASE
+       OR IFNULL(b.name,'') LIKE @kwLike COLLATE NOCASE
        OR c.name LIKE @kwLike COLLATE NOCASE
        OR c.mobile LIKE @kwLike COLLATE NOCASE
        OR s.name LIKE @kwLike COLLATE NOCASE

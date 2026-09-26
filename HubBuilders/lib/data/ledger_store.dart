@@ -1,5 +1,6 @@
 import '../db/app_database.dart';
 import 'allocate_store.dart';
+import 'hub_sync.dart';
 import 'plot_inventory_store.dart';
 import 'staff_audit.dart';
 
@@ -89,7 +90,7 @@ class LedgerLoadResult {
 abstract final class LedgerStore {
   static Future<void> addEntry(LedgerEntry e) async {
     final db = await AppDatabase.instance.database;
-    await db.insert('ledger', {
+    final id = await db.insert('ledger', {
       'customer_plot_id': e.customerPlotId,
       'txn_date': e.txnDate,
       'voucher_no': e.voucherNo,
@@ -99,7 +100,9 @@ abstract final class LedgerStore {
       'txn_type': e.txnType,
     });
     await StaffAudit.log('Insert', 'ledger',
-        detail: 'cpid=${e.customerPlotId}; type=${e.txnType}');
+        detail: 'id=$id; cpid=${e.customerPlotId}; type=${e.txnType}');
+    await HubSync.pushNow('ledger', id);
+    HubSync.notifyLocalWrite();
   }
 
   static Future<List<CustomerItem>> customers() => AllocateStore.customers();

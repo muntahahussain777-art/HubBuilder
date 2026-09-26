@@ -71,7 +71,7 @@ ORDER BY c.name, p.plot_no;",
                 try
                 {
                     numAmount.Value = 0;
-                    txtRefNo.Clear();
+                    SuggestNextRefNo();
                     txtReceiptNotes.Clear();
                     dtpReceiptDate.Value = DateTime.Today;
                 }
@@ -98,6 +98,51 @@ ORDER BY c.name, p.plot_no;",
             {
                 HubBuilders.AppSafety.ShowSoft(ex);
             }
+        }
+
+        /// <summary>
+        /// Auto Ref No: 001, 002… fills gaps after delete. Existing custom refs untouched.
+        /// </summary>
+        private void SuggestNextRefNo()
+        {
+            try
+            {
+                txtRefNo.Text = ComputeNextRefNo();
+            }
+            catch
+            {
+                try { txtRefNo.Text = "001"; } catch { }
+            }
+        }
+
+        private static string ComputeNextRefNo()
+        {
+            var used = new System.Collections.Generic.HashSet<int>();
+            DataTable dt = HubBuilders.MainClass.ExecuteSelectQuery1(
+                "SELECT ref_no FROM receipts WHERE ref_no IS NOT NULL AND TRIM(ref_no) <> ''",
+                null);
+            if (dt != null)
+            {
+                foreach (DataRow row in dt.Rows)
+                {
+                    int? n = ParseNumericRef(Convert.ToString(row["ref_no"]));
+                    if (n.HasValue && n.Value > 0) used.Add(n.Value);
+                }
+            }
+            int next = 1;
+            while (used.Contains(next)) next++;
+            return next.ToString("D3");
+        }
+
+        private static int? ParseNumericRef(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            string t = raw.Trim();
+            foreach (char c in t)
+                if (!char.IsDigit(c)) return null;
+            int v;
+            if (!int.TryParse(t, out v)) return null;
+            return v;
         }
 
         private void EnsurePartnerCombo()
@@ -408,6 +453,8 @@ VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid);", HubBuilders.MainClass.
                 }
 
                 tx.Commit();
+
+                try { HubSyncService.NotifyLocalWrite(); } catch { }
 
                 // clear edit flag if we used it as temp holder for new id
                 if (!isUpdate) EditingReceiptId = null;

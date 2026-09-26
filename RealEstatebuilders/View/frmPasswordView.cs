@@ -1,4 +1,4 @@
-﻿using Guna.UI2.WinForms;
+using Guna.UI2.WinForms;
 using HubBuilders.Model;
 using HubBuilders.Report_Form;
 using System;
@@ -23,15 +23,17 @@ namespace HubBuilders.View
 
         private void frmPasswordView_Load(object sender, EventArgs e)
         {
-            if (MainClass.LoggedInRole != "Admin")
+            if (!StaffAccess.Can("users", "add"))
             {
-                btnAdd.Enabled = false;  // Add button disable
-                gunaDataGridView1.Columns["dgvedit"].Visible = false; // Edit Button Hide
-                gunaDataGridView1.Columns["dgvdel"].Visible = false;  // Delete Button Hide
+                btnAdd.Enabled = false;
             }
-            else
+            if (!StaffAccess.Can("users", "edit") && gunaDataGridView1.Columns.Contains("dgvedit"))
+                gunaDataGridView1.Columns["dgvedit"].Visible = false;
+            if (!StaffAccess.Can("users", "delete") && gunaDataGridView1.Columns.Contains("dgvdel"))
+                gunaDataGridView1.Columns["dgvdel"].Visible = false;
+            if (MainClass.IsAdmin)
             {
-                // Admin: staff entries dekhne ka button (layout same, sirf Add ke paas)
+                // Admin: staff entries + role rules (layout same, sirf Add ke paas)
                 try
                 {
                     if (btnAdd != null && btnAdd.Parent != null && btnAdd.Parent.Controls["btnStaffLog"] == null)
@@ -50,11 +52,56 @@ namespace HubBuilders.View
                         };
                         btnStaffLog.Click += (s, ev) =>
                         {
+                            if (StaffAccess.Deny("staff_entry_log", "open")) return;
                             using (var frm = new frmStaffEntryLog())
                                 frm.ShowDialog(this);
                         };
                         btnAdd.Parent.Controls.Add(btnStaffLog);
                         btnStaffLog.BringToFront();
+                    }
+                    if (btnAdd != null && btnAdd.Parent != null && btnAdd.Parent.Controls["btnStaffRules"] == null)
+                    {
+                        var btnRules = new Guna2Button
+                        {
+                            Name = "btnStaffRules",
+                            Text = "Staff Rules",
+                            Size = new Size(130, btnAdd.Height),
+                            Location = new Point(Math.Max(8, btnAdd.Left - 300), btnAdd.Top),
+                            BorderRadius = btnAdd.BorderRadius,
+                            FillColor = Color.FromArgb(0, 120, 110),
+                            Font = btnAdd.Font,
+                            ForeColor = Color.White,
+                            Animated = true
+                        };
+                        btnRules.Click += (s, ev) =>
+                        {
+                            using (var frm = new frmStaffRolePermissions())
+                                frm.ShowDialog(this);
+                        };
+                        btnAdd.Parent.Controls.Add(btnRules);
+                        btnRules.BringToFront();
+                    }
+                    if (btnAdd != null && btnAdd.Parent != null && btnAdd.Parent.Controls["btnBlockMonthly"] == null)
+                    {
+                        var btnMonthly = new Guna2Button
+                        {
+                            Name = "btnBlockMonthly",
+                            Text = "Block Monthly",
+                            Size = new Size(140, btnAdd.Height),
+                            Location = new Point(Math.Max(8, btnAdd.Left - 450), btnAdd.Top),
+                            BorderRadius = btnAdd.BorderRadius,
+                            FillColor = Color.FromArgb(10, 40, 100),
+                            Font = btnAdd.Font,
+                            ForeColor = Color.White,
+                            Animated = true
+                        };
+                        btnMonthly.Click += (s, ev) =>
+                        {
+                            using (var frm = new frmBlockMonthlyInstallment())
+                                frm.ShowDialog(this);
+                        };
+                        btnAdd.Parent.Controls.Add(btnMonthly);
+                        btnMonthly.BringToFront();
                     }
                 }
                 catch { }
@@ -123,12 +170,7 @@ namespace HubBuilders.View
             if (gunaDataGridView1.CurrentCell.OwningColumn.Name == "dgvedit")
             {
                 // ADMIN-ONLY
-                if (MainClass.LoggedInRole != "Admin")
-                {
-                    CustomeMessage msg = new CustomeMessage("Only Admin can edit users!", "Access Denied");
-                    msg.ShowDialog();
-                    return;
-                }
+                if (StaffAccess.Deny("users", "edit")) return;
 
                 frmPasswordAdd frm = new frmPasswordAdd();
                 frm.id = Convert.ToInt32(gunaDataGridView1.CurrentRow.Cells["dgvid"].Value);
@@ -141,18 +183,21 @@ namespace HubBuilders.View
             if (gunaDataGridView1.CurrentCell.OwningColumn.Name == "dgvdel")
             {
                 // ADMIN-ONLY
-                if (MainClass.LoggedInRole != "Admin")
-                {
-                    CustomeMessage msg = new CustomeMessage("Only Admin can delete users!", "Access Denied");
-                    msg.ShowDialog();
-                    return;
-                }
+                if (StaffAccess.Deny("users", "delete")) return;
 
                 YesOrNoMessage customMessageBox1 = new YesOrNoMessage("Are you sure you want to delete?", "Delete Confirmation");
                 DialogResult dialogResult = customMessageBox1.ShowDialog();
                 if (dialogResult == DialogResult.Yes)
                 {
                     int id = Convert.ToInt32(gunaDataGridView1.CurrentRow.Cells["dgvid"].Value);
+                    string un = "";
+                    try { un = Convert.ToString(gunaDataGridView1.CurrentRow.Cells["dgvusername"].Value); } catch { }
+                    if (MainClass.IsBuiltInAdminUsername(un))
+                    {
+                        MessageBox.Show("Admin user delete nahi ho sakta.",
+                            "Admin", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
                     string qry = "Delete from users where userID = @id";
                     Hashtable ht = new Hashtable { { "@id", id } };
                     MainClass.SQL(qry, ht);

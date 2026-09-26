@@ -63,13 +63,16 @@ JOIN blocks     b ON b.id = p.block_id
 JOIN societies  s ON s.id = p.society_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
 WHERE
-  (
+  IFNULL(cp.status,'') <> 'Cancelled'
+  AND (
     @Keyword = '' OR
     c.name    LIKE @KeywordLike COLLATE NOCASE OR
     pt.code   LIKE @KeywordLike COLLATE NOCASE OR
     p.plot_no LIKE @KeywordLike COLLATE NOCASE
   )
 ORDER BY cp.booking_date, cp.id;";
+
+                    try { MainClass.RepairAllocatedPlotStatuses(); } catch { }
 
                     using (var cmd = new SQLiteCommand(query, con))
                     {
@@ -124,7 +127,8 @@ JOIN blocks     b ON b.id = p.block_id
 JOIN societies  s ON s.id = p.society_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
 WHERE
-  date(cp.booking_date) >= date(@FromDate)
+  IFNULL(cp.status,'') <> 'Cancelled'
+  AND date(cp.booking_date) >= date(@FromDate)
   AND date(cp.booking_date)  < date(@ToDate, '+1 day')
   AND (
     @Keyword = '' OR

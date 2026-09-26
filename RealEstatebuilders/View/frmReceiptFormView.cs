@@ -1,4 +1,4 @@
-﻿using Guna.UI2.WinForms;
+using Guna.UI2.WinForms;
 using HubBuilders.Model;
 using System;
 using System.Collections.Generic;
@@ -1631,6 +1631,8 @@ ORDER BY c.name, p.plot_no;", null);
                         return;
                     }
 
+                    var cascade = HubSyncService.CollectReceiptCascade(rid, ledgerId);
+
                     SQLiteTransaction tx = null;
                     try
                     {
@@ -1639,6 +1641,11 @@ ORDER BY c.name, p.plot_no;", null);
                             pragma.ExecuteNonQuery();
 
                         tx = HubBuilders.MainClass.con.BeginTransaction();
+
+                        HubSyncService.DeletePartnerMoneyWhere(
+                            HubBuilders.MainClass.con, tx,
+                            "receipt_id=@rid",
+                            cmd => cmd.Parameters.AddWithValue("@rid", rid));
 
                         using (var cmd = new SQLiteCommand("DELETE FROM receipts WHERE id=@id;", HubBuilders.MainClass.con, tx))
                         { cmd.Parameters.AddWithValue("@id", rid); cmd.ExecuteNonQuery(); }
@@ -1650,6 +1657,10 @@ ORDER BY c.name, p.plot_no;", null);
                         }
 
                         tx.Commit();
+
+                        try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
+                        try { HubSyncService.NotifyLocalWrite(); } catch { }
+                        try { HubSyncService.RaiseLiveChanged(); } catch { }
 
                         ShowInfo("Receipt deleted successfully.");
 

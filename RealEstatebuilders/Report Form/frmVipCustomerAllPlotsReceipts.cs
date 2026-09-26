@@ -2,12 +2,17 @@ using HubBuilders.ProjectConnection;
 using Microsoft.Reporting.WinForms;
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Data;
 using System.Data.SQLite;
+using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace HubBuilders.Report_Form
@@ -23,6 +28,7 @@ namespace HubBuilders.Report_Form
         private DateTimePicker dtpTo;
         private Guna.UI2.WinForms.Guna2Button btnPreview;
         private Guna.UI2.WinForms.Guna2Button btnClear;
+        private Guna.UI2.WinForms.Guna2Button btnWhatsApp;
         private TextBox txtHint;
         private ReportViewer reportViewer1;
         private Panel _panelTop;
@@ -33,6 +39,17 @@ namespace HubBuilders.Report_Form
         private bool _busy;
 
         private const string Brand = "Hub Builders";
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        private const int SW_RESTORE = 9;
 
         public frmVipCustomerAllPlotsReceipts()
         {
@@ -140,6 +157,7 @@ namespace HubBuilders.Report_Form
 
             cmbCustomer = new ComboBox
             {
+                Name = "cmbCustomer",
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Font = new Font("Segoe UI", 10F),
                 Location = new Point(4, 28),
@@ -186,7 +204,7 @@ namespace HubBuilders.Report_Form
                 ForeColor = Color.FromArgb(180, 190, 210),
                 Location = new Point(4, 172),
                 Size = new Size(400, 46),
-                Text = "Shows receipts for all plots allocated to selected customer.\nHeader shows grand total amount."
+                Text = "All plots receipts + allocate prices.\nRemaining = Plot Prices Total − Receipts Grand Total."
             };
 
             txtHint = new TextBox
@@ -206,7 +224,7 @@ namespace HubBuilders.Report_Form
             var panelButtons = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 56
+                Height = 104
             };
 
             btnPreview = new Guna.UI2.WinForms.Guna2Button
@@ -233,8 +251,22 @@ namespace HubBuilders.Report_Form
             };
             btnClear.Click += btnClear_Click;
 
+            btnWhatsApp = new Guna.UI2.WinForms.Guna2Button
+            {
+                Name = "btnWhatsApp",
+                BorderRadius = 8,
+                FillColor = Color.FromArgb(18, 140, 126),
+                Font = new Font("Segoe UI Semibold", 11F, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(4, 52),
+                Size = new Size(402, 40),
+                Text = "WhatsApp (PDF to Client)"
+            };
+            btnWhatsApp.Click += btnWhatsApp_Click;
+
             panelButtons.Controls.Add(btnPreview);
             panelButtons.Controls.Add(btnClear);
+            panelButtons.Controls.Add(btnWhatsApp);
 
             panelLeft.Controls.Add(panelFields);
             panelLeft.Controls.Add(panelButtons);
@@ -331,6 +363,94 @@ namespace HubBuilders.Report_Form
             catch { }
         }
 
+        private void btnWhatsApp_Click(object sender, EventArgs e)
+        {
+            if (_busy) return;
+            _busy = true;
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+
+                if (cmbCustomer?.SelectedValue == null)
+                {
+                    MessageBox.Show("Pehle customer select karein, phir WhatsApp dabayein.",
+                        "WhatsApp", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                int customerId = Convert.ToInt32(cmbCustomer.SelectedValue);
+                string mobile = LoadCustomerMobile(customerId);
+                string digits = NormalizePhoneToDigits(mobile);
+                if (string.IsNullOrWhiteSpace(digits))
+                {
+                    MessageBox.Show("Customer ka mobile number nahi mila.", "WhatsApp",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                if (dtpFrom.Value.Date > dtpTo.Value.Date)
+                {
+                    MessageBox.Show("From date To date se bara nahi ho sakta.", "Validation",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string customerName;
+                double grandTotal, totalPlotPrices, remaining;
+                int grandReceiptCount;
+                DataTable dt = BuildData(customerId, dtpFrom.Value.Date, dtpTo.Value.Date,
+                    out customerName, out grandTotal, out totalPlotPrices, out remaining, out grandReceiptCount);
+
+                if (dt == null || dt.Rows.Count == 0)
+                {
+                    MessageBox.Show("Is date range mein receipts nahi mile — PDF nahi ban sakti.",
+                        "WhatsApp", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // Also show in viewer (same as Preview) so user sees what is sent
+                try { LoadIntoViewer(dt, customerName, grandTotal, totalPlotPrices, remaining); }
+                catch { }
+
+                string pdfPath = ExportPdf(dt, customerName, grandTotal, totalPlotPrices, remaining);
+                if (string.IsNullOrWhiteSpace(pdfPath) || !File.Exists(pdfPath))
+                {
+                    MessageBox.Show("PDF ban nahi saki.", "WhatsApp", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // PDF clipboard pe — WhatsApp Desktop mein Ctrl+V se auto attach
+                CopyPdfToClipboard(pdfPath);
+
+                string msg = BuildWhatsAppMessage(customerName, grandTotal, totalPlotPrices, remaining);
+                OpenWhatsAppWithPrefill(digits, msg);
+
+                bool attached = TryPastePdfIntoWhatsApp(pdfPath);
+
+                if (attached)
+                {
+                    MessageBox.Show(
+                        "WhatsApp open — PDF auto-attach ho gayi.\nSend dabakar bhej dein.",
+                        "WhatsApp + PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    MessageBox.Show(
+                        "WhatsApp open ho gaya.\nPDF clipboard pe hai — WhatsApp chat mein Ctrl+V dabayein, PDF attach ho jayegi.\n\n" + pdfPath,
+                        "WhatsApp + PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                HubBuilders.AppSafety.ShowSoft(ex);
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+                _busy = false;
+            }
+        }
+
         private void btnPreview_Click(object sender, EventArgs e)
         {
             if (_busy) return;
@@ -356,9 +476,11 @@ namespace HubBuilders.Report_Form
 
                 string customerName;
                 double grandTotal;
+                double totalPlotPrices;
+                double remaining;
                 int grandReceiptCount;
                 DataTable dt = BuildData(customerId, dtpFrom.Value.Date, dtpTo.Value.Date,
-                    out customerName, out grandTotal, out grandReceiptCount);
+                    out customerName, out grandTotal, out totalPlotPrices, out remaining, out grandReceiptCount);
 
                 if (dt == null || dt.Rows.Count == 0)
                 {
@@ -368,31 +490,7 @@ namespace HubBuilders.Report_Form
                     return;
                 }
 
-                string reportPath = Path.Combine(Application.StartupPath, "Reports", "VipCustomerAllPlotsReceipts.rdlc");
-                if (!File.Exists(reportPath))
-                {
-                    MessageBox.Show("Report file not found:\n" + reportPath, "Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-
-                reportViewer1.Reset();
-                reportViewer1.ProcessingMode = ProcessingMode.Local;
-                reportViewer1.LocalReport.ReportPath = reportPath;
-                reportViewer1.LocalReport.DataSources.Clear();
-                reportViewer1.LocalReport.DataSources.Add(new ReportDataSource("DataSet1", dt));
-
-                string period = dtpFrom.Value.ToString("dd-MMM-yyyy") + "  ->  " + dtpTo.Value.ToString("dd-MMM-yyyy");
-                reportViewer1.LocalReport.SetParameters(new ReportParameter[]
-                {
-                    new ReportParameter("HeaderBrand", Brand ?? "Hub Builders"),
-                    new ReportParameter("CustomerNameText", string.IsNullOrWhiteSpace(customerName) ? "(Customer)" : customerName),
-                    new ReportParameter("TotalAmountText", grandTotal.ToString("N2", CultureInfo.InvariantCulture)),
-                    new ReportParameter("PeriodText", period)
-                });
-
-                reportViewer1.ZoomMode = ZoomMode.PageWidth;
-                reportViewer1.RefreshReport();
+                LoadIntoViewer(dt, customerName, grandTotal, totalPlotPrices, remaining);
             }
             catch (Exception ex)
             {
@@ -415,6 +513,256 @@ namespace HubBuilders.Report_Form
             }
         }
 
+        private void LoadIntoViewer(
+            DataTable dt, string customerName,
+            double grandTotal, double totalPlotPrices, double remaining)
+        {
+            string reportPath = Path.Combine(Application.StartupPath, "Reports", "VipCustomerAllPlotsReceipts.rdlc");
+            if (!File.Exists(reportPath))
+            {
+                MessageBox.Show("Report file not found:\n" + reportPath, "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            reportViewer1.Reset();
+            reportViewer1.ProcessingMode = ProcessingMode.Local;
+            reportViewer1.LocalReport.ReportPath = reportPath;
+            reportViewer1.LocalReport.DataSources.Clear();
+            reportViewer1.LocalReport.DataSources.Add(new ReportDataSource("DataSet1", dt));
+
+            string period = dtpFrom.Value.ToString("dd-MMM-yyyy") + "  ->  " + dtpTo.Value.ToString("dd-MMM-yyyy");
+            string summary =
+                "Plot Prices Total: " + totalPlotPrices.ToString("N2", CultureInfo.InvariantCulture)
+                + "   |   Receipts Grand Total: " + grandTotal.ToString("N2", CultureInfo.InvariantCulture)
+                + "   |   Remaining: " + remaining.ToString("N2", CultureInfo.InvariantCulture);
+            reportViewer1.LocalReport.SetParameters(new ReportParameter[]
+            {
+                new ReportParameter("HeaderBrand", Brand ?? "Hub Builders"),
+                new ReportParameter("CustomerNameText", string.IsNullOrWhiteSpace(customerName) ? "(Customer)" : customerName),
+                new ReportParameter("TotalAmountText", grandTotal.ToString("N2", CultureInfo.InvariantCulture)),
+                new ReportParameter("PlotPricesText", totalPlotPrices.ToString("N2", CultureInfo.InvariantCulture)),
+                new ReportParameter("RemainingText", remaining.ToString("N2", CultureInfo.InvariantCulture)),
+                new ReportParameter("SummaryText", summary),
+                new ReportParameter("PeriodText", period)
+            });
+
+            reportViewer1.ZoomMode = ZoomMode.PageWidth;
+            reportViewer1.RefreshReport();
+        }
+
+        private string ExportPdf(
+            DataTable dt, string customerName,
+            double grandTotal, double totalPlotPrices, double remaining)
+        {
+            try
+            {
+                string reportPath = Path.Combine(Application.StartupPath, "Reports", "VipCustomerAllPlotsReceipts.rdlc");
+                if (!File.Exists(reportPath)) return null;
+
+                var local = new LocalReport();
+                local.ReportPath = reportPath;
+                local.DataSources.Clear();
+                local.DataSources.Add(new ReportDataSource("DataSet1", dt));
+
+                string period = dtpFrom.Value.ToString("dd-MMM-yyyy") + "  ->  " + dtpTo.Value.ToString("dd-MMM-yyyy");
+                string summary =
+                    "Plot Prices Total: " + totalPlotPrices.ToString("N2", CultureInfo.InvariantCulture)
+                    + "   |   Receipts Grand Total: " + grandTotal.ToString("N2", CultureInfo.InvariantCulture)
+                    + "   |   Remaining: " + remaining.ToString("N2", CultureInfo.InvariantCulture);
+                try
+                {
+                    local.SetParameters(new ReportParameter[]
+                    {
+                        new ReportParameter("HeaderBrand", Brand ?? "Hub Builders"),
+                        new ReportParameter("CustomerNameText", string.IsNullOrWhiteSpace(customerName) ? "(Customer)" : customerName),
+                        new ReportParameter("TotalAmountText", grandTotal.ToString("N2", CultureInfo.InvariantCulture)),
+                        new ReportParameter("PlotPricesText", totalPlotPrices.ToString("N2", CultureInfo.InvariantCulture)),
+                        new ReportParameter("RemainingText", remaining.ToString("N2", CultureInfo.InvariantCulture)),
+                        new ReportParameter("SummaryText", summary),
+                        new ReportParameter("PeriodText", period)
+                    });
+                }
+                catch { }
+
+                string mime, enc, ext;
+                Warning[] warnings;
+                string[] streams;
+                byte[] bytes = local.Render("PDF", null, out mime, out enc, out ext, out streams, out warnings);
+
+                string folder = Path.Combine(Path.GetTempPath(), "HubBuilders");
+                Directory.CreateDirectory(folder);
+                string safe = MakeFileSafe(customerName);
+                string path = Path.Combine(folder,
+                    "PlotsReceipts_" + safe + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".pdf");
+                File.WriteAllBytes(path, bytes);
+                return path;
+            }
+            catch (Exception ex)
+            {
+                HubBuilders.AppSafety.ShowSoft(ex);
+                return null;
+            }
+        }
+
+        private static string LoadCustomerMobile(int customerId)
+        {
+            try
+            {
+                using (var con = new SQLiteConnection(projectconnection.conReturn()))
+                using (var cmd = new SQLiteCommand(
+                    "SELECT COALESCE(mobile,'') FROM customers WHERE id=@id LIMIT 1;", con))
+                {
+                    cmd.Parameters.AddWithValue("@id", customerId);
+                    con.Open();
+                    return Convert.ToString(cmd.ExecuteScalar() ?? "");
+                }
+            }
+            catch { return ""; }
+        }
+
+        private static string MakeFileSafe(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "Customer";
+            foreach (char c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            name = name.Trim();
+            if (name.Length > 40) name = name.Substring(0, 40);
+            return string.IsNullOrWhiteSpace(name) ? "Customer" : name;
+        }
+
+        private static string BuildWhatsAppMessage(
+            string customerName, double grandTotal, double totalPlotPrices, double remaining)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Assalam o Alaikum,");
+            sb.AppendLine();
+            sb.AppendLine("*" + (string.IsNullOrWhiteSpace(customerName) ? "Customer" : customerName) + "* — Plots Receipts");
+            sb.AppendLine("Plot Prices Total: " + totalPlotPrices.ToString("N0", CultureInfo.InvariantCulture));
+            sb.AppendLine("Receipts Grand Total: " + grandTotal.ToString("N0", CultureInfo.InvariantCulture));
+            sb.AppendLine("*Remaining: " + remaining.ToString("N0", CultureInfo.InvariantCulture) + "*");
+            sb.AppendLine();
+            sb.AppendLine("PDF attached — please check.");
+            sb.AppendLine();
+            sb.AppendLine("Hub Builders");
+            return sb.ToString();
+        }
+
+        private static void CopyPdfToClipboard(string pdfPath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(pdfPath) || !File.Exists(pdfPath)) return;
+                var files = new StringCollection();
+                files.Add(pdfPath);
+                Clipboard.Clear();
+                Clipboard.SetFileDropList(files);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// WhatsApp Desktop chat focus + Ctrl+V = PDF file attach (URL API file support nahi karta).
+        /// </summary>
+        private static bool TryPastePdfIntoWhatsApp(string pdfPath)
+        {
+            try
+            {
+                CopyPdfToClipboard(pdfPath);
+
+                // Chat load hone do
+                Thread.Sleep(2200);
+
+                IntPtr hwnd = FindWhatsAppMainWindow();
+                if (hwnd == IntPtr.Zero)
+                {
+                    // ek aur try
+                    Thread.Sleep(1500);
+                    hwnd = FindWhatsAppMainWindow();
+                }
+                if (hwnd == IntPtr.Zero) return false;
+
+                if (IsIconic(hwnd))
+                    ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                Thread.Sleep(500);
+
+                // Compose box pe PDF paste
+                SendKeys.SendWait("^v");
+                Thread.Sleep(700);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static IntPtr FindWhatsAppMainWindow()
+        {
+            try
+            {
+                // Desktop / Store WhatsApp process names
+                string[] names = { "WhatsApp", "whatsapp", "ApplicationFrameHost" };
+                foreach (var name in names)
+                {
+                    Process[] list = Process.GetProcessesByName(name);
+                    foreach (var p in list)
+                    {
+                        try
+                        {
+                            if (p.MainWindowHandle == IntPtr.Zero) continue;
+                            string title = (p.MainWindowTitle ?? "").Trim();
+                            // Prefer real WhatsApp window
+                            if (name.Equals("ApplicationFrameHost", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (title.IndexOf("WhatsApp", StringComparison.OrdinalIgnoreCase) < 0)
+                                    continue;
+                            }
+                            return p.MainWindowHandle;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return IntPtr.Zero;
+        }
+
+        private static string NormalizePhoneToDigits(string input)
+        {
+            try
+            {
+                var digits = new string((input ?? "").Where(char.IsDigit).ToArray());
+                if (digits.StartsWith("03") && digits.Length == 11)
+                    digits = "92" + digits.Substring(1);
+                return digits;
+            }
+            catch { return ""; }
+        }
+
+        private static void OpenWhatsAppWithPrefill(string digitsE164, string message)
+        {
+            try
+            {
+                string encoded = Uri.EscapeDataString(message ?? "");
+                // Prefer Desktop protocol for attach paste
+                if (!TryOpenUrl("whatsapp://send?phone=" + digitsE164 + "&text=" + encoded))
+                    TryOpenUrl("https://wa.me/" + digitsE164 + "?text=" + encoded);
+            }
+            catch { }
+        }
+
+        private static bool TryOpenUrl(string url)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+                return true;
+            }
+            catch { return false; }
+        }
+
         private sealed class ReceiptDetail
         {
             public int CustomerPlotId;
@@ -422,6 +770,7 @@ namespace HubBuilders.Report_Form
             public string Block;
             public string PlotNo;
             public string PlotType;
+            public decimal PlotPrice;
 
             public int ReceiptId;
             public string ReceiptDate;
@@ -438,10 +787,14 @@ namespace HubBuilders.Report_Form
             DateTime toDate,
             out string customerName,
             out double grandTotal,
+            out double totalPlotPrices,
+            out double remaining,
             out int grandReceiptCount)
         {
             customerName = string.Empty;
             grandTotal = 0d;
+            totalPlotPrices = 0d;
+            remaining = 0d;
             grandReceiptCount = 0;
 
             var dt = new DataTable();
@@ -465,6 +818,7 @@ SELECT
   CAST(p.plot_no AS TEXT) AS plot_no,
   IFNULL(pt.code,'') AS plot_type,
   cp.id AS customer_plot_id,
+  CAST(IFNULL(cp.price,0) AS REAL) AS plot_price,
   r.id AS receipt_id,
   r.receipt_date AS receipt_date,
   r.amount AS amount,
@@ -507,6 +861,7 @@ ORDER BY s.name,
                             Block = Convert.ToString(r["block_name"] ?? string.Empty),
                             PlotNo = Convert.ToString(r["plot_no"] ?? string.Empty),
                             PlotType = Convert.ToString(r["plot_type"] ?? string.Empty),
+                            PlotPrice = Convert.ToDecimal(r["plot_price"] ?? 0m),
 
                             ReceiptId = Convert.ToInt32(r["receipt_id"]),
                             ReceiptDate = Convert.ToString(r["receipt_date"] ?? string.Empty),
@@ -536,6 +891,7 @@ ORDER BY s.name,
                 .Select(g => new
                 {
                     Group = g,
+                    PlotPrice = g.FirstOrDefault()?.PlotPrice ?? 0m,
                     SortSoc = g.FirstOrDefault()?.Society ?? "",
                     SortBlock = g.FirstOrDefault()?.Block ?? "",
                     SortPlotNo = ToIntSafe(g.FirstOrDefault()?.PlotNo)
@@ -545,7 +901,11 @@ ORDER BY s.name,
                 .ThenBy(x => x.SortPlotNo)
                 .ToList();
 
+            totalPlotPrices = (double)plotGroups.Sum(x => x.PlotPrice);
+            remaining = totalPlotPrices - grandTotal;
+
             int sr = 1;
+            var cult = CultureInfo.InvariantCulture;
 
             foreach (var g in plotGroups)
             {
@@ -556,7 +916,9 @@ ORDER BY s.name,
 
                 var first = ordered[0];
                 string plotDisp = BuildPlotDisp(first.Society, first.Block, first.PlotNo, first.PlotType);
-                decimal plotTotal = ordered.Sum(x => x.Amount);
+                decimal plotPaid = ordered.Sum(x => x.Amount);
+                decimal plotPrice = g.PlotPrice;
+                decimal plotBal = plotPrice - plotPaid;
 
                 foreach (var x in ordered)
                 {
@@ -573,29 +935,66 @@ ORDER BY s.name,
                     );
                 }
 
+                // Allocate price for this plot (easy for client)
+                dt.Rows.Add(
+                    0,
+                    "PLOT_PRICE",
+                    "PLOT PRICE (Allocate) - " + plotDisp,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    (double)plotPrice
+                );
+
                 dt.Rows.Add(
                     0,
                     "PLOT_TOTAL",
-                    "PLOT TOTAL - " + plotDisp + "  (" + ordered.Count + " receipts)",
+                    "PLOT PAID - " + plotDisp + "  (" + ordered.Count + " receipts)  |  Remaining: " + plotBal.ToString("N2", cult),
                     "",
                     "",
                     "",
                     "",
                     "",
-                    (double)plotTotal
+                    (double)plotPaid
                 );
             }
 
             dt.Rows.Add(
                 0,
+                "TOTAL_PRICES",
+                "TOTAL PLOT PRICES (all plots above)",
+                "",
+                "",
+                "",
+                "",
+                "",
+                totalPlotPrices
+            );
+
+            dt.Rows.Add(
+                0,
                 "GRAND_TOTAL",
-                "GRAND TOTAL  (" + grandReceiptCount + " receipts)",
+                "RECEIPTS GRAND TOTAL  (" + grandReceiptCount + " receipts)",
                 "",
                 "",
                 "",
                 "",
                 "",
                 grandTotal
+            );
+
+            dt.Rows.Add(
+                0,
+                "REMAINING",
+                "REMAINING  (Plot Prices − Receipts)",
+                "",
+                "",
+                "",
+                "",
+                "",
+                remaining
             );
 
             return dt;

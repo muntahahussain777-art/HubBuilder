@@ -1,4 +1,4 @@
-﻿namespace HubBuilders.Model
+namespace HubBuilders.Model
 {
     partial class frmBlockFormAdd
     {
@@ -32,6 +32,8 @@
             this.cbSociety = new Guna.UI2.WinForms.Guna2ComboBox();
             this.llll = new System.Windows.Forms.Label();
             this.txtBlockName = new Guna.UI2.WinForms.Guna2TextBox();
+            this.lblMonthly = new System.Windows.Forms.Label();
+            this.txtMonthlyInstallment = new Guna.UI2.WinForms.Guna2TextBox();
             this.SuspendLayout();
             // 
             // label1
@@ -114,11 +116,54 @@
             this.txtBlockName.Size = new System.Drawing.Size(233, 36);
             this.txtBlockName.TabIndex = 1;
             // 
+            // lblMonthly
+            // 
+            this.lblMonthly.AutoSize = true;
+            this.lblMonthly.Font = new System.Drawing.Font("Segoe UI Semibold", 12F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.lblMonthly.ForeColor = System.Drawing.Color.White;
+            this.lblMonthly.Location = new System.Drawing.Point(37, 175);
+            this.lblMonthly.Name = "lblMonthly";
+            this.lblMonthly.Size = new System.Drawing.Size(160, 21);
+            this.lblMonthly.TabIndex = 104;
+            this.lblMonthly.Text = "Monthly Installment";
+            // 
+            // txtMonthlyInstallment
+            // 
+            this.txtMonthlyInstallment.AutoRoundedCorners = true;
+            this.txtMonthlyInstallment.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(112)))), ((int)(((byte)(51)))), ((int)(((byte)(255)))));
+            this.txtMonthlyInstallment.BorderRadius = 17;
+            this.txtMonthlyInstallment.Cursor = System.Windows.Forms.Cursors.IBeam;
+            this.txtMonthlyInstallment.DefaultText = "";
+            this.txtMonthlyInstallment.DisabledState.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(208)))), ((int)(((byte)(208)))), ((int)(((byte)(208)))));
+            this.txtMonthlyInstallment.DisabledState.FillColor = System.Drawing.Color.FromArgb(((int)(((byte)(226)))), ((int)(((byte)(226)))), ((int)(((byte)(226)))));
+            this.txtMonthlyInstallment.DisabledState.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(138)))), ((int)(((byte)(138)))), ((int)(((byte)(138)))));
+            this.txtMonthlyInstallment.DisabledState.Parent = this.txtMonthlyInstallment;
+            this.txtMonthlyInstallment.DisabledState.PlaceholderForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(138)))), ((int)(((byte)(138)))), ((int)(((byte)(138)))));
+            this.txtMonthlyInstallment.FillColor = System.Drawing.Color.FromArgb(((int)(((byte)(37)))), ((int)(((byte)(41)))), ((int)(((byte)(74)))));
+            this.txtMonthlyInstallment.FocusedState.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(94)))), ((int)(((byte)(148)))), ((int)(((byte)(255)))));
+            this.txtMonthlyInstallment.FocusedState.Parent = this.txtMonthlyInstallment;
+            this.txtMonthlyInstallment.Font = new System.Drawing.Font("Segoe UI Semibold", 12F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.txtMonthlyInstallment.ForeColor = System.Drawing.Color.White;
+            this.txtMonthlyInstallment.HoverState.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(94)))), ((int)(((byte)(148)))), ((int)(((byte)(255)))));
+            this.txtMonthlyInstallment.HoverState.Parent = this.txtMonthlyInstallment;
+            this.txtMonthlyInstallment.Location = new System.Drawing.Point(17, 199);
+            this.txtMonthlyInstallment.Margin = new System.Windows.Forms.Padding(4, 5, 4, 5);
+            this.txtMonthlyInstallment.Name = "txtMonthlyInstallment";
+            this.txtMonthlyInstallment.PasswordChar = '\0';
+            this.txtMonthlyInstallment.PlaceholderForeColor = System.Drawing.Color.Gray;
+            this.txtMonthlyInstallment.PlaceholderText = "0";
+            this.txtMonthlyInstallment.SelectedText = "";
+            this.txtMonthlyInstallment.ShadowDecoration.Parent = this.txtMonthlyInstallment;
+            this.txtMonthlyInstallment.Size = new System.Drawing.Size(245, 36);
+            this.txtMonthlyInstallment.TabIndex = 2;
+            // 
             // frmBlockFormAdd
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(9F, 21F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(526, 262);
+            this.ClientSize = new System.Drawing.Size(526, 320);
+            this.Controls.Add(this.lblMonthly);
+            this.Controls.Add(this.txtMonthlyInstallment);
             this.Controls.Add(this.llll);
             this.Controls.Add(this.txtBlockName);
             this.Controls.Add(this.txtSociety);
@@ -130,6 +175,8 @@
             this.Controls.SetChildIndex(this.txtSociety, 0);
             this.Controls.SetChildIndex(this.txtBlockName, 0);
             this.Controls.SetChildIndex(this.llll, 0);
+            this.Controls.SetChildIndex(this.txtMonthlyInstallment, 0);
+            this.Controls.SetChildIndex(this.lblMonthly, 0);
             this.ResumeLayout(false);
             this.PerformLayout();
 
@@ -141,5 +188,7 @@
         public Guna.UI2.WinForms.Guna2ComboBox cbSociety;
         private System.Windows.Forms.Label llll;
         public Guna.UI2.WinForms.Guna2TextBox txtBlockName;
+        private System.Windows.Forms.Label lblMonthly;
+        public Guna.UI2.WinForms.Guna2TextBox txtMonthlyInstallment;
     }
 }

@@ -1,4 +1,4 @@
-﻿using HubBuilders.Model;
+using HubBuilders.Model;
 using System;
 using System.Collections.Generic;
 using System.Data;
@@ -23,12 +23,7 @@ namespace HubBuilders.View
                     try { /* keep any column tweaks here if needed */ }
                     catch (Exception ex) { ShowError("Post-bind failed.\n\n" + ex.Message); }
                 };
-                if (MainClass.LoggedInRole != "Admin")
-                {
-                    btnAdd.Enabled = false;  // Add button disable
-                    guna2DataGridView1.Columns["dgvedit"].Visible = false; // Edit Button Hide
-                    guna2DataGridView1.Columns["dgvdel"].Visible = false;  // Delete Button Hide
-                }
+                /* StaffAccess ApplyStaffAccessUi handles Add/Edit/Delete visibility */
 
                 try { MainClass.EnsureCustomerSchema(); } catch { }
 
@@ -115,12 +110,7 @@ ORDER BY datetime(created_at) DESC, id DESC;";
                 if (colName == "dgvedit")
                 {
                     // ADMIN-ONLY: same pattern as categories grid
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        CustomeMessage msg = new CustomeMessage("Only Admin can edit customers!", "Access Denied");
-                        msg.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "edit")) return;
 
                     if (!TryGetSelectedId(out int id))
                     {
@@ -142,12 +132,7 @@ ORDER BY datetime(created_at) DESC, id DESC;";
                 if (colName == "dgvdel")
                 {
                     // ADMIN-ONLY: same pattern as categories grid
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        CustomeMessage msg = new CustomeMessage("Only Admin can delete customers!", "Access Denied");
-                        msg.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "delete")) return;
 
                     if (!TryGetSelectedId(out int id))
                     {

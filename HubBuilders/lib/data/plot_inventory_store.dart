@@ -1,4 +1,5 @@
 import '../db/app_database.dart';
+import 'hub_sync.dart';
 import 'staff_audit.dart';
 
 class IdName {
@@ -226,32 +227,74 @@ abstract final class PlotInventoryStore {
     required int plotTypeId,
   }) async {
     final db = await AppDatabase.instance.database;
-    final rows = await db.query(
-      'plots',
-      where:
-          'society_id = ? AND block_id = ? AND plot_type_id = ? AND status = ?',
-      whereArgs: [societyId, blockId, plotTypeId, 'Available'],
-      orderBy: 'plot_no COLLATE NOCASE',
+    // Same hygiene as Available Plots report / WinForms RepairAllocatedStatusesForReport
+    // (case-insensitive so Installment/Sold never linger as Available).
+    try {
+      await db.execute('''
+UPDATE customer_plots
+SET status = 'Active'
+WHERE LOWER(TRIM(IFNULL(status,''))) = 'cancelled'
+  AND (cancelled_date IS NULL OR TRIM(IFNULL(cancelled_date,'')) = '')
+  AND IFNULL(cancellation_id,0) = 0''');
+      await db.execute('''
+UPDATE plots SET status = CASE
+  WHEN EXISTS (
+    SELECT 1 FROM customer_plots cp
+    WHERE cp.plot_id = plots.id
+      AND LOWER(TRIM(IFNULL(cp.status,''))) <> 'cancelled'
+      AND LOWER(TRIM(IFNULL(cp.deal_type,''))) = 'sold'
+  ) THEN 'Sold'
+  ELSE 'Hold'
+END
+WHERE LOWER(TRIM(IFNULL(status,''))) = 'available'
+  AND EXISTS (
+    SELECT 1 FROM customer_plots cp
+    WHERE cp.plot_id = plots.id
+      AND LOWER(TRIM(IFNULL(cp.status,''))) <> 'cancelled'
+  )''');
+    } catch (_) {}
+    final rows = await db.rawQuery(
+      '''
+SELECT * FROM plots
+WHERE society_id = ? AND block_id = ? AND plot_type_id = ?
+  AND LOWER(TRIM(IFNULL(status,''))) = 'available'
+  AND LOWER(TRIM(IFNULL(status,''))) NOT IN ('hold','sold')
+  AND NOT EXISTS (
+    SELECT 1 FROM customer_plots cp
+    WHERE cp.plot_id = plots.id
+      AND LOWER(TRIM(IFNULL(cp.status,''))) = 'active'
+  )
+ORDER BY plot_no COLLATE NOCASE''',
+      [societyId, blockId, plotTypeId],
     );
     return rows.map(StoredPlot.fromMap).toList();
   }
 
-  /// UPDATE plots SET status='Hold' WHERE id=@pid AND status='Available'
-  static Future<bool> holdIfAvailable(int plotId) async {
+  /// UPDATE plots SET status='Hold'/'Sold' WHERE id=@pid AND status Available (case-insensitive).
+  static Future<bool> holdIfAvailable(int plotId, {String status = 'Hold'}) async {
     final db = await AppDatabase.instance.database;
+    final st = status == 'Sold' ? 'Sold' : 'Hold';
     final n = await db.rawUpdate(
-      "UPDATE plots SET status = 'Hold' WHERE id = ? AND status = 'Available'",
-      [plotId],
+      "UPDATE plots SET status = ? WHERE id = ? AND LOWER(TRIM(IFNULL(status,''))) = 'available'",
+      [st, plotId],
     );
+    if (n > 0) {
+      await HubSync.pushNow('plots', plotId);
+      HubSync.notifyLocalWrite();
+    }
     return n > 0;
   }
 
   static Future<bool> releaseHold(int plotId) async {
     final db = await AppDatabase.instance.database;
     final n = await db.rawUpdate(
-      "UPDATE plots SET status = 'Available' WHERE id = ? AND status = 'Hold'",
+      "UPDATE plots SET status = 'Available' WHERE id = ? AND status IN ('Hold','Sold')",
       [plotId],
     );
+    if (n > 0) {
+      await HubSync.pushNow('plots', plotId);
+      HubSync.notifyLocalWrite();
+    }
     return n > 0;
   }
 
@@ -366,6 +409,15 @@ LIMIT 1''',
     return n > 0;
   }
 
+  static Future<bool> deleteSociety(int id) async {
+    final n = await StaffAudit.delete(
+      'societies',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
   static Future<List<Map<String, Object?>>> societyRows() async {
     final db = await AppDatabase.instance.database;
     return db.query('societies', orderBy: 'id DESC');
@@ -396,6 +448,15 @@ LIMIT 1''',
     return n > 0;
   }
 
+  static Future<bool> deleteBlock(int id) async {
+    final n = await StaffAudit.delete(
+      'blocks',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
   static Future<int> insertPlotType({
     required int societyId,
     required String code,
@@ -414,6 +475,15 @@ LIMIT 1''',
     final n = await StaffAudit.update(
       'plot_types',
       {'society_id': societyId, 'code': code.trim()},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    return n > 0;
+  }
+
+  static Future<bool> deletePlotType(int id) async {
+    final n = await StaffAudit.delete(
+      'plot_types',
       where: 'id = ?',
       whereArgs: [id],
     );

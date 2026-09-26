@@ -1,4 +1,5 @@
-﻿using System;
+using HubBuilders;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -17,6 +18,71 @@ namespace HubBuilders.View
         public Backup_RestoreForm()
         {
             InitializeComponent();
+            Load += Backup_RestoreForm_Load;
+        }
+
+        private void Backup_RestoreForm_Load(object sender, EventArgs e)
+        {
+            try { WireAutoBackupUi(); } catch { }
+        }
+
+        private ComboBox _cmbInterval;
+        private Label _lblAuto;
+
+        private void WireAutoBackupUi()
+        {
+            if (_cmbInterval != null) return;
+            Height += 92;
+            _lblAuto = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI Semibold", 10F, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(19, 292),
+                Text = "Auto backup: " + (string.IsNullOrWhiteSpace(HubAutoBackup.Root)
+                    ? "(drive select karein)"
+                    : HubAutoBackup.Root + "HubBuilders\\yyyy-MM-dd")
+            };
+            _cmbInterval = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Font = new Font("Segoe UI Semibold", 10F),
+                Location = new Point(19, 318),
+                Size = new Size(200, 28)
+            };
+            _cmbInterval.Items.AddRange(new object[] { "After each entry", "Every 3 hours", "Every 1 day" });
+            string iv = HubAutoBackup.Interval;
+            _cmbInterval.SelectedIndex = iv == "entry" ? 0 : iv == "3h" ? 1 : 2;
+            _cmbInterval.SelectedIndexChanged += (s, ev) =>
+            {
+                int i = _cmbInterval.SelectedIndex;
+                HubAutoBackup.Interval = i == 0 ? "entry" : i == 1 ? "3h" : "1d";
+            };
+            var btnDrive = new Guna.UI2.WinForms.Guna2Button
+            {
+                Animated = true,
+                AutoRoundedCorners = true,
+                BorderRadius = 15,
+                FillColor = Color.FromArgb(112, 51, 255),
+                Font = new Font("Segoe UI Semibold", 10F, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(230, 316),
+                Size = new Size(170, 33),
+                Text = "Choose Drive"
+            };
+            btnDrive.Click += (s, ev) =>
+            {
+                HubAutoBackup.PromptDrive(this);
+                _lblAuto.Text = "Auto backup: " + (string.IsNullOrWhiteSpace(HubAutoBackup.Root)
+                    ? "(drive select karein)"
+                    : HubAutoBackup.Root + "HubBuilders\\yyyy-MM-dd");
+            };
+            Controls.Add(_lblAuto);
+            Controls.Add(_cmbInterval);
+            Controls.Add(btnDrive);
+            _lblAuto.BringToFront();
+            _cmbInterval.BringToFront();
+            btnDrive.BringToFront();
         }
         public static string ConnectionString => conReturn();
 
@@ -133,6 +199,7 @@ namespace HubBuilders.View
 
                 File.Copy(restoreFilePath, databaseFilePath, true);
                 MainClass.EnsureAdditiveSchemasAfterRestore();
+                try { HubBuilders.HubSyncService.NotifyDatabaseRestored(); } catch { }
                 MessageBox.Show(
                     "Restore completed successfully.\nPurana data load ho gaya.\nPlease restart the app.",
                     "Success",
@@ -160,6 +227,15 @@ namespace HubBuilders.View
                 if (folderBrowser.ShowDialog() == DialogResult.OK)
                 {
                     txtBackupPath.Text = folderBrowser.SelectedPath;
+                    try
+                    {
+                        if (string.IsNullOrWhiteSpace(HubAutoBackup.Root))
+                        {
+                            string drive = Path.GetPathRoot(folderBrowser.SelectedPath);
+                            if (!string.IsNullOrWhiteSpace(drive)) HubAutoBackup.Root = drive;
+                        }
+                    }
+                    catch { }
                 }
             }
         }

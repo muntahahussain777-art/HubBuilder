@@ -31,14 +31,14 @@
             <TablixRow>
               <Height>0.24in</Height>
               <TablixCells>
-                <TablixCell><CellContents><Textbox Name="c0"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!sr_no.Value,"")</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c1"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!row_label.Value</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c2"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!receipt_date.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c3"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!receipt_id.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c4"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!mode.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c5"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!refno.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c6"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!notes.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
-                <TablixCell><CellContents><Textbox Name="c7"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=FormatNumber(Fields!amount.Value,2)</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White"))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c0"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!sr_no.Value,"")</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c1"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!row_label.Value</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c2"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!receipt_date.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c3"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!receipt_id.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c4"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!mode.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c5"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!refno.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c6"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=IIF(Fields!row_type.Value="DETAIL",Fields!notes.Value,"")</Value><Style><FontSize>7pt</FontSize></Style></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
+                <TablixCell><CellContents><Textbox Name="c7"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=FormatNumber(Fields!amount.Value,2)</Value><Style><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Right</TextAlign></Style></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><BackgroundColor>=IIF(Fields!row_type.Value="REMAINING","#F8D7DA",IIF(Fields!row_type.Value="GRAND_TOTAL","#D4EDDA",IIF(Fields!row_type.Value="TOTAL_PRICES","#D6EAF8",IIF(Fields!row_type.Value="PLOT_PRICE","#D1ECF1",IIF(Fields!row_type.Value="PLOT_TOTAL","#FFF3CD","White")))))</BackgroundColor><PaddingLeft>1pt</PaddingLeft><PaddingRight>1pt</PaddingRight><PaddingTop>1pt</PaddingTop><PaddingBottom>1pt</PaddingBottom></Style></Textbox></CellContents></TablixCell>
               </TablixCells>
             </TablixRow>
           </TablixRows>
@@ -62,40 +62,45 @@
         <Width>7.65in</Width>
       </Tablix>
       <Textbox Name="txtNote">
-        <Paragraphs><Paragraph><TextRuns><TextRun><Value>Each plot shows its receipts. Yellow row = plot total. Green row = grand total of all plots.</Value><Style><FontSize>7pt</FontSize><Color>#555555</Color></Style></TextRun></TextRuns></Paragraph></Paragraphs>
-        <Top>0.65in</Top><Left>0in</Left><Height>0.25in</Height><Width>7.65in</Width>
+        <Paragraphs><Paragraph><TextRuns><TextRun><Value>Blue = allocate plot price. Yellow = plot paid. Light blue = total plot prices. Green = receipts grand total. Pink = Remaining (Prices − Receipts).</Value><Style><FontSize>7pt</FontSize><Color>#555555</Color></Style></TextRun></TextRuns></Paragraph></Paragraphs>
+        <Top>0.65in</Top><Left>0in</Left><Height>0.28in</Height><Width>7.65in</Width>
       </Textbox>
     </ReportItems>
-    <Height>1.0in</Height>
+    <Height>1.05in</Height>
   </Body>
   <Width>7.8in</Width>
   <Page>
     <PageHeader>
-      <Height>1.05in</Height>
+      <Height>1.22in</Height>
       <PrintOnFirstPage>true</PrintOnFirstPage>
       <PrintOnLastPage>true</PrintOnLastPage>
       <ReportItems>
         <Textbox Name="txtBrand">
           <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Parameters!HeaderBrand.Value</Value><Style><FontFamily>Segoe UI</FontFamily><FontSize>16pt</FontSize><FontWeight>Bold</FontWeight><Color>#0A235F</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
-          <Top>0.05in</Top><Left>0in</Left><Height>0.28in</Height><Width>7.8in</Width>
+          <Top>0.05in</Top><Left>0in</Left><Height>0.26in</Height><Width>7.8in</Width>
         </Textbox>
         <Textbox Name="txtTitle">
           <Paragraphs><Paragraph><TextRuns><TextRun><Value>Customer Plots Receipts (VIP)</Value><Style><FontFamily>Segoe UI</FontFamily><FontSize>11pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
-          <Top>0.33in</Top><Left>0in</Left><Height>0.20in</Height><Width>7.8in</Width>
+          <Top>0.30in</Top><Left>0in</Left><Height>0.18in</Height><Width>7.8in</Width>
         </Textbox>
         <Textbox Name="txtCustomer">
           <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Parameters!CustomerNameText.Value</Value><Style><FontSize>8pt</FontSize><FontWeight>Bold</FontWeight><Color>#444444</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
-          <Top>0.52in</Top><Left>0in</Left><Height>0.16in</Height><Width>7.8in</Width>
+          <Top>0.48in</Top><Left>0in</Left><Height>0.15in</Height><Width>7.8in</Width>
         </Textbox>
-        <Textbox Name="txtTotal">
+        <Textbox Name="txtSummary">
           <CanGrow>true</CanGrow>
-          <Paragraphs><Paragraph><TextRuns><TextRun><Value>="Grand Total: " &amp; Parameters!TotalAmountText.Value</Value><Style><FontSize>8pt</FontSize><FontWeight>Bold</FontWeight><Color>#0A235F</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
-          <Top>0.68in</Top><Left>0in</Left><Height>0.16in</Height><Width>7.8in</Width>
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Parameters!SummaryText.Value</Value><Style><FontSize>8pt</FontSize><FontWeight>Bold</FontWeight><Color>#0A235F</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+          <Top>0.64in</Top><Left>0in</Left><Height>0.18in</Height><Width>7.8in</Width>
         </Textbox>
         <Textbox Name="txtPeriod">
           <CanGrow>true</CanGrow>
           <Paragraphs><Paragraph><TextRuns><TextRun><Value>="Period: " &amp; Parameters!PeriodText.Value</Value><Style><FontSize>8pt</FontSize><FontWeight>Bold</FontWeight><Color>#444444</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
           <Top>0.84in</Top><Left>0in</Left><Height>0.16in</Height><Width>7.8in</Width>
+        </Textbox>
+        <Textbox Name="txtBreakdown">
+          <CanGrow>true</CanGrow>
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>="Prices: " &amp; Parameters!PlotPricesText.Value &amp; "  −  Receipts: " &amp; Parameters!TotalAmountText.Value &amp; "  =  Remaining: " &amp; Parameters!RemainingText.Value</Value><Style><FontSize>8pt</FontSize><FontWeight>Bold</FontWeight><Color>#8B0000</Color></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+          <Top>1.00in</Top><Left>0in</Left><Height>0.16in</Height><Width>7.8in</Width>
         </Textbox>
       </ReportItems>
     </PageHeader>
@@ -167,6 +172,27 @@
       <AllowBlank>true</AllowBlank>
       <Prompt>TotalAmountText</Prompt>
       <DefaultValue><Values><Value>0.00</Value></Values></DefaultValue>
+    </ReportParameter>
+    <ReportParameter Name="PlotPricesText">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>PlotPricesText</Prompt>
+      <DefaultValue><Values><Value>0.00</Value></Values></DefaultValue>
+    </ReportParameter>
+    <ReportParameter Name="RemainingText">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>RemainingText</Prompt>
+      <DefaultValue><Values><Value>0.00</Value></Values></DefaultValue>
+    </ReportParameter>
+    <ReportParameter Name="SummaryText">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>SummaryText</Prompt>
+      <DefaultValue><Values><Value></Value></Values></DefaultValue>
     </ReportParameter>
     <ReportParameter Name="PeriodText">
       <DataType>String</DataType>

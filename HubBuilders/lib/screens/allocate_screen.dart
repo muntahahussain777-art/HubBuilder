@@ -2,7 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../data/allocate_store.dart';
+import '../data/block_monthly_store.dart';
+import '../data/hub_sync.dart';
+import '../data/partner_cash_store.dart';
 import '../data/plot_inventory_store.dart';
+import '../data/whatsapp_open.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 
@@ -23,13 +27,19 @@ class _AllocateScreenState extends State<AllocateScreen> {
   @override
   void initState() {
     super.initState();
+    HubSync.revision.addListener(_onSync);
     _reload();
   }
 
   @override
   void dispose() {
+    HubSync.revision.removeListener(_onSync);
     _search.dispose();
     super.dispose();
+  }
+
+  void _onSync() {
+    if (mounted) _reload();
   }
 
   Future<void> _reload() async {
@@ -47,6 +57,192 @@ class _AllocateScreenState extends State<AllocateScreen> {
       MaterialPageRoute(builder: (_) => const AllocateFormScreen()),
     );
     if (saved == true && mounted) await _reload();
+  }
+
+  Future<void> _complete(AllocationListRow r) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Mark Completed'),
+        content: Text('${r.customer} · Plot ${r.plotNo}\nPlot Sold mark hoga.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Yes')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final res = await AllocateStore.setStatus(
+      customerPlotId: r.id,
+      status: 'Completed',
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(res.message)));
+    if (res.ok) await _reload();
+  }
+
+  Future<void> _cancel(AllocationListRow r) async {
+    final pctCtrl = TextEditingController(text: '30');
+    final notesCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cancel Allocation'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('${r.customer} · Plot ${r.plotNo}'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: pctCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Deduction % (on received)',
+              ),
+            ),
+            TextField(
+              controller: notesCtrl,
+              decoration: const InputDecoration(labelText: 'Notes'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Cancel Plot')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final pct = double.tryParse(pctCtrl.text.trim()) ?? 30;
+    final res = await AllocateStore.cancelAllocation(
+      customerPlotId: r.id,
+      deductionPercent: pct,
+      notes: notesCtrl.text.trim().isEmpty ? null : notesCtrl.text.trim(),
+    );
+    pctCtrl.dispose();
+    notesCtrl.dispose();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(res.message)));
+    if (res.ok) await _reload();
+  }
+
+  Future<void> _deleteAllocation(AllocationListRow r) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Allocation'),
+        content: Text(
+          '${r.customer} · Plot ${r.plotNo}\n\n'
+          'Sirf tab delete hoga jab is pe koi receipt na ho.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('No'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final res = await AllocateStore.deleteAllocation(r.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(res.message)));
+    if (res.ok) await _reload();
+  }
+
+  Future<void> _whatsApp(AllocationListRow r) async {
+    if (r.phone.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Customer mobile not available.')),
+      );
+      return;
+    }
+    final msg = '''Assalam o Alaikum ${r.customer},
+Aap ke plot allocation ki tafseel:
+
+Society: ${r.society}
+Block: ${r.block}
+Type: ${r.type}
+Plot No: ${r.plotNo}
+Price: ${r.price}
+Booking Date: ${r.bookingDate}
+Status: ${r.status}
+
+Agar koi sawal ho to reply karein.''';
+    final ok = await WhatsAppOpen.send(mobile: r.phone, message: msg);
+    if (!mounted) return;
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('WhatsApp open nahi hua.')),
+      );
+    }
+  }
+
+  Future<void> _edit(AllocationListRow r) async {
+    final priceCtrl = TextEditingController(text: r.price.toStringAsFixed(0));
+    final monthlyCtrl = TextEditingController(
+      text: r.monthlyInstallment > 0
+          ? r.monthlyInstallment.toStringAsFixed(0)
+          : '',
+    );
+    final notesCtrl = TextEditingController();
+    final dateCtrl = TextEditingController(text: r.bookingDate);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Edit Allocation'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('${r.customer} · Plot ${r.plotNo}'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: priceCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Price'),
+            ),
+            TextField(
+              controller: monthlyCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Monthly Installment'),
+            ),
+            TextField(
+              controller: dateCtrl,
+              decoration: const InputDecoration(labelText: 'Booking Date (yyyy-MM-dd)'),
+            ),
+            TextField(
+              controller: notesCtrl,
+              decoration: const InputDecoration(labelText: 'Notes'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('No')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final price = double.tryParse(priceCtrl.text.trim()) ?? r.price;
+    final monthly = double.tryParse(monthlyCtrl.text.trim()) ?? 0;
+    final res = await AllocateStore.updateAllocation(
+      customerPlotId: r.id,
+      price: price,
+      bookingDate: dateCtrl.text.trim().isEmpty ? r.bookingDate : dateCtrl.text.trim(),
+      notes: notesCtrl.text.trim(),
+      monthlyInstallment: monthly,
+    );
+    priceCtrl.dispose();
+    monthlyCtrl.dispose();
+    notesCtrl.dispose();
+    dateCtrl.dispose();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(res.message)));
+    if (res.ok) await _reload();
   }
 
   @override
@@ -115,6 +311,39 @@ class _AllocateScreenState extends State<AllocateScreen> {
                             ),
                           ),
                           StatusChip(r.status),
+                          IconButton(
+                            tooltip: 'WhatsApp',
+                            icon: const Icon(Icons.chat_outlined, size: 20),
+                            onPressed: () => _whatsApp(r),
+                          ),
+                          PopupMenuButton<String>(
+                              onSelected: (v) {
+                                if (v == 'edit') _edit(r);
+                                if (v == 'complete') _complete(r);
+                                if (v == 'cancel') _cancel(r);
+                                if (v == 'delete') _deleteAllocation(r);
+                              },
+                              itemBuilder: (_) => [
+                                if (r.status == 'Active') ...[
+                                  const PopupMenuItem(
+                                    value: 'edit',
+                                    child: Text('Edit'),
+                                  ),
+                                  const PopupMenuItem(
+                                    value: 'complete',
+                                    child: Text('Mark Completed'),
+                                  ),
+                                  const PopupMenuItem(
+                                    value: 'cancel',
+                                    child: Text('Cancel Allocation'),
+                                  ),
+                                ],
+                                const PopupMenuItem(
+                                  value: 'delete',
+                                  child: Text('Delete'),
+                                ),
+                              ],
+                            ),
                         ],
                       ),
                       const SizedBox(height: 4),
@@ -122,6 +351,14 @@ class _AllocateScreenState extends State<AllocateScreen> {
                         '${r.society} · ${r.block} · ${r.plotNo} · ${r.type}',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
+                      if (r.staff.trim().isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          'Staff: ${r.staff}',
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(color: AppColors.mist),
+                        ),
+                      ],
                       const SizedBox(height: 6),
                       Row(
                         children: [
@@ -169,10 +406,13 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
   PlotTypeItem? _plotType;
   StoredPlot? _plot;
   BrokerItem? _broker;
+  IdName? _partner;
+  String _dealType = 'Installment';
 
   final _price = TextEditingController();
   final _notes = TextEditingController();
   final _commission = TextEditingController(text: '0');
+  final _monthly = TextEditingController();
   late DateTime _bookingDate;
   final _dateFmt = DateFormat('yyyy-MM-dd');
 
@@ -182,6 +422,7 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
   List<PlotTypeItem> _types = const [];
   List<StoredPlot> _availablePlots = const [];
   List<BrokerItem> _brokers = const [];
+  List<IdName> _partners = const [];
   bool _loading = true;
   bool _saving = false;
 
@@ -196,11 +437,13 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
     final customers = await AllocateStore.customers();
     final societies = await PlotInventoryStore.societies();
     final brokers = await AllocateStore.brokers(activeOnly: true);
+    final partners = await PartnerCashStore.partners();
     if (!mounted) return;
     setState(() {
       _customers = customers;
       _societies = societies;
       _brokers = brokers;
+      _partners = partners;
       _loading = false;
     });
   }
@@ -256,6 +499,7 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
     _price.dispose();
     _notes.dispose();
     _commission.dispose();
+    _monthly.dispose();
     super.dispose();
   }
 
@@ -271,6 +515,15 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
       _plot = null;
     });
     await _refreshCascade();
+  }
+
+  Future<void> _applyBlockMonthlyDefault(BlockItem? block) async {
+    if (block == null) return;
+    final existing = double.tryParse(_monthly.text.trim()) ?? 0;
+    if (existing > 0) return;
+    final def = await BlockMonthlyStore.amountForBlock(block.id);
+    if (def <= 0 || !mounted) return;
+    setState(() => _monthly.text = def.toStringAsFixed(0));
   }
 
   void _onBroker(BrokerItem? v) {
@@ -312,6 +565,7 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
       _price.text = '';
       _notes.clear();
       _commission.text = '0';
+      _monthly.clear();
       _bookingDate = DateTime.now();
     });
   }
@@ -338,18 +592,24 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
       return;
     }
     final price = double.tryParse(_price.text.trim()) ?? 0;
-    if (price <= 0) {
-      _toast('Price required hai.');
+    if (price < 0) {
+      _toast('Price 0 ya us se zyada honi chahiye.');
       return;
     }
-    if (_broker == null) {
-      _toast('Broker select karein.');
-      return;
-    }
-    final comm = double.tryParse(_commission.text.trim()) ?? -1;
+    // Broker optional — reserve bina broker bhi
+    final comm = double.tryParse(_commission.text.trim()) ?? 0;
     if (comm < 0) {
       _toast('Broker commission 0 ya us se zyada honi chahiye.');
       return;
+    }
+    final monthly = double.tryParse(_monthly.text.trim()) ?? 0;
+    if (monthly < 0) {
+      _toast('Monthly installment 0 ya us se zyada honi chahiye.');
+      return;
+    }
+    var monthlyFinal = monthly;
+    if (monthlyFinal <= 0 && _block != null) {
+      monthlyFinal = await BlockMonthlyStore.amountForBlock(_block!.id);
     }
 
     setState(() => _saving = true);
@@ -362,8 +622,11 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
       price: price,
       bookingDate: _dateFmt.format(_bookingDate),
       notes: _notes.text.trim(),
-      brokerId: _broker!.id,
+      brokerId: _broker?.id ?? 0,
       brokerCommission: comm,
+      partnerId: _partner?.id ?? 0,
+      dealType: _dealType,
+      monthlyInstallment: monthlyFinal,
     );
     if (!mounted) return;
     setState(() => _saving = false);
@@ -461,6 +724,7 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
                               _block = v;
                               _plot = null;
                             });
+                            await _applyBlockMonthlyDefault(v);
                             await _refreshPlots();
                           },
                         ),
@@ -509,10 +773,42 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
                           onChanged: (v) => setState(() => _plot = v),
                         ),
                         const SizedBox(height: 10),
+                        DropdownButtonFormField<String>(
+                          value: _dealType,
+                          decoration: const InputDecoration(
+                            labelText: 'Deal Type',
+                          ),
+                          dropdownColor: AppColors.panel,
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'Installment',
+                              child: Text('Installment'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'Reserve',
+                              child: Text('Reserve'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'Sold',
+                              child: Text('Sold'),
+                            ),
+                          ],
+                          onChanged: (v) =>
+                              setState(() => _dealType = v ?? 'Installment'),
+                        ),
+                        const SizedBox(height: 10),
                         TextField(
                           controller: _price,
                           keyboardType: TextInputType.number,
                           decoration: const InputDecoration(labelText: 'Price'),
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _monthly,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'Monthly Installment',
+                          ),
                         ),
                         const SizedBox(height: 10),
                         InkWell(
@@ -552,6 +848,28 @@ class _AllocateFormScreenState extends State<AllocateFormScreen> {
                               )
                               .toList(),
                           onChanged: _onBroker,
+                        ),
+                        const SizedBox(height: 10),
+                        DropdownButtonFormField<IdName?>(
+                          key: ValueKey(_partner?.id ?? 'partner'),
+                          initialValue: _partner,
+                          decoration: const InputDecoration(
+                            labelText: 'Partner (Cash Book commission)',
+                          ),
+                          dropdownColor: AppColors.panel,
+                          items: [
+                            const DropdownMenuItem(
+                              value: null,
+                              child: Text('(None)'),
+                            ),
+                            ..._partners.map(
+                              (p) => DropdownMenuItem(
+                                value: p,
+                                child: Text(p.name),
+                              ),
+                            ),
+                          ],
+                          onChanged: (v) => setState(() => _partner = v),
                         ),
                         const SizedBox(height: 10),
                         TextField(

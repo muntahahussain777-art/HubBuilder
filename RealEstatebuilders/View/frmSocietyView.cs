@@ -1,4 +1,4 @@
-﻿using HubBuilders.Model;
+using HubBuilders.Model;
 using System;
 using System.Collections.Generic;
 using System.Windows.Forms;
@@ -16,12 +16,7 @@ namespace HubBuilders.View
         {
             try
             {
-                if (MainClass.LoggedInRole != "Admin")
-                {
-                    btnAdd.Enabled = false;  // Add button disable
-                    guna2DataGridView1.Columns["dgvedit"].Visible = false; // Edit Button Hide
-                    guna2DataGridView1.Columns["dgvdel"].Visible = false;  // Delete Button Hide
-                }
+                /* StaffAccess ApplyStaffAccessUi handles Add/Edit/Delete visibility */
                 GetData();
             }
             catch (Exception ex)
@@ -34,7 +29,7 @@ namespace HubBuilders.View
         {
             try
             {
-                // ✅ Societies listing (name/city pe search)
+                // ? Societies listing (name/city pe search)
                 string qry = @"SELECT id, name, city, created_at 
                                FROM societies
                                WHERE (name LIKE @q OR city LIKE @q)
@@ -98,15 +93,10 @@ namespace HubBuilders.View
                 var colName = guna2DataGridView1.CurrentCell.OwningColumn?.Name;
                 if (string.IsNullOrEmpty(colName)) return;
 
-                // ✅ EDIT (ADMIN-ONLY)
+                // ? EDIT (ADMIN-ONLY)
                 if (colName == "dgvedit")
                 {
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        using (var deny = new CustomeMessage("Only Admin can edit societies!", "Access Denied"))
-                            deny.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "edit")) return;
 
                     if (!TryGetSelectedId(out var id))
                     {
@@ -124,15 +114,10 @@ namespace HubBuilders.View
                     return;
                 }
 
-                // ✅ DELETE (ADMIN-ONLY)
+                // ? DELETE (ADMIN-ONLY)
                 if (colName == "dgvdel")
                 {
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        using (var deny = new CustomeMessage("Only Admin can delete societies!", "Access Denied"))
-                            deny.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "delete")) return;
 
                     if (!TryGetSelectedId(out var id))
                     {

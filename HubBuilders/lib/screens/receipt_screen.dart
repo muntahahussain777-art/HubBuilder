@@ -3,6 +3,10 @@ import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../data/receipt_store.dart';
+import '../data/hub_sync.dart';
+import '../data/partner_cash_store.dart';
+import '../data/plot_inventory_store.dart';
+import '../data/whatsapp_open.dart';
 import '../theme/app_colors.dart';
 import '../widgets/ui_bits.dart';
 
@@ -28,13 +32,19 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
   @override
   void initState() {
     super.initState();
+    HubSync.revision.addListener(_onSync);
     _bootstrap();
   }
 
   @override
   void dispose() {
+    HubSync.revision.removeListener(_onSync);
     _search.dispose();
     super.dispose();
+  }
+
+  void _onSync() {
+    if (mounted) _reloadRows();
   }
 
   Future<void> _bootstrap() async {
@@ -237,30 +247,12 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
       rows: _rows,
       allocationDisp: _allocationDisp,
     );
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.panel,
-        title: const Text('WhatsApp'),
-        content: SingleChildScrollView(
-          child: SelectableText('To: $mobile\n\n$msg'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () async {
-              await Clipboard.setData(ClipboardData(text: msg));
-              if (ctx.mounted) Navigator.pop(ctx);
-              _toast('Message copied.');
-            },
-            child: const Text('Copy'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
-    );
+    final ok = await WhatsAppOpen.send(mobile: mobile, message: msg);
+    if (!mounted) return;
+    if (!ok) {
+      await Clipboard.setData(ClipboardData(text: msg));
+      _toast('WhatsApp open nahi hua — message copied.');
+    }
   }
 
   @override
@@ -587,6 +579,8 @@ class ReceiptFormScreen extends StatefulWidget {
 class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
   CustomerPlotOption? _allocation;
   List<CustomerPlotOption> _opts = const [];
+  List<IdName> _partners = const [];
+  IdName? _partner;
   String? _mode = 'Cash';
   final _refNo = TextEditingController();
   final _amount = TextEditingController(text: '0');
@@ -608,6 +602,7 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
 
   Future<void> _bootstrap() async {
     final opts = await ReceiptStore.activeCustomerPlots();
+    final partners = await PartnerCashStore.partners();
     if (!mounted) return;
 
     CustomerPlotOption? allocation;
@@ -621,16 +616,39 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
     if (!mounted) return;
     setState(() {
       _opts = opts;
+      _partners = partners;
       _allocation = allocation;
     });
+
+    if (allocation != null) {
+      await _loadPartnerForPlot(allocation.id);
+    }
 
     if (_isEdit) {
       await _loadEdit(widget.editingReceiptId!);
     } else {
+      final nextRef = await ReceiptStore.nextAutoRefNo();
+      if (!mounted) return;
+      _refNo.text = nextRef;
       await _refreshRemaining();
       if (!mounted) return;
       setState(() => _loading = false);
     }
+  }
+
+  Future<void> _loadPartnerForPlot(int cpId) async {
+    final pid = await PartnerCashStore.getAllocationPartnerId(cpId);
+    if (!mounted) return;
+    IdName? match;
+    if (pid != null) {
+      for (final p in _partners) {
+        if (p.id == pid) {
+          match = p;
+          break;
+        }
+      }
+    }
+    setState(() => _partner = match);
   }
 
   Future<void> _loadEdit(int receiptId) async {
@@ -734,6 +752,7 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
       refNo: _refNo.text,
       notes: _notes.text,
       editingReceiptId: widget.editingReceiptId,
+      partnerId: _partner?.id,
     );
     if (!mounted) return;
     setState(() => _saving = false);
@@ -860,8 +879,30 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
                               .toList(),
                           onChanged: (v) async {
                             setState(() => _allocation = v);
+                            if (v != null) await _loadPartnerForPlot(v.id);
                             await _refreshRemaining();
                           },
+                        ),
+                        const SizedBox(height: 10),
+                        DropdownButtonFormField<IdName?>(
+                          key: ValueKey(_partner?.id ?? 'partner'),
+                          initialValue: _partner,
+                          decoration: const InputDecoration(
+                            labelText: 'Partner (Cash Book)',
+                          ),
+                          items: [
+                            const DropdownMenuItem(
+                              value: null,
+                              child: Text('(None)'),
+                            ),
+                            ..._partners.map(
+                              (p) => DropdownMenuItem(
+                                value: p,
+                                child: Text(p.name),
+                              ),
+                            ),
+                          ],
+                          onChanged: (v) => setState(() => _partner = v),
                         ),
                         const SizedBox(height: 10),
                         TextField(

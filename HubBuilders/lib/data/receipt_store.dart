@@ -1,4 +1,6 @@
 import '../db/app_database.dart';
+import 'hub_sync.dart';
+import 'partner_cash_store.dart';
 import 'staff_audit.dart';
 
 /// SQLite-backed receipts + ledger — same as C# `receipts` / `ledger`.
@@ -372,6 +374,32 @@ WHERE ref_no IS NOT NULL AND trim(ref_no) != ''
     );
   }
 
+  /// Next Ref No like 001, 002… fills deleted gaps; ignores non-numeric refs.
+  /// Never rewrites existing receipt rows.
+  static Future<String> nextAutoRefNo() async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.rawQuery(
+      "SELECT ref_no FROM receipts WHERE ref_no IS NOT NULL AND trim(ref_no) != ''",
+    );
+    final used = <int>{};
+    for (final r in rows) {
+      final n = _parseNumericRef(r['ref_no'] as String?);
+      if (n != null && n > 0) used.add(n);
+    }
+    var next = 1;
+    while (used.contains(next)) {
+      next++;
+    }
+    return next.toString().padLeft(3, '0');
+  }
+
+  static int? _parseNumericRef(String? raw) {
+    final t = (raw ?? '').trim();
+    if (t.isEmpty) return null;
+    if (!RegExp(r'^\d+$').hasMatch(t)) return null;
+    return int.tryParse(t);
+  }
+
   static Future<List<ReceiptLedgerRow>?> searchByCustomerName(
     String query,
   ) async {
@@ -552,7 +580,7 @@ WHERE lower(c.name) LIKE ?
   static Future<List<CustomerPlotOption>> searchAllocations(String query) =>
       activeCustomerPlots(query: query);
 
-  static Future<({bool ok, String message, double remaining})> saveReceipt({
+  static Future<({bool ok, String message, double remaining, int? receiptId})> saveReceipt({
     required int customerPlotId,
     required String receiptDate,
     required double amount,
@@ -560,12 +588,13 @@ WHERE lower(c.name) LIKE ?
     String? refNo,
     String? notes,
     int? editingReceiptId,
+    int? partnerId,
   }) async {
     if (amount <= 0) {
-      return (ok: false, message: 'Amount > 0 required.', remaining: 0.0);
+      return (ok: false, message: 'Amount > 0 required.', remaining: 0.0, receiptId: null);
     }
     if (mode != 'Cash' && mode != 'Bank') {
-      return (ok: false, message: 'Mode select karein.', remaining: 0.0);
+      return (ok: false, message: 'Mode select karein.', remaining: 0.0, receiptId: null);
     }
 
     final rm =
@@ -576,6 +605,7 @@ WHERE lower(c.name) LIKE ?
         message:
             'Is allocation ka debit settle ho chuka hai. New receipt add/update nahi ho sakti.',
         remaining: 0.0,
+        receiptId: null,
       );
     }
     if (amount > rm.remaining) {
@@ -584,6 +614,7 @@ WHERE lower(c.name) LIKE ?
         message:
             'Amount remaining se zyada hai.\nRemaining: ${rm.remaining.toStringAsFixed(2)}\nPlease enter equal or less.',
         remaining: rm.remaining,
+        receiptId: null,
       );
     }
 
@@ -595,11 +626,12 @@ WHERE lower(c.name) LIKE ?
     final narration = cleanNotes ?? 'Receipt ($mode)';
 
     final db = await AppDatabase.instance.database;
+    late final int receiptIdForPartner;
 
     if (editingReceiptId != null) {
       final existing = await receiptById(editingReceiptId);
       if (existing == null) {
-        return (ok: false, message: 'Receipt not found.', remaining: 0.0);
+        return (ok: false, message: 'Receipt not found.', remaining: 0.0, receiptId: null);
       }
 
       if (existing.ledgerId != null) {
@@ -629,6 +661,7 @@ WHERE lower(c.name) LIKE ?
         where: 'id = ?',
         whereArgs: [editingReceiptId],
       );
+      receiptIdForPartner = editingReceiptId;
     } else {
       final lid = await db.insert('ledger', {
         'customer_plot_id': customerPlotId,
@@ -638,7 +671,7 @@ WHERE lower(c.name) LIKE ?
         'credit': amount,
         'txn_type': txnType,
       });
-      await db.insert('receipts', {
+      receiptIdForPartner = await db.insert('receipts', {
         'customer_plot_id': customerPlotId,
         'receipt_date': receiptDate,
         'amount': amount,
@@ -649,13 +682,39 @@ WHERE lower(c.name) LIKE ?
       });
     }
 
+    try {
+      await PartnerCashStore.upsertPartnerMoneyForReceipt(
+        receiptId: receiptIdForPartner,
+        partnerId: partnerId ?? 0,
+        customerPlotId: customerPlotId,
+        txnDate: receiptDate,
+        amount: amount,
+        mode: mode,
+        note: cleanNotes,
+      );
+    } catch (_) {
+      // Partner cash sync additive — never block receipt save.
+    }
+
     final after = await getRemaining(customerPlotId);
     await StaffAudit.log(
       editingReceiptId != null ? 'Update' : 'Insert',
       'receipts',
-      detail: 'amount=$amount; mode=$mode; cpid=$customerPlotId',
+      detail:
+          'amount=$amount; mode=$mode; cpid=$customerPlotId; partner=${partnerId ?? 0}',
     );
-    return (ok: true, message: 'Saved', remaining: after.remaining);
+    await HubSync.pushNow('receipts', receiptIdForPartner);
+    if (editingReceiptId == null) {
+      final saved = await receiptById(receiptIdForPartner);
+      final lid = saved?.ledgerId;
+      if (lid != null) await HubSync.pushNow('ledger', lid);
+    } else {
+      final existing = await receiptById(editingReceiptId);
+      final lid = existing?.ledgerId;
+      if (lid != null) await HubSync.pushNow('ledger', lid);
+    }
+    HubSync.notifyLocalWrite();
+    return (ok: true, message: 'Saved', remaining: after.remaining, receiptId: receiptIdForPartner);
   }
 
   static Future<({bool ok, String message})> deleteReceipt(int receiptId) async {
@@ -663,13 +722,14 @@ WHERE lower(c.name) LIKE ?
     if (existing == null) {
       return (ok: false, message: 'Receipt not found.');
     }
-    final db = await AppDatabase.instance.database;
     final lid = existing.ledgerId;
-    await db.delete('receipts', where: 'id = ?', whereArgs: [receiptId]);
+    try {
+      await PartnerCashStore.deletePartnerMoneyForReceipt(receiptId);
+    } catch (_) {}
+    await StaffAudit.delete('receipts', where: 'id = ?', whereArgs: [receiptId]);
     if (lid != null) {
-      await db.delete('ledger', where: 'id = ?', whereArgs: [lid]);
+      await StaffAudit.delete('ledger', where: 'id = ?', whereArgs: [lid]);
     }
-    await StaffAudit.log('Delete', 'receipts', detail: 'id=$receiptId');
     return (ok: true, message: 'Receipt deleted successfully.');
   }
 

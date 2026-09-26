@@ -1,6 +1,7 @@
 using HubBuilders.Model;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Windows.Forms;
 
 namespace HubBuilders.View
@@ -18,12 +19,18 @@ namespace HubBuilders.View
             {
                 MainClass.EnsurePartnerMoneySchema();
                 label1.Text = "Partner Cash Book";
-                LoadData();
+                GetData();
             }
             catch (Exception ex)
             {
                 ShowError("Form load failed.\n\n" + ex.Message);
             }
+        }
+
+        /// <summary>SampleView LiveChanged / sync pull ke baad turant refresh.</summary>
+        private void GetData()
+        {
+            LoadData();
         }
 
         private void LoadData()
@@ -33,39 +40,70 @@ namespace HubBuilders.View
                 MainClass.EnsurePartnerMoneySchema();
                 string q = (txtSearch?.Text ?? string.Empty).Trim();
                 string qry;
+                string totalsQry;
                 Dictionary<string, object> pars = null;
+
+                const string fromJoin = @"
+FROM partner_money pm
+LEFT JOIN Person p ON p.person_id = pm.partner_id
+LEFT JOIN customer_plots cp ON cp.id = pm.customer_plot_id
+LEFT JOIN customers c ON c.id = cp.customer_id
+LEFT JOIN plots pl ON pl.id = cp.plot_id
+LEFT JOIN societies s ON s.id = COALESCE(pm.society_id, pl.society_id)";
 
                 if (string.IsNullOrWhiteSpace(q))
                 {
                     qry = @"
 SELECT pm.id AS dgvid,
-       p.name AS dgvpartner,
+       IFNULL(NULLIF(trim(p.name),''), 'Partner #' || pm.partner_id) AS dgvpartner,
        pm.txn_date AS dgvdate,
        pm.direction AS dgvdir,
        printf('%.2f', pm.amount) AS dgvamount,
        IFNULL(pm.category,'') AS dgvcategory,
        IFNULL(pm.mode,'') AS dgvmode,
+       IFNULL(c.name,'') AS dgvcustomer,
+       IFNULL(CAST(pl.plot_no AS TEXT),'') AS dgvplot,
        IFNULL(pm.note,'') AS dgvnote
-FROM partner_money pm
-JOIN Person p ON p.person_id = pm.partner_id
+" + fromJoin + @"
 ORDER BY pm.txn_date DESC, pm.id DESC;";
+                    totalsQry = @"
+SELECT
+  COALESCE(SUM(CASE WHEN trim(lower(ifnull(pm.direction,'')))='in' THEN ifnull(pm.amount,0) ELSE 0 END), 0) AS tin,
+  COALESCE(SUM(CASE WHEN trim(lower(ifnull(pm.direction,'')))='out' THEN ifnull(pm.amount,0) ELSE 0 END), 0) AS tout
+" + fromJoin + ";";
                 }
                 else
                 {
                     qry = @"
 SELECT pm.id AS dgvid,
-       p.name AS dgvpartner,
+       IFNULL(NULLIF(trim(p.name),''), 'Partner #' || pm.partner_id) AS dgvpartner,
        pm.txn_date AS dgvdate,
        pm.direction AS dgvdir,
        printf('%.2f', pm.amount) AS dgvamount,
        IFNULL(pm.category,'') AS dgvcategory,
        IFNULL(pm.mode,'') AS dgvmode,
+       IFNULL(c.name,'') AS dgvcustomer,
+       IFNULL(CAST(pl.plot_no AS TEXT),'') AS dgvplot,
        IFNULL(pm.note,'') AS dgvnote
-FROM partner_money pm
-JOIN Person p ON p.person_id = pm.partner_id
-WHERE p.name LIKE @q OR pm.category LIKE @q OR pm.note LIKE @q
+" + fromJoin + @"
+WHERE IFNULL(p.name,'') LIKE @q OR pm.category LIKE @q OR pm.note LIKE @q
    OR pm.direction LIKE @q OR CAST(pm.amount AS TEXT) LIKE @q
+   OR IFNULL(c.name,'') LIKE @q OR IFNULL(c.mobile,'') LIKE @q
+   OR CAST(IFNULL(pl.plot_no,'') AS TEXT) LIKE @q
+   OR IFNULL(s.name,'') LIKE @q
+   OR CAST(pm.partner_id AS TEXT) LIKE @q
 ORDER BY pm.txn_date DESC, pm.id DESC;";
+                    totalsQry = @"
+SELECT
+  COALESCE(SUM(CASE WHEN trim(lower(ifnull(pm.direction,'')))='in' THEN ifnull(pm.amount,0) ELSE 0 END), 0) AS tin,
+  COALESCE(SUM(CASE WHEN trim(lower(ifnull(pm.direction,'')))='out' THEN ifnull(pm.amount,0) ELSE 0 END), 0) AS tout
+" + fromJoin + @"
+WHERE IFNULL(p.name,'') LIKE @q OR pm.category LIKE @q OR pm.note LIKE @q
+   OR pm.direction LIKE @q OR CAST(pm.amount AS TEXT) LIKE @q
+   OR IFNULL(c.name,'') LIKE @q OR IFNULL(c.mobile,'') LIKE @q
+   OR CAST(IFNULL(pl.plot_no,'') AS TEXT) LIKE @q
+   OR IFNULL(s.name,'') LIKE @q
+   OR CAST(pm.partner_id AS TEXT) LIKE @q;";
                     pars = new Dictionary<string, object> { { "@q", "%" + q + "%" } };
                 }
 
@@ -77,19 +115,26 @@ ORDER BY pm.txn_date DESC, pm.id DESC;";
                 lb.Items.Add(dgvamount);
                 lb.Items.Add(dgvcategory);
                 lb.Items.Add(dgvmode);
+                lb.Items.Add(dgvcustomer);
+                lb.Items.Add(dgvplot);
                 lb.Items.Add(dgvnote);
 
                 MainClass.LoadData1(qry, guna2DataGridView1, lb, pars);
                 guna2DataGridView1.ClearSelection();
 
-                var bal = MainClass.ExecuteScalar(@"
-SELECT
-  COALESCE(SUM(CASE WHEN direction='In' THEN amount ELSE 0 END),0) -
-  COALESCE(SUM(CASE WHEN direction='Out' THEN amount ELSE 0 END),0)
-FROM partner_money;");
-                decimal b = 0;
-                try { b = Convert.ToDecimal(bal ?? 0); } catch { }
-                label1.Text = "Partner Cash Book  |  Balance (In − Out): " + b.ToString("N2");
+                decimal tin = 0, tout = 0;
+                var dtTotals = pars == null
+                    ? MainClass.GetData(totalsQry)
+                    : MainClass.ExecuteSelectQuery1(totalsQry, pars);
+                if (dtTotals != null && dtTotals.Rows.Count > 0)
+                {
+                    var tr = dtTotals.Rows[0];
+                    try { tin = Convert.ToDecimal(tr["tin"]); } catch { }
+                    try { tout = Convert.ToDecimal(tr["tout"]); } catch { }
+                }
+                label1.Text = "Partner Cash Book  |  Total In: " + tin.ToString("N2")
+                    + "  |  Total Out: " + tout.ToString("N2")
+                    + "  |  Balance (In − Out): " + (tin - tout).ToString("N2");
             }
             catch (Exception ex)
             {
@@ -105,7 +150,7 @@ FROM partner_money;");
                 {
                     MainClass.BlurBackground(f);
                 }
-                LoadData();
+                GetData();
             }
             catch (Exception ex)
             {
@@ -115,7 +160,7 @@ FROM partner_money;");
 
         public override void txtSearch_TextChanged(object sender, EventArgs e)
         {
-            try { LoadData(); }
+            try { GetData(); }
             catch (Exception ex) { ShowError("Search update failed.\n\n" + ex.Message); }
         }
 
@@ -140,7 +185,7 @@ FROM partner_money;");
                     {
                         MainClass.BlurBackground(frm);
                     }
-                    LoadData();
+                    GetData();
                     return;
                 }
 
@@ -162,8 +207,9 @@ FROM partner_money;");
 
                         if (res > 0)
                         {
+                            try { HubSyncService.NotifyLocalWrite(); } catch { }
                             ShowInfo("Delete Successfully");
-                            LoadData();
+                            GetData();
                         }
                         else
                         {

@@ -1,4 +1,4 @@
-﻿using HubBuilders.Model;
+using HubBuilders.Model;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -22,12 +22,7 @@ namespace HubBuilders.View
         {
             try
             {
-                if (MainClass.LoggedInRole != "Admin")
-                {
-                    btnAdd.Enabled = false;  // Add button disable
-                    guna2DataGridView1.Columns["dgvedit"].Visible = false; // Edit Button Hide
-                    guna2DataGridView1.Columns["dgvdel"].Visible = false;  // Delete Button Hide
-                }
+                /* StaffAccess ApplyStaffAccessUi handles Add/Edit/Delete visibility */
                 LoadData();
             }
             catch (Exception ex)
@@ -119,12 +114,7 @@ namespace HubBuilders.View
                 if (col == "dgvedit")
                 {
                     // ADMIN-ONLY
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        CustomeMessage msg = new CustomeMessage("Only Admin can edit brokers!", "Access Denied");
-                        msg.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "edit")) return;
 
                     if (!TryGetSelectedId(out int id))
                     {
@@ -147,12 +137,7 @@ namespace HubBuilders.View
                 if (col == "dgvdel")
                 {
                     // ADMIN-ONLY
-                    if (MainClass.LoggedInRole != "Admin")
-                    {
-                        CustomeMessage msg = new CustomeMessage("Only Admin can delete brokers!", "Access Denied");
-                        msg.ShowDialog();
-                        return;
-                    }
+                    if (StaffAccess.Deny(StaffAccess.ModuleForForm(this), "delete")) return;
 
                     if (!TryGetSelectedId(out int id))
                     {

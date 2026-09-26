@@ -1,4 +1,4 @@
-﻿namespace HubBuilders.View
+namespace HubBuilders.View
 {
     partial class frmReceiptFormView
     {

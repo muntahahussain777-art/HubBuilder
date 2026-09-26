@@ -1,4 +1,4 @@
-﻿// frmReceiptFormAdd.cs  (SQLite: customers, customer_plots, receipts, ledger)
+// frmReceiptFormAdd.cs  (SQLite: customers, customer_plots, receipts, ledger)
 // ReceiptForm = CREDIT ONLY. Grid shows Opening(Debit), Receipts(Credit), Total, Closing with running Balance.
 // DataGridView has last two columns: dgvEdit (Edit) and dgvDel (Delete). Edit/Delete handled in CellContentClick.
 
@@ -175,6 +175,54 @@ namespace HubBuilders.Model
         {
             LoadCustomerPlots();
             RefreshGrid();
+            if (!_editingReceiptId.HasValue)
+                SuggestNextRefNo();
+        }
+
+        /// <summary>
+        /// Auto Ref No: 001, 002… fills gaps after delete. Does not change existing rows.
+        /// Non-numeric refs (client custom) are ignored for sequencing.
+        /// </summary>
+        private void SuggestNextRefNo()
+        {
+            try
+            {
+                txtRefNo.Text = ComputeNextRefNo();
+            }
+            catch
+            {
+                try { txtRefNo.Text = "001"; } catch { }
+            }
+        }
+
+        private static string ComputeNextRefNo()
+        {
+            var used = new HashSet<int>();
+            DataTable dt = HubBuilders.MainClass.ExecuteSelectQuery1(
+                "SELECT ref_no FROM receipts WHERE ref_no IS NOT NULL AND TRIM(ref_no) <> ''",
+                null);
+            if (dt != null)
+            {
+                foreach (DataRow row in dt.Rows)
+                {
+                    int? n = ParseNumericRef(Convert.ToString(row["ref_no"]));
+                    if (n.HasValue && n.Value > 0) used.Add(n.Value);
+                }
+            }
+            int next = 1;
+            while (used.Contains(next)) next++;
+            return next.ToString("D3");
+        }
+
+        private static int? ParseNumericRef(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            string t = raw.Trim();
+            foreach (char c in t)
+                if (!char.IsDigit(c)) return null;
+            int v;
+            if (!int.TryParse(t, out v)) return null;
+            return v;
         }
 
         // =============== Utilities ===============
@@ -438,7 +486,14 @@ WHERE r.id=@id;";
                     if (obj != null && obj != DBNull.Value) ledgerId = Convert.ToInt64(obj);
                 }
 
+                var cascade = HubSyncService.CollectReceiptCascade(receiptId, ledgerId);
+
                 tx = HubBuilders.MainClass.con.BeginTransaction();
+
+                HubSyncService.DeletePartnerMoneyWhere(
+                    HubBuilders.MainClass.con, tx,
+                    "receipt_id=@rid",
+                    cmd => cmd.Parameters.AddWithValue("@rid", receiptId));
 
                 // delete receipt
                 using (var cmd = new SQLiteCommand("DELETE FROM receipts WHERE id=@id;", HubBuilders.MainClass.con, tx))
@@ -458,6 +513,9 @@ WHERE r.id=@id;";
                 }
 
                 tx.Commit();
+                tx = null;
+                try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
+                try { HubSyncService.NotifyLocalWrite(); } catch { }
             }
             catch (Exception ex)
             {
@@ -470,15 +528,19 @@ WHERE r.id=@id;";
                 HubBuilders.MainClass.ReleaseSharedConnection();
             }
 
-            // reset if we were editing this one
+            // reset if we were editing this one; else refresh next Ref if adding new
             if (_editingReceiptId == receiptId)
             {
                 _editingReceiptId = null;
                 _editingLedgerId = null;
                 btnSaveReceipt.Text = "Save";
-                txtRefNo.Clear();
+                SuggestNextRefNo();
                 txtReceiptNotes.Clear();
                 numAmount.Value = 0;
+            }
+            else if (!_editingReceiptId.HasValue)
+            {
+                SuggestNextRefNo();
             }
 
             RefreshGrid(); // recompute opening/closing
@@ -600,11 +662,13 @@ VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid);", HubBuilders.MainClass.
             }
             catch { }
 
+            try { HubSyncService.NotifyLocalWrite(); } catch { }
+
             // reset edit state & UI
             _editingReceiptId = null;
             _editingLedgerId = null;
             btnSaveReceipt.Text = "Save";
-            txtRefNo.Clear();
+            SuggestNextRefNo();
             txtReceiptNotes.Clear();
             numAmount.Value = 0;
 
