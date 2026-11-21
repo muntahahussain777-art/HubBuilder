@@ -63,6 +63,10 @@ namespace HubBuilders.View
         private bool _vipFilterBusy;
         private const int VipAllocPanelWidth = 340;
 
+        // Date-range filter (From/To inclusive on receipt_date)
+        private bool _dateFilterReady = false;
+        private bool _dateFilterBusy = false;
+
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
@@ -96,10 +100,15 @@ namespace HubBuilders.View
         {
             try
             {
-                _isRefMode = _isCustMode = false;
-                _refQuery = _custQuery = "";
-                GetData(); // GetData khud txtSearch.Text ko filter me use karta hai
                 var q = (txtSearch == null ? "" : txtSearch.Text ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(q))
+                {
+                    _isRefMode = _isCustMode = false;
+                    _refQuery = _custQuery = "";
+                    GetData(); // empty search → selected plot ki saari receipts
+                    return;
+                }
+                // Typing = find customer/ref/plot; do NOT hide receipts by notes filter
                 SmartSearchExternal(q, false);
             }
             catch (Exception ex)
@@ -182,22 +191,188 @@ namespace HubBuilders.View
                 EnsureRuntimeColumns();
                 WireGridEventsOnce();
 
-                // VIP: no forced Select Allocation popup — inline finder on this form only
-                EnsureVipAllocationFinder();
-                LoadVipAllocations();
-                this.Text = "Receipt View — type name to find customer";
-                GetData();
-
+                // Default date range: last 5 years → today (same as Customer Plots Receipts VIP)
                 try
                 {
-                    if (_txtVipAllocSearch != null && !_txtVipAllocSearch.IsDisposed)
-                        _txtVipAllocSearch.Focus();
+                    var today = DateTime.Today;
+                    fromdate.Value = today.AddYears(-5);
+                    todate.Value = today;
                 }
                 catch { }
+
+                _dateFilterReady = true;
+
+                // VIP: no forced Select Allocation popup — inline finder on this form only
+                EnsureVipAllocationFinder();
+                this.Text = "Receipt View — type name to find customer";
+
+                // Form pehle open, list/totals baad — hang feel khatam (UI same)
+                BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        LoadVipAllocations();
+                        ApplyDateFilterAndRefresh();
+                        try
+                        {
+                            if (_txtVipAllocSearch != null && !_txtVipAllocSearch.IsDisposed)
+                                _txtVipAllocSearch.Focus();
+                        }
+                        catch { }
+                    }
+                    catch (Exception ex)
+                    {
+                        ShowError("Form load failed.\n\n" + ex.Message);
+                    }
+                }));
             }
             catch (Exception ex)
             {
                 ShowError("Form load failed.\n\n" + ex.Message);
+            }
+        }
+
+        // -------- Date range filter (From / To) --------
+        private void btnLoadDates_Click(object sender, EventArgs e)
+        {
+            ApplyDateFilterAndRefresh();
+        }
+
+        private void fromdate_ValueChanged(object sender, EventArgs e)
+        {
+            if (!_dateFilterReady || _dateFilterBusy) return;
+            ApplyDateFilterAndRefresh();
+        }
+
+        private void todate_ValueChanged(object sender, EventArgs e)
+        {
+            if (!_dateFilterReady || _dateFilterBusy) return;
+            ApplyDateFilterAndRefresh();
+        }
+
+        private void ApplyDateFilterAndRefresh()
+        {
+            if (_dateFilterBusy) return;
+            _dateFilterBusy = true;
+            try
+            {
+                NormalizeDateRange();
+
+                if (_isRefMode && !string.IsNullOrWhiteSpace(_refQuery))
+                    TryBindRefReceipts(_refQuery);
+                else if (_isCustMode && !string.IsNullOrWhiteSpace(_custQuery))
+                    TryBindCustomerReceipts(_custQuery);
+                else
+                    GetData();
+            }
+            catch (Exception ex)
+            {
+                ShowError("Date filter failed.\n\n" + ex.Message);
+            }
+            finally
+            {
+                _dateFilterBusy = false;
+            }
+        }
+
+        private void NormalizeDateRange()
+        {
+            try
+            {
+                if (fromdate == null || todate == null) return;
+                if (fromdate.Value.Date <= todate.Value.Date) return;
+                var tmp = fromdate.Value;
+                fromdate.Value = todate.Value;
+                todate.Value = tmp;
+            }
+            catch { }
+        }
+
+        private string GetFilterFromDate()
+        {
+            try
+            {
+                if (fromdate == null) return DateTime.Today.ToString("yyyy-MM-dd");
+                return fromdate.Value.Date.ToString("yyyy-MM-dd");
+            }
+            catch { return DateTime.Today.ToString("yyyy-MM-dd"); }
+        }
+
+        private string GetFilterToDate()
+        {
+            try
+            {
+                if (todate == null) return DateTime.Today.ToString("yyyy-MM-dd");
+                return todate.Value.Date.ToString("yyyy-MM-dd");
+            }
+            catch { return DateTime.Today.ToString("yyyy-MM-dd"); }
+        }
+
+        /// <summary>
+        /// Top totals: From–To + Society. Easy recover view:
+        /// Total Amount = sab; Total Receipt = allocate/booking din ke baad;
+        /// Total Advance = usi din jab plot allocate/book hua.
+        /// </summary>
+        private void UpdateRangeTotals()
+        {
+            try
+            {
+                string fromStr = GetFilterFromDate();
+                string toStr = GetFilterToDate();
+                int societyId = GetVipSelectedSocietyId();
+
+                // Date-range total — Society filter (0 = All Societies)
+                string sql = @"
+SELECT COUNT(*) AS cnt,
+       COALESCE(SUM(r.amount), 0) AS total_amount,
+       COALESCE(SUM(CASE WHEN date(r.receipt_date) = date(cp.booking_date) THEN r.amount ELSE 0 END), 0) AS total_advance,
+       COALESCE(SUM(CASE WHEN date(r.receipt_date) > date(cp.booking_date) THEN r.amount ELSE 0 END), 0) AS total_receipt
+FROM receipts r
+JOIN customer_plots cp ON cp.id = r.customer_plot_id
+JOIN plots p ON p.id = cp.plot_id
+WHERE date(r.receipt_date) >= date(@from)
+  AND date(r.receipt_date) <= date(@to)
+  AND (@sid = 0 OR p.society_id = @sid);";
+                var prms = new Dictionary<string, object>
+                {
+                    { "@from", fromStr },
+                    { "@to", toStr },
+                    { "@sid", societyId }
+                };
+
+                var dt = MainClass.ExecuteSelectQuery1(sql, prms);
+                decimal totalAmt = 0m, totalAdv = 0m, totalReceipt = 0m;
+                int cnt = 0;
+                if (dt != null && dt.Rows.Count > 0)
+                {
+                    var row = dt.Rows[0];
+                    cnt = Convert.ToInt32(row["cnt"] == DBNull.Value ? 0 : row["cnt"]);
+                    totalAmt = Convert.ToDecimal(row["total_amount"] == DBNull.Value ? 0 : row["total_amount"]);
+                    totalAdv = Convert.ToDecimal(row["total_advance"] == DBNull.Value ? 0 : row["total_advance"]);
+                    totalReceipt = Convert.ToDecimal(row["total_receipt"] == DBNull.Value ? 0 : row["total_receipt"]);
+                }
+
+                // Order: Total Amount → Total Receipt (baad) → Total Advance (allocate din)
+                if (lblTotalReceiptAmount != null)
+                    lblTotalReceiptAmount.Text = "Total Amount: " + totalAmt.ToString("N2");
+                if (lblTotalAdvance != null)
+                {
+                    lblTotalAdvance.ForeColor = Color.FromArgb(120, 220, 180);
+                    lblTotalAdvance.Text = "Total Receipt: " + totalReceipt.ToString("N2");
+                }
+                if (lblReceiptCount != null)
+                {
+                    lblReceiptCount.ForeColor = Color.FromArgb(255, 210, 120);
+                    lblReceiptCount.Text = "Total Advance: " + totalAdv.ToString("N2")
+                        + "  |  Count: " + cnt.ToString();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (lblTotalReceiptAmount != null) lblTotalReceiptAmount.Text = "Total Amount: —";
+                if (lblTotalAdvance != null) lblTotalAdvance.Text = "Total Receipt: —";
+                if (lblReceiptCount != null) lblReceiptCount.Text = "Total Advance: —";
+                ShowError("Range totals failed.\n\n" + ex.Message);
             }
         }
 
@@ -440,23 +615,24 @@ private void EnsureRuntimeColumns()
             }
         }
 
-        // -------- Core Ledger (allocation-only filter) --------
+        // -------- Core Ledger: sirf SELECTED plot, saari dates (doosra plot mix nahi) --------
         public void GetData()
         {
             try
             {
-                if (_currentCustomerPlotId <= 0) { guna2DataGridView1.DataSource = null; return; }
+                if (_currentCustomerPlotId <= 0) { guna2DataGridView1.DataSource = null; UpdateRangeTotals(); return; }
                 if (_isRefMode || _isCustMode) return; // global modes only via explicit calls, NOT txtSearch
 
                 EnsureRuntimeColumns();
 
-                string filter = (txtSearch == null ? "" : (txtSearch.Text ?? "")).Trim();
-
+                // IMPORTANT: only @cpid — selected plot ki SAARI receipts (search box se hide nahi)
                 string sql = @"
 WITH alloc_cust AS (
-    SELECT c.mobile AS customer_mobile
+    SELECT c.mobile AS customer_mobile,
+           CAST(p.plot_no AS TEXT) AS plot_no
     FROM customer_plots cp
     JOIN customers c ON c.id = cp.customer_id
+    JOIN plots     p ON p.id = cp.plot_id
     WHERE cp.id = @cpid
 ),
 open_val AS (
@@ -469,15 +645,15 @@ open_val AS (
 receipts_filtered AS (
     SELECT r.id, r.receipt_date, r.amount, COALESCE(r.notes,'') AS notes, COALESCE(r.ref_no,'') AS refno
     FROM receipts r
-    WHERE r.customer_plot_id=@cpid
-      AND (COALESCE(@q,'')='' OR LOWER(r.ref_no) LIKE '%'||LOWER(@q)||'%' OR LOWER(r.notes) LIKE '%'||LOWER(@q)||'%')
+    WHERE r.customer_plot_id = @cpid
 ),
 tot AS (
     SELECT COALESCE(SUM(amount),0) AS total_credit FROM receipts_filtered
 )
 SELECT * FROM (
     SELECT 'OPENING' AS row_type, NULL AS receipt_id, '' AS date,
-           'Opening (Debit)' AS description, (SELECT opening FROM open_val) AS debit, 0 AS credit,
+           ('Opening (Debit) — Plot ' || (SELECT plot_no FROM alloc_cust)) AS description,
+           (SELECT opening FROM open_val) AS debit, 0 AS credit,
            (SELECT customer_mobile FROM alloc_cust) AS customer_mobile,
            '' AS refno
     UNION ALL
@@ -488,12 +664,14 @@ SELECT * FROM (
            rf.refno AS refno
     FROM receipts_filtered rf
     UNION ALL
-    SELECT 'TOTAL' AS row_type, NULL, '', 'Total Credit', 0,
+    SELECT 'TOTAL' AS row_type, NULL, '',
+           ('Total Credit — Plot ' || (SELECT plot_no FROM alloc_cust)), 0,
            (SELECT total_credit FROM tot),
            (SELECT customer_mobile FROM alloc_cust),
            '' AS refno
     UNION ALL
-    SELECT 'CLOSING' AS row_type, NULL, '', 'Closing Balance (Debit - Credit)',
+    SELECT 'CLOSING' AS row_type, NULL, '',
+           ('Closing Balance — Plot ' || (SELECT plot_no FROM alloc_cust)),
            (SELECT opening FROM open_val),
            (SELECT total_credit FROM tot),
            (SELECT customer_mobile FROM alloc_cust),
@@ -505,8 +683,7 @@ ORDER BY
   receipt_id ASC;";
 
                 var prms = new Dictionary<string, object> {
-                    {"@cpid", _currentCustomerPlotId},
-                    {"@q", filter}
+                    {"@cpid", _currentCustomerPlotId}
                 };
 
                 ListBox lb = new ListBox();
@@ -521,6 +698,8 @@ ORDER BY
 
                 if (!string.IsNullOrWhiteSpace(_currentAllocationDisp))
                     this.Text = "Receipt View — " + _currentAllocationDisp;
+
+                UpdateRangeTotals();
             }
             catch (Exception ex)
             {
@@ -571,6 +750,7 @@ ORDER BY c.name, p.plot_no;", new Dictionary<string, object> { { "@q", q } });
             {
                 _currentCustomerPlotId = Convert.ToInt32(dt.Rows[0]["id"]);
                 _currentAllocationDisp = Convert.ToString(dt.Rows[0]["disp"]);
+                try { if (txtSearch != null) txtSearch.Text = ""; } catch { }
                 this.Text = "Receipt View — " + _currentAllocationDisp;
                 GetData(); return;
             }
@@ -582,6 +762,7 @@ ORDER BY c.name, p.plot_no;", new Dictionary<string, object> { { "@q", q } });
                 {
                     _currentCustomerPlotId = pickedId;
                     _currentAllocationDisp = pickedDisp;
+                    try { if (txtSearch != null) txtSearch.Text = ""; } catch { }
                     this.Text = "Receipt View — " + _currentAllocationDisp;
                     GetData();
                 }
@@ -594,7 +775,11 @@ ORDER BY c.name, p.plot_no;", new Dictionary<string, object> { { "@q", q } });
             try
             {
                 EnsureRuntimeColumns();
-                var prms = new Dictionary<string, object> { { "@q", q } };
+                int societyId = GetVipSelectedSocietyId();
+                var prms = new Dictionary<string, object> {
+                    { "@q", q },
+                    { "@sid", societyId }
+                };
 
                 string sqlRef = @"
 WITH matches AS (
@@ -605,6 +790,7 @@ WITH matches AS (
   JOIN customers c ON c.id=cp.customer_id
   JOIN plots     p ON p.id=cp.plot_id
   WHERE COALESCE(r.ref_no,'') <> '' AND LOWER(r.ref_no) LIKE '%'||LOWER(@q)||'%'
+    AND (@sid = 0 OR p.society_id = @sid)
 ),
 per_alloc AS (
   SELECT cp_id,
@@ -686,6 +872,7 @@ ORDER BY sort_cust, sort_plot,
                 lb.Items.Add(dgvCredit);
 
                 MainClass.LoadData1(sqlRef, guna2DataGridView1, lb, prms);
+                UpdateRangeTotals();
 
                 int rows = guna2DataGridView1.Rows.Count;
                 if (rows > 0)
@@ -708,8 +895,7 @@ ORDER BY sort_cust, sort_plot,
             try
             {
                 EnsureRuntimeColumns();
-                var prms = new Dictionary<string, object> { { "@q", q } };
-
+                int societyId = GetVipSelectedSocietyId();
                 string sqlCust = @"
 WITH allocs AS (
   SELECT cp.id AS cp_id, c.name AS cust_name, p.plot_no AS plot_no, c.mobile AS customer_mobile
@@ -717,6 +903,8 @@ WITH allocs AS (
   JOIN customers c ON c.id=cp.customer_id
   JOIN plots     p ON p.id=cp.plot_id
   WHERE LOWER(c.name) LIKE '%'||LOWER(@q)||'%'
+    AND IFNULL(cp.status,'') <> 'Cancelled'
+    AND (@sid = 0 OR p.society_id = @sid)
 ),
 receipts_filtered AS (
   SELECT r.id, r.receipt_date, r.amount, COALESCE(r.notes,'') AS notes, COALESCE(r.ref_no,'') AS refno,
@@ -784,6 +972,12 @@ ORDER BY sort_cust, sort_plot,
          date(date) ASC,
          receipt_id ASC;";
 
+                var prms = new Dictionary<string, object>
+                {
+                    { "@q", q },
+                    { "@sid", societyId }
+                };
+
                 ListBox lb = new ListBox();
                 lb.Items.Add(dgvRowType);
                 lb.Items.Add(dgvReceiptId);
@@ -793,6 +987,7 @@ ORDER BY sort_cust, sort_plot,
                 lb.Items.Add(dgvCredit);
 
                 MainClass.LoadData1(sqlCust, guna2DataGridView1, lb, prms);
+                UpdateRangeTotals();
 
                 int rows = guna2DataGridView1.Rows.Count;
                 if (rows > 0)
@@ -975,7 +1170,13 @@ ORDER BY sort_cust, sort_plot,
 
                 _cmbVipSociety.SelectedIndexChanged += (s, e) =>
                 {
-                    try { ApplyVipAllocationFilter(true); }
+                    try
+                    {
+                        // Allocate jaisa: society change → list filter + wrong plot clear + totals
+                        ApplyVipAllocationFilter(true);
+                        ClearSelectionIfOutsideSocietyFilter();
+                        UpdateRangeTotals();
+                    }
                     catch (Exception ex) { ShowError("Society filter failed.\n\n" + ex.Message); }
                 };
 
@@ -1132,6 +1333,44 @@ ORDER BY sort_cust, sort_plot,
             }
         }
 
+        /// <summary>Selected plot dusri society ka ho to clear — society filter mix na dikhe.</summary>
+        private void ClearSelectionIfOutsideSocietyFilter()
+        {
+            try
+            {
+                int societyId = GetVipSelectedSocietyId();
+                if (societyId <= 0 || _currentCustomerPlotId <= 0) return;
+
+                bool stillVisible = false;
+                if (_vipAllocView != null)
+                {
+                    for (int i = 0; i < _vipAllocView.Count; i++)
+                    {
+                        try
+                        {
+                            if (Convert.ToInt32(_vipAllocView[i]["id"]) == _currentCustomerPlotId)
+                            {
+                                stillVisible = true;
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (stillVisible) return;
+
+                _currentCustomerPlotId = 0;
+                _currentAllocationDisp = "";
+                _isRefMode = _isCustMode = false;
+                _refQuery = _custQuery = "";
+                try { if (_lblVipSelected != null) _lblVipSelected.Text = "Selected: (none)"; } catch { }
+                this.Text = "Receipt View — type name to find customer";
+                try { guna2DataGridView1.DataSource = null; } catch { }
+            }
+            catch { }
+        }
+
         private void LoadVipAllocations()
         {
             try
@@ -1271,6 +1510,7 @@ ORDER BY s.name, c.name, p.plot_no;", null);
                 _currentAllocationDisp = display ?? "";
                 _isRefMode = _isCustMode = false;
                 _refQuery = _custQuery = "";
+                try { if (txtSearch != null) txtSearch.Text = ""; } catch { }
                 this.Text = "Receipt View — " + _currentAllocationDisp;
                 if (_lblVipSelected != null)
                     _lblVipSelected.Text = "Selected: " + _currentAllocationDisp;
@@ -1632,6 +1872,8 @@ ORDER BY c.name, p.plot_no;", null);
                     }
 
                     var cascade = HubSyncService.CollectReceiptCascade(rid, ledgerId);
+                    // Cloud soft-delete PEHLE — CatchUp/refresh resurrect band
+                    try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
 
                     SQLiteTransaction tx = null;
                     try

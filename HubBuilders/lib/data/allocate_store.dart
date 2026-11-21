@@ -413,24 +413,31 @@ WHERE cp.customer_id = ?''',
     return rows.map(AllocationRecord.fromMap).toList();
   }
 
-  static Future<List<AllocationListRow>> list({String query = ''}) async {
+  static Future<List<AllocationListRow>> list({
+    String query = '',
+    int societyId = 0,
+  }) async {
     final db = await AppDatabase.instance.database;
     final q = query.trim().toLowerCase();
-    final rows = await db.rawQuery('''
+    final rows = await db.rawQuery(
+      '''
 SELECT cp.id, cp.price, cp.booking_date, cp.status,
        COALESCE(cp.monthly_installment,0) AS monthly_installment,
        c.name AS customer, c.mobile AS phone,
        s.name AS society, b.name AS block, pt.code AS type,
-       p.plot_no
+       p.plot_no, s.id AS society_id
 FROM customer_plots cp
 JOIN customers c ON c.id = cp.customer_id
 JOIN plots p ON p.id = cp.plot_id
-JOIN societies s ON s.id = p.society_id
-JOIN blocks b ON b.id = p.block_id
-JOIN plot_types pt ON pt.id = p.plot_type_id
+LEFT JOIN societies s ON s.id = p.society_id
+LEFT JOIN blocks b ON b.id = p.block_id
+LEFT JOIN plot_types pt ON pt.id = p.plot_type_id
 WHERE IFNULL(cp.status,'') <> 'Cancelled'
+  AND (? = 0 OR IFNULL(s.id,0) = ?)
 ORDER BY cp.id DESC
-''');
+''',
+      [societyId, societyId],
+    );
 
     final out = <AllocationListRow>[];
     for (final r in rows) {
@@ -506,6 +513,10 @@ ORDER BY cp.id DESC
       final db = await AppDatabase.instance.database;
       await AppDatabase.ensureCustomerPlotsDealType(db);
       await AppDatabase.ensureCustomerPlotsMonthlyInstallment(db);
+      final syncIdRows = await db.rawQuery(
+        "SELECT lower(hex(randomblob(16))) AS s",
+      );
+      final syncId = (syncIdRows.first['s'] ?? '').toString();
       final id = await db.insert('customer_plots', {
         'customer_id': customerId,
         'plot_id': plotId,
@@ -518,6 +529,7 @@ ORDER BY cp.id DESC
         'down_payment': 0,
         'deal_type': deal,
         'monthly_installment': monthlyInstallment < 0 ? 0 : monthlyInstallment,
+        if (syncId.isNotEmpty) 'sync_id': syncId,
       });
       if (partnerId > 0) {
         try {
@@ -531,8 +543,9 @@ ORDER BY cp.id DESC
       }
       await StaffAudit.log('Insert', 'customer_plots',
           detail: 'id=$id; plotId=$plotId; price=$price; deal=$deal; partner=$partnerId');
+      await HubSync.pushNow('plots', plotId);
       await HubSync.pushNow('customer_plots', id);
-      HubSync.notifyLocalWrite();
+      HubSync.notifyLocalWrite(alreadyPushed: true);
       return (
         ok: true,
         message: 'Plot allocate ho gaya ($deal — plot: $plotStatus).',
@@ -591,7 +604,7 @@ ORDER BY cp.id DESC
     await StaffAudit.log('Update', 'customer_plots',
         detail: 'id=$customerPlotId; price=$price');
     await HubSync.pushNow('customer_plots', customerPlotId);
-    HubSync.notifyLocalWrite();
+    HubSync.notifyLocalWrite(alreadyPushed: true);
     return (ok: true, message: 'Allocation updated.');
   }
 
@@ -656,7 +669,7 @@ FROM customer_plots cp WHERE cp.id = ?''',
         detail: 'id=$customerPlotId; refund=$refundable');
     await HubSync.pushNow('customer_plots', customerPlotId);
     await HubSync.pushNow('plots', plotId);
-    HubSync.notifyLocalWrite();
+    HubSync.notifyLocalWrite(alreadyPushed: true);
     return (ok: true, message: 'Allocation cancelled. Plot Available.');
   }
 
@@ -703,7 +716,7 @@ FROM customer_plots cp WHERE cp.id = ?''',
     if (status == 'Completed') {
       await HubSync.pushNow('plots', plotId);
     }
-    HubSync.notifyLocalWrite();
+    HubSync.notifyLocalWrite(alreadyPushed: true);
     return (ok: true, message: 'Status updated.');
   }
 }

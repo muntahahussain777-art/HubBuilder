@@ -21,6 +21,8 @@ class AllocateScreen extends StatefulWidget {
 class _AllocateScreenState extends State<AllocateScreen> {
   final _search = TextEditingController();
   String _query = '';
+  int _societyId = 0;
+  List<IdName> _societies = const [];
   List<AllocationListRow> _rows = const [];
   bool _loading = true;
 
@@ -28,7 +30,7 @@ class _AllocateScreenState extends State<AllocateScreen> {
   void initState() {
     super.initState();
     HubSync.revision.addListener(_onSync);
-    _reload();
+    _bootstrap();
   }
 
   @override
@@ -39,12 +41,23 @@ class _AllocateScreenState extends State<AllocateScreen> {
   }
 
   void _onSync() {
-    if (mounted) _reload();
+    // Remote sync: list turant refresh, loading spinner mat dikhao (1s feel)
+    if (mounted) _reload(silent: true);
   }
 
-  Future<void> _reload() async {
-    setState(() => _loading = true);
-    final rows = await AllocateStore.list(query: _query);
+  Future<void> _bootstrap() async {
+    final societies = await PlotInventoryStore.societies();
+    if (!mounted) return;
+    setState(() => _societies = societies);
+    await _reload();
+  }
+
+  Future<void> _reload({bool silent = false}) async {
+    if (!silent) setState(() => _loading = true);
+    final rows = await AllocateStore.list(
+      query: _query,
+      societyId: _societyId,
+    );
     if (!mounted) return;
     setState(() {
       _rows = rows;
@@ -277,6 +290,30 @@ Agar koi sawal ho to reply karein.''';
               ),
               onChanged: (v) {
                 _query = v;
+                _reload();
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          SoftPanel(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: DropdownButtonFormField<int>(
+              value: _societyId,
+              decoration: const InputDecoration(
+                labelText: 'Society',
+                border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                filled: false,
+              ),
+              items: [
+                const DropdownMenuItem(value: 0, child: Text('All Societies')),
+                ..._societies.map(
+                  (s) => DropdownMenuItem(value: s.id, child: Text(s.name)),
+                ),
+              ],
+              onChanged: (v) {
+                setState(() => _societyId = v ?? 0);
                 _reload();
               },
             ),

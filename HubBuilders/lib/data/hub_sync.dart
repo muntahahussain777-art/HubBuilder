@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show min;
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
@@ -77,13 +78,54 @@ abstract final class HubSync {
 
   static Timer? _timer;
   static Future<void>? _inFlight;
-  static bool _dirty = true;
+  static bool _tickAgain = false;
+  static bool _dirty = false;
+  static DateTime _lastHashPush = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastFullPrune = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastSafetyPush = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastUserMirror = DateTime.fromMillisecondsSinceEpoch(0);
   static final revision = ValueNotifier<int>(0);
   static final notice = ValueNotifier<String?>(null);
   static final snackKey = GlobalKey<ScaffoldMessengerState>();
   static final _pullNotes = <String>[];
-  static DateTime _lastCatchUp = DateTime.now();
+  static DateTime _lastCatchUp = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastAllocCatchUp = DateTime.fromMillisecondsSinceEpoch(0);
   static DateTime _lastForceRecoverBg = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastFullIncremental = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastDeepHeal = DateTime.fromMillisecondsSinceEpoch(0);
+  static DateTime _lastPrune = DateTime.fromMillisecondsSinceEpoch(0);
+  static final Set<String> _dirtyTables = <String>{};
+  /// Rare deep heal — saari business forms.
+  static const _hotTables = <String>[
+    'societies',
+    'blocks',
+    'plot_types',
+    'plots',
+    'plans',
+    'customers',
+    'brokers',
+    'users',
+    'customer_plots',
+    'ledger',
+    'receipts',
+    'Expensetbl',
+    'Person',
+    'Deal',
+    'Credit',
+    'customer_plot_partners',
+    'partner_money',
+    'block_monthly_installments',
+  ];
+  /// Har tick live forms (~sub-second).
+  static const _liveTables = <String>[
+    'customers',
+    'customer_plots',
+    'receipts',
+    'ledger',
+    'plots',
+    'partner_money',
+    'customer_plot_partners',
+  ];
 
   static void _bump() {
     revision.value++;
@@ -399,10 +441,17 @@ abstract final class HubSync {
     }
   }
 
+  static void markDirtyTable(String table) {
+    markDirty();
+    final t = table.trim();
+    if (t.isNotEmpty) _dirtyTables.add(t);
+  }
+
   /// WinForms NotifyLocalWrite — local save/delete ke baad turant pull/push cycle.
-  static void notifyLocalWrite() {
+  /// [alreadyPushed] true jab [pushNow] pehle chal chuka — sirf pull, full hash-scan skip.
+  static void notifyLocalWrite({bool alreadyPushed = false}) {
     try {
-      markDirty();
+      if (!alreadyPushed) markDirty();
     } catch (_) {}
     unawaited(tick());
   }
@@ -460,32 +509,13 @@ abstract final class HubSync {
     }
   }
 
-  /// Force Recover from Cloud (UI): soft-mark pending deletes + push dirty local
-  /// FIRST, then insert-missing-only for allocate chain. No full merge rewrite, no prune.
+  /// Force Recover UI entry — DISABLED (galati se press risk). Sync/Pull use karein.
   static Future<({bool ok, String summary})> forceRecoverFromCloud() async {
-    _manualHold++;
-    try {
-      if (!await _ensureSb()) {
-        return (ok: false, summary: 'Supabase configured nahi / offline');
-      }
-      if (_inFlight != null) {
-        try {
-          await _inFlight;
-        } catch (_) {}
-      }
-      final future = _forceRecoverBody();
-      _inFlight = future;
-      try {
-        return await future;
-      } finally {
-        _inFlight = null;
-      }
-    } catch (e, st) {
-      debugPrint('HubSync forceRecover: $e\n$st');
-      return (ok: false, summary: 'Recover fail: $e');
-    } finally {
-      _manualHold--;
-    }
+    return (
+      ok: false,
+      summary:
+          'Force Recover band hai — Sync / Pull use karein. Galati se recover nahi hoga.',
+    );
   }
 
   static const _allocateRecoverTables = <String>[
@@ -502,8 +532,7 @@ abstract final class HubSync {
   ];
 
   static Future<({bool ok, String summary})> _forceRecoverBody() async {
-    // WinForms-safe: soft-mark pending deletes, push dirty local FIRST, then
-    // insert-missing-only. Never prune / never full-replace.
+    // Kept for reference; UI entry disabled via forceRecoverFromCloud().
     await _pushPendingDeletes();
     if (await _canPush()) {
       await _pushChanged();
@@ -515,7 +544,6 @@ abstract final class HubSync {
     try {
       await reconcileOneActiveCustomerPlots();
     } catch (_) {}
-    // NO prune — local-only extras mat mitao
     _bump();
 
     var summary =
@@ -595,7 +623,12 @@ abstract final class HubSync {
                 .toList();
             if (isAlloc) {
               await _ensureRecoverParentsForCustomerPlots(rows, skipList);
+            } else if (table == 'customers') {
+              _filterOutRecoverPlaceholderCustomers(rows, skipList);
+            } else if (table == 'receipts' || table == 'ledger') {
+              await _filterRecoverChildrenToExistingAllocs(table, rows, skipList);
             }
+            if (rows.isEmpty) continue;
 
             final before = await _localRowCount(table);
             await _applyFetched(
@@ -667,11 +700,13 @@ abstract final class HubSync {
     );
   }
 
-  /// Force Recover only: plot chain + customer (incl. soft-deleted) + placeholder.
+  /// Force Recover: plot chain + real cloud customer only. No Recovered placeholders.
+  /// Invalid orphan rows are removed from [cloudRows] before apply.
   static Future<void> _ensureRecoverParentsForCustomerPlots(
     List<Map<String, dynamic>> cloudRows,
     List<String> skipList,
   ) async {
+    final keep = <Map<String, dynamic>>[];
     for (final row in cloudRows) {
       try {
         final allocSync = (row['sync_id'] ?? '').toString().trim();
@@ -679,6 +714,13 @@ abstract final class HubSync {
         final custSync = (row['customer_sync_id'] ?? '').toString().trim();
         final planSync = (row['plan_sync_id'] ?? '').toString().trim();
         final brokerSync = (row['broker_sync_id'] ?? '').toString().trim();
+        final short =
+            allocSync.length >= 8 ? allocSync.substring(0, 8) : allocSync;
+
+        if (custSync.toLowerCase().startsWith('recover_')) {
+          skipList.add('$short: skip — placeholder customer_sync_id');
+          continue;
+        }
 
         if (plotSync.isNotEmpty) await _ensureRecoverPlotChain(plotSync);
         if (planSync.isNotEmpty) {
@@ -695,32 +737,111 @@ abstract final class HubSync {
         final plotId = plotSync.isEmpty
             ? null
             : await _localIdBySync(db, 'plots', plotSync);
-        var custId = custSync.isEmpty
+        final custId = custSync.isEmpty
             ? null
             : await _localIdBySync(db, 'customers', custSync);
 
-        final short =
-            allocSync.length >= 8 ? allocSync.substring(0, 8) : allocSync;
         if (plotId == null) {
           skipList.add('$short: plot parent missing');
           continue;
         }
-        if (custId == null) {
-          final phSync = await _ensureRecoverPlaceholderCustomer(
-            db,
-            custSync,
-            allocSync,
-          );
-          if (phSync.isNotEmpty) {
-            row['customer_sync_id'] = phSync;
-          }
+        if (custSync.isEmpty || custId == null) {
+          skipList.add('$short: skip — no valid cloud customer');
+          continue;
         }
+        if (await _isLocalRecoverPlaceholderCustomer(db, custId)) {
+          skipList.add('$short: skip — Recovered placeholder customer');
+          continue;
+        }
+        keep.add(row);
       } catch (e) {
         final id = (row['sync_id'] ?? '?').toString();
         final short = id.length >= 8 ? id.substring(0, 8) : id;
         skipList.add('$short: $e');
       }
     }
+    cloudRows
+      ..clear()
+      ..addAll(keep);
+  }
+
+  static void _filterOutRecoverPlaceholderCustomers(
+    List<Map<String, dynamic>> rows,
+    List<String> skipList,
+  ) {
+    final keep = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      if (_isForceRecoverPlaceholderCustomerPayload(row)) {
+        final id = (row['sync_id'] ?? '?').toString();
+        final short = id.length >= 8 ? id.substring(0, 8) : id;
+        skipList.add('$short: skip — Recovered placeholder');
+        continue;
+      }
+      keep.add(row);
+    }
+    rows
+      ..clear()
+      ..addAll(keep);
+  }
+
+  static Future<void> _filterRecoverChildrenToExistingAllocs(
+    String table,
+    List<Map<String, dynamic>> rows,
+    List<String> skipList,
+  ) async {
+    final db = await AppDatabase.instance.database;
+    final keep = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      final id = (row['sync_id'] ?? '').toString();
+      final short = id.length >= 8 ? id.substring(0, 8) : id;
+      final cpSync = (row['customer_plot_sync_id'] ?? '').toString().trim();
+      if (cpSync.isEmpty ||
+          await _localIdBySync(db, 'customer_plots', cpSync) == null) {
+        skipList.add('$short: skip — parent allocate missing ($table)');
+        continue;
+      }
+      keep.add(row);
+    }
+    rows
+      ..clear()
+      ..addAll(keep);
+  }
+
+  static bool _isForceRecoverPlaceholderCustomerPayload(
+    Map<String, dynamic> row,
+  ) {
+    final sid = (row['sync_id'] ?? '').toString().trim();
+    final name = (row['name'] ?? '').toString();
+    final notes = (row['notes'] ?? '').toString();
+    if (sid.toLowerCase().startsWith('recover_')) return true;
+    if (notes.toLowerCase().contains('force-recover')) return true;
+    if (name.startsWith('Recovered (')) return true;
+    return false;
+  }
+
+  static Future<bool> _isLocalRecoverPlaceholderCustomer(
+    DatabaseExecutor db,
+    int customerId,
+  ) async {
+    try {
+      final rows = await db.query(
+        'customers',
+        columns: ['name', 'notes', 'sync_id'],
+        where: 'id = ?',
+        whereArgs: [customerId],
+        limit: 1,
+      );
+      if (rows.isEmpty) return true;
+      final name = (rows.first['name'] ?? '').toString();
+      final notes = (rows.first['notes'] ?? '').toString();
+      final sid = (rows.first['sync_id'] ?? '').toString().trim();
+      if (sid.toLowerCase().startsWith('recover_')) return true;
+      if (notes.toLowerCase().contains('force-recover')) return true;
+      if (name.startsWith('Recovered (')) return true;
+    } catch (_) {
+      return true;
+    }
+    return false;
   }
 
   static Future<void> _ensureRecoverPlotChain(String plotSyncId) async {
@@ -763,9 +884,16 @@ abstract final class HubSync {
     bool includeDeleted,
   ) async {
     if (syncIds.isEmpty) return;
+    var ids = syncIds;
+    if (table == 'customers') {
+      ids = syncIds
+          .where((s) => s.trim().isNotEmpty && !s.trim().toLowerCase().startsWith('recover_'))
+          .toList();
+      if (ids.isEmpty) return;
+    }
     final db = await AppDatabase.instance.database;
     final need = <String>[];
-    for (final id in syncIds) {
+    for (final id in ids) {
       final t = id.trim();
       if (t.isEmpty) continue;
       if (await _localIdBySync(db, table, t) == null) need.add(t);
@@ -782,12 +910,17 @@ abstract final class HubSync {
         includeDeleted: includeDeleted,
       );
       if (got.rows.isEmpty) continue;
-      final rows = got.rows.map((r) {
+      var rows = got.rows.map((r) {
         final m = Map<String, dynamic>.from(r);
         // Soft-deleted parents: insert as live for FK resolve (do not ApplyRow-delete)
         if (includeDeleted) m['is_deleted'] = false;
         return m;
       }).toList();
+      if (table == 'customers') {
+        final skip = <String>[];
+        _filterOutRecoverPlaceholderCustomers(rows, skip);
+        if (rows.isEmpty) continue;
+      }
       await _applyFetched(
         _asApplyRows(table, rows),
         notify: false,
@@ -796,76 +929,60 @@ abstract final class HubSync {
     }
   }
 
-  /// Force Recover only — minimal customer for customer_id NOT NULL.
+  /// DISABLED — Recovered placeholders caused bad hisab.
   static Future<String> _ensureRecoverPlaceholderCustomer(
     DatabaseExecutor db,
     String customerSyncId,
     String allocSyncId,
   ) async {
-    var sid = customerSyncId.trim();
-    if (sid.isEmpty) {
-      final a = allocSyncId.trim();
-      sid = a.isNotEmpty
-          ? 'recover_$a'
-          : 'recover_${DateTime.now().millisecondsSinceEpoch}';
-    }
-    final existing = await _localIdBySync(db, 'customers', sid);
-    if (existing != null) return sid;
-
-    final name = customerSyncId.trim().isEmpty
-        ? 'Recovered (no cloud customer)'
-        : 'Recovered (cloud customer missing)';
-    try {
-      await db.insert('customers', {
-        'name': name,
-        'father_name': '',
-        'mobile': '',
-        'cnic': '',
-        'notes': 'force-recover placeholder',
-        'sync_id': sid,
-      });
-    } catch (e) {
-      debugPrint('HubSync placeholder customer: $e');
-    }
-    return sid;
+    return '';
   }
 
-  static Future<void> _pullNowBody() async {
-    // Push-first — kabhi pull-wipe pehle nahi
-    await _pushLocalFirst();
+  /// WinForms-primary: remote soft-deletes pehle apply, phir local push.
+  /// Pehle push se mobile purani row cloud delete overwrite karti thi (delete wapas aa jata).
+  static Future<void> _syncCycleBody({required bool forcePrune}) async {
+    // 1) Is device ke pending deletes soft-mark (apni deletes)
+    await _pushPendingDeletes();
+
+    // 2) Pull updates + deletes pehle (WinForms delete/update/transfer)
     if (await _needsFullPull()) {
       await _fullPullAllTables();
     } else {
       await _pullIncremental();
-      await _catchUpMissing();
-    }
-    if (await _looksStaleLocal()) {
-      await forceRecoverMissingFromCloud();
+      await _pullRecentHeal(120);
     }
     await _mirrorUsersFromCloud();
-    await _pruneGoneFromCloud(force: true);
-    _bump();
-  }
+    await _pruneGoneFromCloud(force: forcePrune);
 
-  static Future<void> _syncNowBody() async {
-    // Always push dirty local FIRST, then union-pull / insert-missing.
-    // Kabhi pull-wipe-first nahi (old mobile wipe bug).
-    await _pushLocalFirst();
-    if (await _needsFullPull()) {
-      await _fullPullAllTables();
-    } else {
-      await _pullIncremental();
-      await _catchUpMissing();
+    // 3) Ab push — deleted rows local se hat chuki, cloud soft-delete overwrite nahi
+    if (await _getState('restore_push_first') == '1' || await _canPush()) {
+      if (await _canPush()) {
+        await _pushChanged();
+        _dirty = false;
+      }
+      if (await _getState('restore_push_first') == '1') {
+        await _setState('restore_push_first', '');
+      }
     }
+
+    // 4) Insert-missing only (live cloud rows) — soft-deleted catch-up mein nahi
     if (await _looksStaleLocal()) {
       await forceRecoverMissingFromCloud();
       try {
         await reconcileOneActiveCustomerPlots();
       } catch (_) {}
+    } else {
+      await _catchUpMissing();
     }
-    await _mirrorUsersFromCloud();
-    await _pruneGoneFromCloud(force: true);
     _bump();
+  }
+
+  static Future<void> _pullNowBody() async {
+    await _syncCycleBody(forcePrune: true);
+  }
+
+  static Future<void> _syncNowBody() async {
+    await _syncCycleBody(forcePrune: true);
   }
 
   /// Soft-mark pending deletes + push dirty rows only (no empty destructive upload).
@@ -883,9 +1000,37 @@ abstract final class HubSync {
   static Future<void> pushNow(String table, Object? rowId) async {
     if (rowId == null) return;
     if (table == 'staff_entry_log' || table.startsWith('sync_')) return;
+    if (!await _ensureSb()) return;
     try {
       final db = await AppDatabase.instance.database;
       if (!await _tableExists(db, table)) return;
+
+      // Parents pehle — WinForms/mobile dono taraf list empty na rahe
+      if (table == 'customer_plots') {
+        final parents = await db.rawQuery(
+          'SELECT customer_id, plot_id, broker_id FROM customer_plots WHERE id = ? LIMIT 1',
+          [rowId],
+        );
+        if (parents.isNotEmpty) {
+          final p = parents.first;
+          final cid = p['customer_id'];
+          final pid = p['plot_id'];
+          final bid = p['broker_id'];
+          if (cid != null) await pushNow('customers', cid);
+          if (pid != null) await pushNow('plots', pid);
+          if (bid != null) await pushNow('brokers', bid);
+        }
+      } else if (table == 'receipts' || table == 'ledger') {
+        final parents = await db.rawQuery(
+          'SELECT customer_plot_id FROM "$table" WHERE id = ? LIMIT 1',
+          [rowId],
+        );
+        if (parents.isNotEmpty) {
+          final aid = parents.first['customer_plot_id'];
+          if (aid != null) await pushNow('customer_plots', aid);
+        }
+      }
+
       final pk = _pk(table);
       await db.execute(
         'UPDATE "$table" SET sync_id = lower(hex(randomblob(16))) WHERE "$pk" = ? AND (sync_id IS NULL OR TRIM(sync_id)=\'\')',
@@ -922,9 +1067,13 @@ abstract final class HubSync {
       cloudRow['dup_key'] = _dupKey(table, payload);
       cloudRow['is_deleted'] = false;
       cloudRow['staff_name'] = staff;
-      cloudRow['updated_at'] = DateTime.now().toUtc().toIso8601String();
+      cloudRow['updated_at'] = _utcFilter(DateTime.now().toUtc());
       final ok = await _httpUpsertIds(_cloudTable(table), [cloudRow]);
-      if (ok.contains(syncId)) await _saveHash(db, syncId, hash);
+      if (ok.contains(syncId)) {
+        await _saveHash(db, syncId, hash);
+        _dirty = false;
+        _bump();
+      }
       try {
         await db.insert(
           'sync_known',
@@ -975,7 +1124,7 @@ abstract final class HubSync {
     } catch (_) {}
   }
 
-  /// Offline delete queue — soft-mark + delayed hard delete.
+  /// Offline delete queue — soft-mark tombstone only (no hard-delete).
   static Future<void> _pushPendingDeletes() async {
     if (!SupabaseConfig.isConfigured) return;
     try {
@@ -989,11 +1138,8 @@ abstract final class HubSync {
         final table = (row['table_name'] ?? '').toString().trim();
         final sid = (row['sync_id'] ?? '').toString().trim();
         if (table.isEmpty || sid.isEmpty) continue;
-        await _softMarkCloudDeleted(table, sid);
-        if (!_pendingDeleteAged((row['queued_at'] ?? '').toString(), 45)) {
-          continue;
-        }
-        if (await _hardDeleteCloudRow(table, sid)) {
+        // Soft tombstone only — hard delete se doosri device delete signal kho jati hai
+        if (await _softMarkCloudDeleted(table, sid)) {
           await _removePendingDelete(sid);
         }
       }
@@ -1011,7 +1157,7 @@ abstract final class HubSync {
     return DateTime.now().difference(dt).inSeconds >= minSec;
   }
 
-  /// Soft-delete signal + queue hard delete. Doosre devices pull pe delete.
+  /// Soft-delete tombstone for other devices. No hard-delete in normal sync.
   static Future<bool> _pushDeletedOne(String localTable, String syncId) async {
     final sid = syncId.trim();
     final table = localTable.trim();
@@ -1020,7 +1166,50 @@ abstract final class HubSync {
     if (!SupabaseConfig.isConfigured) return false;
     final softOk = await _softMarkCloudDeleted(table, sid);
     await _clearPendingDeleteMeta(sid);
+    if (softOk) await _removePendingDelete(sid);
     return softOk;
+  }
+
+  static Map<String, Object?> _buildDeleteTombstone(String table, String syncId) {
+    final tomb = <String, Object?>{
+      'sync_id': syncId,
+      'is_deleted': true,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+      'staff_name':
+          (StaffAudit.displayName ?? StaffAudit.username ?? 'system').trim(),
+    };
+    final t = table.toLowerCase();
+    if (t == 'customer_plots') {
+      tomb['booking_date'] =
+          DateTime.now().toIso8601String().substring(0, 10);
+      tomb['price'] = 0;
+      tomb['down_payment'] = 0;
+      tomb['status'] = 'Cancelled';
+      tomb['deal_type'] = 'Installment';
+      tomb['notes'] = '';
+    } else if (t == 'customers') {
+      tomb['name'] = '(deleted)';
+      tomb['mobile'] = '';
+      tomb['cnic'] = '';
+    } else if (t == 'receipts') {
+      tomb['receipt_date'] =
+          DateTime.now().toIso8601String().substring(0, 10);
+      tomb['amount'] = 0;
+      tomb['mode'] = 'Cash';
+    } else if (t == 'ledger') {
+      tomb['txn_date'] = DateTime.now().toIso8601String().substring(0, 10);
+      tomb['txn_type'] = 'Adjustment';
+      tomb['debit'] = 0;
+      tomb['credit'] = 0;
+    }
+    return tomb;
+  }
+
+  static bool _cloudRowIsDeleted(Map row) {
+    final del = row['is_deleted'];
+    return del == true ||
+        del == 1 ||
+        del?.toString().toLowerCase() == 'true';
   }
 
   static Future<bool> _softMarkCloudDeleted(
@@ -1030,15 +1219,36 @@ abstract final class HubSync {
     final sid = syncId.trim();
     final table = localTable.trim();
     if (sid.isEmpty || table.isEmpty) return true;
+    final cloud = _cloudTable(table);
     try {
       if (!await _ensureSb()) return false;
-      await Supabase.instance.client.from(_cloudTable(table)).update({
+      await Supabase.instance.client.from(cloud).update({
         'is_deleted': true,
         'updated_at': DateTime.now().toUtc().toIso8601String(),
       }).eq('sync_id', sid);
-      return true;
     } catch (e) {
       debugPrint('HubSync soft-delete $table $e');
+    }
+    try {
+      final left = await Supabase.instance.client
+          .from(cloud)
+          .select('sync_id,is_deleted')
+          .eq('sync_id', sid)
+          .limit(1);
+      if (left.isNotEmpty && _cloudRowIsDeleted(left.first)) return true;
+      // Row missing ya still live — INSERT/UPSERT tombstone (mobile delete signal)
+      await Supabase.instance.client.from(cloud).upsert(
+            _buildDeleteTombstone(table, sid),
+            onConflict: 'sync_id',
+          );
+      final again = await Supabase.instance.client
+          .from(cloud)
+          .select('is_deleted')
+          .eq('sync_id', sid)
+          .limit(1);
+      return again.isNotEmpty && _cloudRowIsDeleted(again.first);
+    } catch (e) {
+      debugPrint('HubSync soft-delete verify $table $e');
       return false;
     }
   }
@@ -1135,13 +1345,36 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
       await db.execute(
         "UPDATE \"$t\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)=''",
       );
+      // Non-unique index — tez lookup, purani entries break nahi
+      try {
+        final idx = 'idx_${t.toLowerCase()}_sync_id';
+        await db.execute('CREATE INDEX IF NOT EXISTS "$idx" ON "$t"(sync_id)');
+      } catch (_) {}
     }
     await _seedHashesIfAlreadySynced();
-    if (await _getState('sync_schema') != '8') {
-      await _setState('last_pull_utc', '');
-      await _setState('first_pull_done', '');
-      await _setState('sync_schema', '8');
-      await _setState('alias_backfill_done', '');
+    // Schema 10: indexes only — first_pull / last_pull WIPE mat karo (entries protect)
+    final sch = await _getState('sync_schema');
+    if (sch != '10') {
+      final populated = (await _localRowCount('customer_plots')) +
+              (await _localRowCount('customers')) >=
+          20;
+      if (populated) {
+        await _setState('first_pull_done', '1');
+        if ((await _getState('last_pull_utc')).trim().isEmpty) {
+          await _setState(
+            'last_pull_utc',
+            DateTime.now()
+                .toUtc()
+                .subtract(const Duration(minutes: 2))
+                .toIso8601String(),
+          );
+        }
+      } else if (sch.isEmpty) {
+        // Sirf bilkul empty pehle install — full pull allow
+        await _setState('last_pull_utc', '');
+        await _setState('first_pull_done', '');
+      }
+      await _setState('sync_schema', '10');
     }
     if (SupabaseConfig.isConfigured && await _getState('alias_backfill_done') != '1') {
       try {
@@ -1187,20 +1420,18 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     await SupabaseConfig.load();
     await _ensureSb();
     await ensureLocalSchema();
-    _timer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+    _timer ??= Timer.periodic(const Duration(milliseconds: 400), (_) {
       unawaited(tick());
     });
-    // App start: push-first + stale force-recover (tick body)
-    markDirty();
+    // App start pe pura DB push mat karo — woh pehli pulls ko minutes rok deta tha.
     unawaited(tick());
   }
 
   static Future<void> tick() async {
     if (_manualHold > 0) return;
     if (_inFlight != null) {
-      try {
-        await _inFlight;
-      } catch (_) {}
+      // Busy tick miss mat karo — khatam hote hi dubara chalo (realtime)
+      _tickAgain = true;
       return;
     }
     _inFlight = _tickBody();
@@ -1210,6 +1441,10 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     } finally {
       _inFlight = null;
     }
+    if (_tickAgain) {
+      _tickAgain = false;
+      unawaited(tick());
+    }
   }
 
   static Future<void> _tickBody() async {
@@ -1218,26 +1453,52 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         debugPrint('HubSync: Supabase not ready');
         return;
       }
-      // Background = WinForms-style but ALWAYS push-first (anti-wipe).
-      final restoreFirst = await _getState('restore_push_first') == '1';
-      if (restoreFirst || _dirty || await _hasPendingDeletes()) {
-        await _pushLocalFirst();
-      }
+      await _healSyncFlagsIfLocalReady();
+      await _ensureMissingSyncIds();
       if (await _needsFullPull()) {
         await _fullPullAllTables();
       } else {
-        await _pullIncremental();
+        // Cursor: aaj ki WinForms entries jo 3 min se purani hain bhi aa jayein, phir <1s.
+        await _pullLiveCursor();
+        _bump();
+
+        if (await _canPush()) {
+          await _pushPendingDeletes();
+          final pushed = await _pushChanged();
+          if (pushed) {
+            _dirty = false;
+            _lastHashPush = DateTime.now();
+          }
+        }
+
+        // Full incremental rare — har 3s pe 19 tables tick ko atka deti thi
+        if (DateTime.now().difference(_lastFullIncremental).inSeconds >= 45) {
+          await _pullIncremental();
+          _lastFullIncremental = DateTime.now();
+          _bump();
+        }
+
+        if (DateTime.now().difference(_lastDeepHeal).inSeconds >= 180) {
+          await _pullRecentHealFor(_hotTables, 120);
+          _lastDeepHeal = DateTime.now();
+          _bump();
+        }
+        if (DateTime.now().difference(_lastPrune).inSeconds >= 300) {
+          await _pruneGoneFromCloud(force: true);
+          _lastPrune = DateTime.now();
+          _bump();
+        }
       }
-      await _mirrorUsersFromCloud();
-      if (_dirty && await _canPush()) {
-        debugPrint('HubSync pushing local changes');
-        await _pushChanged();
-        _dirty = false;
+      if (DateTime.now().difference(_lastUserMirror).inSeconds >= 300) {
+        await _mirrorUsersFromCloud();
+        _lastUserMirror = DateTime.now();
+      }
+      if (await _getState('restore_push_first') == '1') {
+        await _setState('restore_push_first', '');
       }
       final stale = await _looksStaleLocal();
       if (stale &&
-          DateTime.now().difference(_lastForceRecoverBg).inSeconds >= 90) {
-        // Old/stale local: insert-missing-only — NO wipe / NO prune for this path
+          DateTime.now().difference(_lastForceRecoverBg).inSeconds >= 300) {
         debugPrint('HubSync stale local → force recover missing (background)');
         await forceRecoverMissingFromCloud();
         try {
@@ -1246,24 +1507,96 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         _lastForceRecoverBg = DateTime.now();
         _bump();
       } else if (await _getState('first_pull_done') == '1' &&
-          DateTime.now().difference(_lastCatchUp).inSeconds >= 30) {
+          DateTime.now().difference(_lastCatchUp).inSeconds >= 300) {
         await _catchUpMissing();
         _lastCatchUp = DateTime.now();
-      }
-      // Stale pe prune skip — empty/old cloud se local mat mitao
-      if (!stale && await _getState('first_pull_done') == '1') {
-        await _pruneGoneFromCloud();
       }
     } catch (e, st) {
       debugPrint('HubSync tick: $e\n$st');
     }
   }
 
-  /// WinForms CanPush: first_pull done OR dirty / pending deletes.
-  /// Stuck first_pull pe bhi local data cloud pe ja sake (anti-wipe restore).
+  /// updated_at cursor. Pehli dafa 2 din — miss hui WinForms entries. Phir sirf nayi.
+  /// Same sync_id update. is_deleted = sirf woh row. Wipe nahi.
+  static Future<void> _pullLiveCursor() async {
+    var raw = (await _getState('live_cursor_utc')).trim();
+    if (raw.isEmpty) {
+      raw = _utcFilter(
+        DateTime.now().toUtc().subtract(const Duration(days: 2)),
+      );
+    }
+    final cursor = _utcFilterIso(raw);
+    DateTime? hold;
+    var anyFail = false;
+    final bag = <Map<String, dynamic>>[];
+    for (final table in _liveTables) {
+      final got = await _sbSelect(
+        _cloudTable(table),
+        from: 0,
+        to: 79,
+        updatedAfter: cursor,
+        includeDeleted: true,
+      );
+      if (!got.ok) {
+        anyFail = true;
+        continue;
+      }
+      if (got.rows.length >= 80) {
+        final last = DateTime.tryParse(
+          (got.rows.last['updated_at'] ?? '').toString(),
+        )?.toUtc();
+        if (last != null && (hold == null || last.isBefore(hold))) hold = last;
+      }
+      final ready = await _preparePulledRows(table, got.rows);
+      if (ready.isNotEmpty) bag.addAll(_asApplyRows(table, ready));
+    }
+    if (bag.isNotEmpty) await _applyFetched(bag);
+    if (anyFail) return;
+    final next = hold != null
+        ? _utcFilter(hold.subtract(const Duration(seconds: 1)))
+        : _utcFilter(DateTime.now().toUtc().subtract(const Duration(seconds: 15)));
+    if (next.compareTo(cursor) > 0) await _setState('live_cursor_utc', next);
+  }
+
+  /// Sirf is_deleted=true (last N sec) — allocate/receipt delete ~1s mein.
+  static Future<void> _pullRecentDeletesFor(
+    List<String> tables,
+    int windowSec,
+  ) async {
+    final sec = windowSec < 30 ? 30 : windowSec;
+    final since = _utcFilter(
+      DateTime.now().toUtc().subtract(Duration(seconds: sec)),
+    );
+    final bag = <Map<String, dynamic>>[];
+    final fetched = await Future.wait(tables.map((table) async {
+      final cloud = _cloudTable(table);
+      final all = <Map<String, dynamic>>[];
+      for (var page = 0; page < 3; page++) {
+        final from = page * 200;
+        final got = await _sbSelect(
+          cloud,
+          from: from,
+          to: from + 199,
+          updatedAfter: since,
+          deletedOnly: true,
+          orderBy: 'updated_at',
+        );
+        if (!got.ok || got.rows.isEmpty) break;
+        all.addAll(got.rows);
+        if (got.rows.length < 200) break;
+      }
+      return (table: table, rows: all);
+    }));
+    for (final item in fetched) {
+      if (item.rows.isEmpty) continue;
+      bag.addAll(_asApplyRows(item.table, item.rows));
+    }
+    if (bag.isNotEmpty) await _applyFetched(bag);
+  }
+
+  /// Sirf apni save/delete — pura DB upload band (tick block = minute+ lag).
   static Future<bool> _canPush() async {
     if (!SupabaseConfig.isConfigured) return false;
-    if (await _getState('first_pull_done') == '1') return true;
     if (_dirty) return true;
     return await _hasPendingDeletes();
   }
@@ -1456,15 +1789,67 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     return got.rows.isEmpty ? 0 : 1;
   }
 
+  static Future<void> _ensureMissingSyncIds() async {
+    try {
+      final db = await AppDatabase.instance.database;
+      var changed = 0;
+      for (final table in _liveTables) {
+        if (!await _tableExists(db, table)) continue;
+        final n = await db.rawUpdate(
+          "UPDATE \"$table\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)=''",
+        );
+        if (n > 0) {
+          changed += n;
+          markDirtyTable(table);
+        }
+      }
+      if (changed > 0) markDirty();
+    } catch (_) {}
+  }
+
+  static Future<bool> _isLastPullStale(int minutes) async {
+    try {
+      final lp = (await _getState('last_pull_utc')).trim();
+      if (lp.isEmpty) return true;
+      final t = DateTime.tryParse(lp);
+      if (t == null) return true;
+      return DateTime.now().toUtc().difference(t.toUtc()).inMinutes > minutes;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// Agar local pe pehle se data hai lekin flags wipe ho gaye — incremental pe lao (full-pull stuck band).
+  static Future<void> _healSyncFlagsIfLocalReady() async {
+    if (await _getState('first_pull_done') == '1') return;
+    final n = await _localRowCount('customer_plots');
+    final c = await _localRowCount('customers');
+    if (n + c < 20) return;
+    await _setState('first_pull_done', '1');
+    if ((await _getState('last_pull_utc')).trim().isEmpty) {
+      // 2 min — 6h backlog tick ko minutes laga deta tha
+      await _setState(
+        'last_pull_utc',
+        DateTime.now()
+            .toUtc()
+            .subtract(const Duration(minutes: 2))
+            .toIso8601String(),
+      );
+    }
+    debugPrint('HubSync heal flags: local ready alloc=$n customers=$c');
+  }
+
   /// WinForms NeedsFullPull — sirf pehli baar. Empty allocate → Force Recover missing, not wipe-pull.
   static Future<bool> _needsFullPull() async {
+    await _healSyncFlagsIfLocalReady();
     return await _getState('first_pull_done') != '1';
   }
 
   /// Old/stale local (wipe risk / missing cloud rows): insert-missing Force Recover path.
   static Future<bool> _looksStaleLocal() async {
+    await _healSyncFlagsIfLocalReady();
     if (await _getState('first_pull_done') != '1') return true;
-    if (await _getState('sync_schema') != '8') return true;
+    if (await _getState('sync_schema') != '10') return true;
     final last = (await _getState('last_pull_utc')).trim();
     if (last.isEmpty) return true;
     final dt = DateTime.tryParse(last);
@@ -1505,6 +1890,7 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
           cloud,
           from: from,
           to: from + 499,
+          includeDeleted: true, // tombstones bhi — delete miss na ho
         );
         if (!got.ok) {
           ok = false;
@@ -1524,11 +1910,13 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         anyOk = true;
       }
       if (item.rows.isEmpty) continue;
-      bag.addAll(_asApplyRows(item.table, item.rows));
       for (final row in item.rows) {
         final ts = (row['updated_at'] ?? '').toString();
         if (ts.compareTo(maxTs) > 0) maxTs = ts;
       }
+      final ready = await _preparePulledRows(item.table, item.rows);
+      if (ready.isEmpty) continue;
+      bag.addAll(_asApplyRows(item.table, ready));
     }
     if (bag.isNotEmpty) {
       await _applyFetched(bag, notify: false, bump: false);
@@ -1536,7 +1924,8 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     if (maxTs == '1970-01-01T00:00:00.000Z') {
       maxTs = DateTime.now().toUtc().toIso8601String();
     }
-    if (anyOk && !anyFail) {
+    // Partial fail pe bhi stuck forever mat raho (warna prune/incremental band)
+    if (anyOk) {
       await _setState('last_pull_utc', maxTs);
       await _setState('first_pull_done', '1');
     }
@@ -1553,6 +1942,63 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
   static String _base() =>
       SupabaseConfig.url.replaceAll(RegExp(r'/$'), '');
 
+  /// Cloud pe already soft-deleted sync_ids — live upsert mat bhejo (delete overwrite band).
+  static Future<Set<String>> _fetchCloudDeletedSyncIds(
+    String cloud,
+    List<String> syncIds,
+  ) async {
+    final deleted = <String>{};
+    if (syncIds.isEmpty) return deleted;
+    if (!await _ensureSb()) return deleted;
+    for (var i = 0; i < syncIds.length; i += 40) {
+      final chunk = syncIds.sublist(i, min(i + 40, syncIds.length));
+      try {
+        final got = await Supabase.instance.client
+            .from(cloud)
+            .select('sync_id')
+            .eq('is_deleted', true)
+            .inFilter('sync_id', chunk)
+            .limit(100);
+        for (final r in (got as List).whereType<Map>()) {
+          final id = (r['sync_id'] ?? '').toString().trim();
+          if (id.isNotEmpty) deleted.add(id);
+        }
+      } catch (e) {
+        debugPrint('HubSync fetch deleted $cloud $e');
+      }
+    }
+    return deleted;
+  }
+
+  static Future<void> _deleteLocalBySyncIds(
+    String cloud,
+    Set<String> syncIds,
+  ) async {
+    if (syncIds.isEmpty) return;
+    String? local;
+    for (final t in _tables) {
+      if (_cloudTable(t) == cloud) {
+        local = t;
+        break;
+      }
+    }
+    if (local == null) return;
+    final db = await AppDatabase.instance.database;
+    await AppDatabase.suspendSyncTriggers(db);
+    try {
+      await db.execute('PRAGMA foreign_keys = OFF');
+      for (final sid in syncIds) {
+        await db.delete(local, where: 'sync_id = ?', whereArgs: [sid]);
+        await db.delete('sync_known', where: 'sync_id = ?', whereArgs: [sid]);
+        await db.delete('sync_hash', where: 'sync_id = ?', whereArgs: [sid]);
+      }
+    } finally {
+      await db.execute('PRAGMA foreign_keys = ON');
+      await AppDatabase.restoreSyncTriggers(db);
+    }
+    _bump();
+  }
+
   static Future<Set<String>> _httpUpsertIds(
     String cloud,
     List<Map<String, Object?>> rows,
@@ -1560,26 +2006,40 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     final okIds = <String>{};
     if (rows.isEmpty) return okIds;
     if (!await _ensureSb()) return okIds;
+    final ids = rows
+        .map((r) => (r['sync_id'] ?? '').toString().trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    final cloudDeleted = await _fetchCloudDeletedSyncIds(cloud, ids);
+    var liveRows = rows;
+    if (cloudDeleted.isNotEmpty) {
+      liveRows = rows
+          .where((r) =>
+              !cloudDeleted.contains((r['sync_id'] ?? '').toString().trim()))
+          .toList();
+      await _deleteLocalBySyncIds(cloud, cloudDeleted);
+    }
+    if (liveRows.isEmpty) return okIds;
     try {
       final payload =
-          rows.map((r) => Map<String, dynamic>.from(r)).toList();
+          liveRows.map((r) => Map<String, dynamic>.from(r)).toList();
       await Supabase.instance.client.from(cloud).upsert(
             payload,
             onConflict: 'sync_id',
           );
-      for (final r in rows) {
+      for (final r in liveRows) {
         final id = (r['sync_id'] ?? '').toString();
         if (id.isNotEmpty) okIds.add(id);
       }
       return okIds;
     } catch (e) {
       debugPrint('HubSync UPSERT $cloud $e');
-      if (rows.length > 1) {
-        for (final row in rows) {
+      if (liveRows.length > 1) {
+        for (final row in liveRows) {
           okIds.addAll(await _httpUpsertIds(cloud, [row]));
         }
-      } else if (cloud == 'users' && rows.length == 1) {
-        final sid = await _mergeUserIntoLive(rows.first);
+      } else if (cloud == 'users' && liveRows.length == 1) {
+        final sid = await _mergeUserIntoLive(liveRows.first);
         if (sid != null && sid.isNotEmpty) okIds.add(sid);
       }
     }
@@ -1642,9 +2102,11 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     await _setState('push_hashes_ready', '1');
   }
 
-  static Future<void> _pushChanged() async {
+  /// true = dirty clear karo; false = baad mein safety push.
+  static Future<bool> _pushChanged() async {
     final db = await AppDatabase.instance.database;
     final staff = (StaffAudit.displayName ?? StaffAudit.username ?? '').trim();
+    final pendingDel = await _loadPendingDeleteSyncIds();
     final batch = <Map<String, Object?>>[];
 
     Future<void> flush() async {
@@ -1671,19 +2133,34 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
       batch.clear();
     }
 
-    final cloudUserSync = <String, String>{};
-    try {
-      final got = await _sbSelect('users', from: 0, to: 499);
-      if (got.ok) {
-        for (final r in got.rows) {
-          final un = (r['username'] ?? '').toString().trim().toLowerCase();
-          final sid = (r['sync_id'] ?? '').toString().trim();
-          if (un.isNotEmpty && sid.isNotEmpty) cloudUserSync[un] = sid;
-        }
-      }
-    } catch (_) {}
+    late final List<String> scanTables;
+    if (_dirtyTables.isNotEmpty) {
+      scanTables = List<String>.from(_dirtyTables);
+      _dirtyTables.clear();
+    } else if (_dirty &&
+        DateTime.now().difference(_lastSafetyPush).inSeconds >= 15) {
+      // Rare safety — har tick LiveTables scan = WinForms→mobile lag
+      scanTables = List<String>.from(_liveTables);
+      _lastSafetyPush = DateTime.now();
+    } else {
+      return !_dirty;
+    }
 
-    for (final table in _tables) {
+    final cloudUserSync = <String, String>{};
+    if (scanTables.any((t) => t.toLowerCase() == 'users')) {
+      try {
+        final got = await _sbSelect('users', from: 0, to: 499);
+        if (got.ok) {
+          for (final r in got.rows) {
+            final un = (r['username'] ?? '').toString().trim().toLowerCase();
+            final sid = (r['sync_id'] ?? '').toString().trim();
+            if (un.isNotEmpty && sid.isNotEmpty) cloudUserSync[un] = sid;
+          }
+        }
+      } catch (_) {}
+    }
+
+    for (final table in scanTables) {
       if (!await _tableExists(db, table)) continue;
       await db.execute(
         "UPDATE \"$table\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)=''",
@@ -1695,6 +2172,8 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         final payload = Map<String, Object?>.from(r);
         var syncId = (payload['sync_id'] ?? '').toString();
         if (syncId.trim().isEmpty) continue;
+        // Pending SoftMark — live upsert se tombstone overwrite mat karo
+        if (pendingDel.contains(syncId.trim().toLowerCase())) continue;
         if (table.toLowerCase() == 'users') {
           final un = (payload['username'] ?? '').toString().trim().toLowerCase();
           final keep = un.isEmpty ? '' : (cloudUserSync[un] ?? '');
@@ -1736,7 +2215,7 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         cloudRow['dup_key'] = dupKey;
         cloudRow['is_deleted'] = false;
         cloudRow['staff_name'] = staff;
-        cloudRow['updated_at'] = DateTime.now().toUtc().toIso8601String();
+        cloudRow['updated_at'] = _utcFilter(DateTime.now().toUtc());
         cloudRow['_cloud_table'] = _cloudTable(table);
         cloudRow['_row_hash'] = hash;
         batch.add(cloudRow);
@@ -1745,6 +2224,64 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     }
     await flush();
     await _setState('push_hashes_ready', '1');
+    return true;
+  }
+
+  static String _utcFilterIso(String iso) {
+    final dt = DateTime.tryParse(iso)?.toUtc();
+    if (dt == null) return iso;
+    return _utcFilter(dt);
+  }
+
+  static String _utcFilter(DateTime utc) {
+    final u = utc.toUtc();
+    final ms = u.millisecond.toString().padLeft(3, '0');
+    return '${u.year.toString().padLeft(4, '0')}-'
+        '${u.month.toString().padLeft(2, '0')}-'
+        '${u.day.toString().padLeft(2, '0')}T'
+        '${u.hour.toString().padLeft(2, '0')}:'
+        '${u.minute.toString().padLeft(2, '0')}:'
+        '${u.second.toString().padLeft(2, '0')}.'
+        '${ms}Z';
+  }
+
+  /// Recent cloud allocates missing locally — light (full catch-up nahi).
+  static Future<void> _catchUpRecentAllocates(int windowSec) async {
+    final sec = windowSec < 60 ? 60 : windowSec;
+    final since = _utcFilter(
+      DateTime.now().toUtc().subtract(Duration(seconds: sec)),
+    );
+    final got = await _sbSelect(
+      'customer_plots',
+      from: 0,
+      to: 199,
+      updatedAfter: since,
+      includeDeleted: false,
+    );
+    if (!got.ok || got.rows.isEmpty) return;
+    final db = await AppDatabase.instance.database;
+    final local = <String>{};
+    try {
+      final rows = await db.rawQuery(
+        "SELECT lower(trim(sync_id)) AS s FROM customer_plots WHERE ifnull(sync_id,'') <> ''",
+      );
+      for (final r in rows) {
+        final s = (r['s'] ?? '').toString();
+        if (s.isNotEmpty) local.add(s);
+      }
+    } catch (_) {}
+    final missing = <Map<String, dynamic>>[];
+    for (final row in got.rows) {
+      final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
+      if (id.isEmpty || local.contains(id)) continue;
+      missing.add(Map<String, dynamic>.from(row));
+    }
+    if (missing.isEmpty) return;
+    final skip = <String>[];
+    await _ensureRecoverParentsForCustomerPlots(missing, skip);
+    if (missing.isNotEmpty) {
+      await _applyFetched(_asApplyRows('customer_plots', missing));
+    }
   }
 
   static Future<String> _lookupSyncId(Database db, String table, Object id) async {
@@ -1762,6 +2299,20 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     }
   }
 
+  static Future<Set<String>> _loadPendingDeleteSyncIds() async {
+    final ids = <String>{};
+    try {
+      final db = await AppDatabase.instance.database;
+      final rows = await db.query('sync_pending_delete', columns: ['sync_id']);
+      for (final r in rows) {
+        final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+        if (id.isNotEmpty) ids.add(id);
+      }
+    } catch (_) {}
+    return ids;
+  }
+
+  /// Insert-missing only (no wipe). Allocate rows: parent-ensure pehle (Force Recover jaisa).
   static Future<void> _catchUpMissing() async {
     try {
       final db = await AppDatabase.instance.database;
@@ -1772,10 +2323,12 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
             "lower(table_name) IN ('partner_money','receipts','customer_plots')",
       );
     } catch (_) {}
+    final pendingDel = await _loadPendingDeleteSyncIds();
     for (final table in _tables) {
       final cloud = _cloudTable(table);
+      final isAlloc = table == 'customer_plots';
       final db = await AppDatabase.instance.database;
-      // Sirf isi table ke sync_id (+ isi table ke alias) — global alias se missing skip na ho
+      // Sirf isi table ke sync_id — global alias se missing skip na ho
       final local = await _localSyncIdsForTable(db, table);
       for (var page = 0; page < 60; page++) {
         final from = page * 1000;
@@ -1790,7 +2343,9 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         final missing = <String>[];
         for (final row in got.rows) {
           final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
-          if (id.isNotEmpty && !local.contains(id)) missing.add(id);
+          if (id.isEmpty) continue;
+          if (pendingDel.contains(id)) continue; // local delete in-flight
+          if (!local.contains(id)) missing.add(id);
         }
         for (var i = 0; i < missing.length; i += 30) {
           final end = (i + 30 < missing.length) ? i + 30 : missing.length;
@@ -1801,16 +2356,26 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
             to: chunk.length + 5,
             syncIds: chunk,
           );
-          if (fetched.rows.isNotEmpty) {
-            await _applyFetched(
-              _asApplyRows(table, fetched.rows),
-              notify: false,
-              bump: false,
-            );
-            for (final r in fetched.rows) {
-              final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
-              if (id.isNotEmpty) local.add(id);
+          if (fetched.rows.isEmpty) continue;
+          final rows = fetched.rows
+              .map((r) => Map<String, dynamic>.from(r))
+              .toList();
+          if (isAlloc) {
+            final skipList = <String>[];
+            await _ensureRecoverParentsForCustomerPlots(rows, skipList);
+            if (skipList.isNotEmpty) {
+              debugPrint('HubSync catch-up alloc skip: ${skipList.join('; ')}');
             }
+          }
+          if (rows.isEmpty) continue;
+          await _applyFetched(
+            _asApplyRows(table, rows),
+            notify: false,
+            bump: false,
+          );
+          for (final r in rows) {
+            final id = (r['sync_id'] ?? '').toString().trim().toLowerCase();
+            if (id.isNotEmpty) local.add(id);
           }
         }
         if (got.rows.length < 1000) break;
@@ -1840,10 +2405,86 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     return ids;
   }
 
+  static Future<List<Map<String, dynamic>>> _preparePulledRows(
+    String table,
+    List<Map<String, dynamic>> raw,
+  ) async {
+    if (raw.isEmpty) return raw;
+    // Tombstones parent-ensure se filter na hon — delete signal zaya na ho
+    final deleted = <Map<String, dynamic>>[];
+    final live = <Map<String, dynamic>>[];
+    for (final r in raw) {
+      final m = Map<String, dynamic>.from(r);
+      if (_cloudRowIsDeleted(m)) {
+        deleted.add(m);
+      } else {
+        live.add(m);
+      }
+    }
+    if (live.isNotEmpty && table == 'customer_plots') {
+      final skip = <String>[];
+      await _ensureRecoverParentsForCustomerPlots(live, skip);
+    } else if (live.isNotEmpty &&
+        (table == 'receipts' || table == 'ledger')) {
+      final skip = <String>[];
+      await _ensureChildParentsThenFilter(table, live, skip);
+    }
+    return [...deleted, ...live];
+  }
+
+  /// Receipt/ledger: pehle parent allocate (+ uske parents), phir filter.
+  static Future<void> _ensureChildParentsThenFilter(
+    String table,
+    List<Map<String, dynamic>> rows,
+    List<String> skipList,
+  ) async {
+    final need = <String>{};
+    for (final row in rows) {
+      final cp = (row['customer_plot_sync_id'] ?? '').toString().trim();
+      if (cp.isNotEmpty) need.add(cp);
+    }
+    if (need.isNotEmpty) {
+      final got = await _sbSelect(
+        'customer_plots',
+        from: 0,
+        to: need.length + 10,
+        syncIds: need.toList(),
+        includeDeleted: true,
+      );
+      final allocs = got.rows
+          .map((r) => Map<String, dynamic>.from(r))
+          .toList();
+      for (final a in allocs) {
+        // Soft-deleted allocate: child apply se pehle parent resolve ke liye live treat
+        a['is_deleted'] = false;
+      }
+      if (allocs.isNotEmpty) {
+        await _ensureRecoverParentsForCustomerPlots(allocs, skipList);
+        if (allocs.isNotEmpty) {
+          await _applyFetched(
+            _asApplyRows('customer_plots', allocs),
+            notify: false,
+            bump: false,
+          );
+        }
+      }
+    }
+    await _filterRecoverChildrenToExistingAllocs(table, rows, skipList);
+  }
+
+  /// last_pull `gt` ke liye — fail row dubara aaye (entries miss band).
+  static String _justBeforeUtc(String iso) {
+    final dt = DateTime.tryParse(iso)?.toUtc();
+    if (dt == null) return iso;
+    return dt.subtract(const Duration(milliseconds: 1)).toIso8601String();
+  }
+
   static Future<void> _pullIncremental() async {
-    var since = await _getState('last_pull_utc');
-    if (since.trim().isEmpty) since = '1970-01-01T00:00:00.000Z';
-    var maxTs = since;
+    var sinceRaw = await _getState('last_pull_utc');
+    if (sinceRaw.trim().isEmpty) sinceRaw = '1970-01-01T00:00:00.000Z';
+    final since = _utcFilterIso(sinceRaw);
+    var maxApplied = since;
+    String? minDropped;
     final bag = <Map<String, dynamic>>[];
     final fetched = await Future.wait(_tables.map((table) async {
       final cloud = _cloudTable(table);
@@ -1865,14 +2506,86 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     }));
     for (final item in fetched) {
       if (item.rows.isEmpty) continue;
-      bag.addAll(_asApplyRows(item.table, item.rows));
+      final rawLiveIds = <String>{};
       for (final row in item.rows) {
-        final ts = (row['updated_at'] ?? '').toString();
-        if (ts.compareTo(maxTs) > 0) maxTs = ts;
+        if (_cloudRowIsDeleted(row)) continue;
+        final id = (row['sync_id'] ?? '').toString().trim();
+        if (id.isNotEmpty) rawLiveIds.add(id);
       }
+      final ready = await _preparePulledRows(item.table, item.rows);
+      final readyIds = <String>{};
+      for (final row in ready) {
+        final id = (row['sync_id'] ?? '').toString().trim();
+        if (id.isNotEmpty) readyIds.add(id);
+        final ts = (row['updated_at'] ?? '').toString();
+        if (ts.compareTo(maxApplied) > 0) maxApplied = ts;
+      }
+      // Parent miss → prepare drop: last_pull aage mat badhao warna allocate forever miss
+      for (final row in item.rows) {
+        if (_cloudRowIsDeleted(row)) continue;
+        final id = (row['sync_id'] ?? '').toString().trim();
+        if (id.isEmpty || readyIds.contains(id)) continue;
+        if (!rawLiveIds.contains(id)) continue;
+        final ts = (row['updated_at'] ?? '').toString();
+        if (ts.isEmpty) continue;
+        if (minDropped == null || ts.compareTo(minDropped!) < 0) {
+          minDropped = ts;
+        }
+      }
+      if (ready.isEmpty) continue;
+      bag.addAll(_asApplyRows(item.table, ready));
     }
     if (bag.isNotEmpty) await _applyFetched(bag);
-    if (maxTs.compareTo(since) > 0) await _setState('last_pull_utc', maxTs);
+    var advance = maxApplied;
+    if (minDropped != null) {
+      final cap = _justBeforeUtc(minDropped!);
+      if (advance.compareTo(cap) > 0) advance = cap;
+    }
+    if (advance.compareTo(since) > 0) await _setState('last_pull_utc', advance);
+  }
+
+  /// Recent window re-apply (incl. deletes). Does NOT advance last_pull —
+  /// heals missed update/delete; same sync_id = update only (no dup/wipe).
+  static Future<void> _pullRecentHeal(int windowSec) async {
+    await _pullRecentHealFor(_tables, windowSec);
+  }
+
+  static Future<void> _pullRecentHealFor(
+    List<String> tables,
+    int windowSec,
+  ) async {
+    final sec = windowSec < 15 ? 15 : windowSec;
+    final since = _utcFilter(
+      DateTime.now().toUtc().subtract(Duration(seconds: sec)),
+    );
+    final bag = <Map<String, dynamic>>[];
+    final fetched = await Future.wait(tables.map((table) async {
+      final cloud = _cloudTable(table);
+      final all = <Map<String, dynamic>>[];
+      for (var page = 0; page < 5; page++) {
+        final from = page * 200;
+        final got = await _sbSelect(
+          cloud,
+          from: from,
+          to: from + 199,
+          updatedAfter: since,
+          includeDeleted: true,
+        );
+        if (!got.ok || got.rows.isEmpty) break;
+        all.addAll(got.rows);
+        if (got.rows.length < 200) break;
+      }
+      return (table: table, rows: all);
+    }));
+    for (final item in fetched) {
+      if (item.rows.isEmpty) continue;
+      final ready = await _preparePulledRows(item.table, item.rows);
+      if (ready.isEmpty) continue;
+      bag.addAll(_asApplyRows(item.table, ready));
+    }
+    if (bag.isNotEmpty) {
+      await _applyFetched(bag);
+    }
   }
 
   static Future<({bool ok, List<Map<String, dynamic>> rows})> _sbSelect(
@@ -1884,13 +2597,17 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     String? updatedAfter,
     List<String>? syncIds,
     bool includeDeleted = false,
+    bool deletedOnly = false,
   }) async {
     try {
       if (!await _ensureSb()) {
         return (ok: false, rows: <Map<String, dynamic>>[]);
       }
       var q = Supabase.instance.client.from(cloud).select(columns);
-      if (!includeDeleted) {
+      // deletedOnly = prune confirm path only; default sync/pull still is_deleted=false
+      if (deletedOnly) {
+        q = q.eq('is_deleted', true);
+      } else if (!includeDeleted) {
         q = q.eq('is_deleted', false);
       }
       if (updatedAfter != null && updatedAfter.isNotEmpty) {
@@ -1935,29 +2652,42 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     return ids;
   }
 
-  /// Hard delete doosre devices: cloud pe nahi + local hash hai → delete.
-  /// Bulk wipe block. Never-pushed skip. Manual sync pe force=true.
-  static DateTime _lastPrune = DateTime.fromMillisecondsSinceEpoch(0);
-
+  /// Prune: sirf cloud-confirmed is_deleted=true. Absence se kabhi local delete nahi.
+  /// Soft-delete cleanup = ApplyRow / ye confirm path. Sync/pull logic alag, untouched.
   static Future<void> _pruneGoneFromCloud({bool force = false}) async {
-    if (!force && DateTime.now().difference(_lastPrune).inSeconds < 30) return;
+    // force=false: max 2s; tick pe force → turant delete sync
+    if (!force && DateTime.now().difference(_lastPrune).inSeconds < 2) return;
     _lastPrune = DateTime.now();
     final pending = <String, List<String>>{};
 
-    // Parallel live-id fetch — fast
-    final liveByTable = <String, Set<String>>{};
+    // Recent tombstones har tick (fast); full scan ~30s (purani deletes)
+    final fullScan =
+        DateTime.now().difference(_lastFullPrune).inSeconds >= 30;
+    if (fullScan) _lastFullPrune = DateTime.now();
+    final since = fullScan
+        ? null
+        : DateTime.now()
+            .toUtc()
+            .subtract(const Duration(minutes: 10))
+            .toIso8601String();
+
+    // Cloud se sirf soft-deleted sync_ids (positive confirm) — live absence ignore
+    final deletedByTable = <String, Set<String>>{};
     await Future.wait(_tables.map((table) async {
       final cloud = _cloudTable(table);
-      final live = <String>{};
+      final deleted = <String>{};
       var failed = false;
-      for (var page = 0; page < 80; page++) {
+      final pageLimit = fullScan ? 80 : 5;
+      for (var page = 0; page < pageLimit; page++) {
         final from = page * 1000;
         final got = await _sbSelect(
           cloud,
           from: from,
           to: from + 999,
           columns: 'sync_id',
-          orderBy: 'sync_id',
+          orderBy: since == null ? 'sync_id' : 'updated_at',
+          updatedAfter: since,
+          deletedOnly: true,
         );
         if (!got.ok) {
           failed = true;
@@ -1965,47 +2695,32 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         }
         if (got.rows.isEmpty) break;
         for (final row in got.rows) {
-          final id = (row['sync_id'] ?? '').toString().trim().toLowerCase();
-          if (id.isNotEmpty) live.add(id);
+          final id = (row['sync_id'] ?? '').toString().trim();
+          if (id.isNotEmpty) deleted.add(id);
         }
         if (got.rows.length < 1000) break;
       }
-      if (!failed) liveByTable[table] = live;
+      if (!failed && deleted.isNotEmpty) deletedByTable[table] = deleted;
     }));
 
     final db = await AppDatabase.instance.database;
     for (final table in _tables.reversed) {
-      final live = liveByTable[table];
-      if (live == null) continue;
-      // Empty / incomplete cloud → local mat mitao (anti-wipe)
-      if (live.isEmpty) continue;
+      final confirmed = deletedByTable[table];
+      if (confirmed == null || confirmed.isEmpty) continue;
       if (!await _tableExists(db, table)) continue;
       if (!await _hasColumn(db, table, 'sync_id')) continue;
-      final local = await db.rawQuery(
-        'SELECT sync_id FROM "$table" WHERE sync_id IS NOT NULL AND TRIM(sync_id)<>\'\'',
-      );
-      final gone = <String>[];
-      for (final r in local) {
-        final sid = (r['sync_id'] ?? '').toString().trim();
-        if (sid.isEmpty) continue;
-        if (live.contains(sid.toLowerCase())) continue;
-        final hash = await _loadHash(db, sid);
-        final known = await _isSyncKnown(db, sid);
-        if (hash.isEmpty && !known) continue;
-        gone.add(sid);
+
+      final localGone = <String>[];
+      for (final sid in confirmed) {
+        final hit = await db.rawQuery(
+          'SELECT 1 AS x FROM "$table" WHERE sync_id = ? LIMIT 1',
+          [sid],
+        );
+        if (hit.isEmpty) continue;
+        localGone.add(sid);
       }
-      if (gone.isEmpty) continue;
-      // Bulk wipe guard: incomplete cloud (110→78) mat mitao.
-      // Intentional delete soft-mark + pull se aata hai.
-      if (gone.length > 20 &&
-          (live.length < 5 || gone.length * 4 > live.length)) {
-        continue;
-      }
-      // Small tables: agar majority "gone" hai to cloud incomplete samjho
-      if (gone.length >= 3 && gone.length * 2 >= local.length) {
-        continue;
-      }
-      pending[table] = gone;
+      if (localGone.isEmpty) continue;
+      pending[table] = localGone;
     }
     if (pending.isEmpty) return;
     await AppDatabase.suspendSyncTriggers(db);
@@ -2167,7 +2882,7 @@ WHERE IFNULL(status,'') = 'Active'
           }
         } catch (_) {}
       }
-      await db.delete(table, where: 'sync_id = ?', whereArgs: [syncId]);
+      await _deleteLocalBySync(db, table, syncId);
       await db.delete('sync_known', where: 'sync_id = ?', whereArgs: [syncId]);
       await db.delete('sync_hash', where: 'sync_id = ?', whereArgs: [syncId]);
       if (notify) _noteRemote(row, 'delete', table);
@@ -2190,11 +2905,9 @@ WHERE IFNULL(status,'') = 'Active'
     }
 
     final pk = _pk(table);
-    // Partner Cash / Receipt / Allocate: alias se merge mat karo — warna union wipe
+    // Same sync_id ya purana alias → wahi row update. Content-merge se doosri entry mat chhedo.
     final unionSafe = _skipContentDupMerge(table);
-    int? existingBySync = unionSafe
-        ? await _localIdBySyncExact(db, table, syncId)
-        : await _localIdBySync(db, table, syncId);
+    int? existingBySync = await _localIdBySync(db, table, syncId);
     int? existing = existingBySync;
     if (promptDup && existing == null) {
       final other = (row['staff_name'] ?? '').toString();
@@ -2707,7 +3420,8 @@ WHERE IFNULL(status,'') = 'Active'
           lk == 'deal_id' ||
           lk == 'credit_id' ||
           lk == 'userid' ||
-          lk == 'sync_id') {
+          lk == 'sync_id' ||
+          k.startsWith('__fk_')) {
         continue;
       }
       buf.write('$k=${payload[k]}|');
@@ -2771,8 +3485,47 @@ WHERE IFNULL(status,'') = 'Active'
 
   static bool _skipContentDupMerge(String table) {
     final t = table.toLowerCase();
-    // Partner Cash / Receipt / Allocate: har sync_id alag row (union merge)
-    return t == 'partner_money' || t == 'receipts' || t == 'customer_plots';
+    // In tables pe naam/plot match se merge nahi — warna update/delete galat row pe, ya duplicate.
+    return t == 'partner_money' ||
+        t == 'receipts' ||
+        t == 'customer_plots' ||
+        t == 'customers' ||
+        t == 'plots' ||
+        t == 'ledger';
+  }
+
+  /// sync_id wali row + alias wali visible row. Doosri entries nahi.
+  static Future<void> _deleteLocalBySync(
+    DatabaseExecutor db,
+    String table,
+    String syncId,
+  ) async {
+    final pk = _pk(table);
+    final ids = <int>{};
+    final exact = await _localIdBySyncExact(db, table, syncId);
+    if (exact != null) ids.add(exact);
+    try {
+      final alias = await db.query(
+        'sync_alias',
+        columns: ['local_pk'],
+        where: 'sync_id = ? AND lower(table_name) = lower(?)',
+        whereArgs: [syncId, table],
+      );
+      for (final a in alias) {
+        final id = int.tryParse((a['local_pk'] ?? '').toString());
+        if (id != null && id > 0) ids.add(id);
+      }
+    } catch (_) {}
+    for (final id in ids) {
+      await db.delete(table, where: '"$pk" = ?', whereArgs: [id]);
+    }
+    try {
+      await db.delete(
+        'sync_alias',
+        where: 'sync_id = ? AND lower(table_name) = lower(?)',
+        whereArgs: [syncId, table],
+      );
+    } catch (_) {}
   }
 
   static Future<int?> _findDupPk(

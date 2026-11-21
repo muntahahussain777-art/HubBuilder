@@ -185,10 +185,11 @@ JOIN blocks b ON b.id = p.block_id
 JOIN societies s ON s.id = p.society_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
 WHERE IFNULL(cp.status,'') <> 'Cancelled'
+  AND (? = 0 OR p.society_id = ?)
   AND (? = '' OR c.name LIKE ? COLLATE NOCASE
   OR pt.code LIKE ? COLLATE NOCASE OR p.plot_no LIKE ? COLLATE NOCASE)
 ORDER BY cp.booking_date, cp.id''',
-          [kw, kwLike, kwLike, kwLike],
+          [societyId, societyId, kw, kwLike, kwLike, kwLike],
         );
         return ReportResult(
           lines: rows
@@ -224,8 +225,10 @@ WITH bal AS (
               ELSE COALESCE(cp.price,0)-COALESCE(rc.total_receipts,0)
          END AS due_amount
   FROM customer_plots cp
+  JOIN plots p ON p.id = cp.plot_id
   LEFT JOIN bill ON bill.customer_plot_id=cp.id
   LEFT JOIN rc   ON rc.customer_plot_id=cp.id
+  WHERE (? = 0 OR p.society_id = ?)
 )
 SELECT c.id AS customer_id, c.name, c.mobile, c.cnic,
        SUM(bal.billed_debit) AS billed_total,
@@ -236,7 +239,7 @@ LEFT JOIN bal ON bal.customer_id=c.id
 WHERE (? = 0 OR c.id = ?)
 GROUP BY c.id
 ORDER BY c.name''',
-          [customerId, customerId],
+          [societyId, societyId, customerId, customerId],
         );
         return ReportResult(
           lines: rows
@@ -261,9 +264,10 @@ FROM receipts r
 LEFT JOIN customer_plots cp ON cp.id = r.customer_plot_id
 LEFT JOIN customers c ON c.id = cp.customer_id
 LEFT JOIN plots p ON p.id = cp.plot_id
-WHERE (? = '' OR c.name LIKE ? COLLATE NOCASE OR p.plot_no LIKE ? COLLATE NOCASE)
+WHERE (? = 0 OR p.society_id = ?)
+  AND (? = '' OR c.name LIKE ? COLLATE NOCASE OR p.plot_no LIKE ? COLLATE NOCASE)
 ORDER BY r.receipt_date, r.id''',
-          [kw, kwLike, kwLike],
+          [societyId, societyId, kw, kwLike, kwLike],
         );
         return ReportResult(
           lines: rows
@@ -279,7 +283,8 @@ ORDER BY r.receipt_date, r.id''',
         );
 
       case ReportKind.dues:
-        final rows = await db.rawQuery('''
+        final rows = await db.rawQuery(
+          '''
 WITH bill AS (
   SELECT customer_plot_id,
          SUM(CASE WHEN txn_type IN ('Booking','InstallmentDue','Surcharge')
@@ -299,9 +304,13 @@ SELECT c.name AS customer_name, cp.booking_date, cp.price,
   END AS due_amount
 FROM customer_plots cp
 JOIN customers c ON c.id = cp.customer_id
+JOIN plots p ON p.id = cp.plot_id
 LEFT JOIN bill ON bill.customer_plot_id = cp.id
 LEFT JOIN rc ON rc.customer_plot_id = cp.id
-ORDER BY cp.booking_date, cp.id''');
+WHERE (? = 0 OR p.society_id = ?)
+ORDER BY cp.booking_date, cp.id''',
+          [societyId, societyId],
+        );
         return ReportResult(
           lines: rows
               .map(
@@ -351,6 +360,7 @@ base AS (
     CASE WHEN p.plot_no IS NOT NULL AND p.plot_no <> ''
       THEN c.name || '/' || p.plot_no ELSE c.name END AS customer_name,
     p.plot_no, pt.code AS plot_type_code,
+    COALESCE(p.society_id, 0) AS plot_society_id,
     CASE
       WHEN q.due_amount <= 0 THEN 'Current'
       WHEN (julianday(?) - julianday(q.oldest_unpaid_date)) <= 30 THEN '0-30'
@@ -364,7 +374,8 @@ base AS (
   LEFT JOIN plot_types pt ON pt.id = p.plot_type_id
 )
 SELECT * FROM base
-WHERE (? = '' OR customer_name LIKE ? COLLATE NOCASE
+WHERE (? = 0 OR plot_society_id = ?)
+  AND (? = '' OR customer_name LIKE ? COLLATE NOCASE
   OR plot_no LIKE ? COLLATE NOCASE OR plot_type_code LIKE ? COLLATE NOCASE)
 ORDER BY aging_bucket DESC, due_amount DESC, customer_name''',
           [
@@ -374,6 +385,8 @@ ORDER BY aging_bucket DESC, due_amount DESC, customer_name''',
             asOfStr,
             asOfStr,
             asOfStr,
+            societyId,
+            societyId,
             kw,
             kwLike,
             kwLike,
@@ -397,10 +410,13 @@ ORDER BY aging_bucket DESC, due_amount DESC, customer_name''',
           '''
 SELECT strftime('%Y-%m', r.receipt_date) AS yyyymm, SUM(r.amount) AS total_amount
 FROM receipts r
+LEFT JOIN customer_plots cp ON cp.id = r.customer_plot_id
+LEFT JOIN plots p ON p.id = cp.plot_id
 WHERE (? IS NULL OR strftime('%Y', r.receipt_date) = ?)
+  AND (? = 0 OR p.society_id = ?)
 GROUP BY strftime('%Y-%m', r.receipt_date)
 ORDER BY yyyymm''',
-          [year, year],
+          [year, year, societyId, societyId],
         );
         return ReportResult(
           lines: rows
@@ -425,10 +441,12 @@ SELECT DATE(r.receipt_date) AS receipt_date, c.name AS customer_name,
 FROM receipts r
 LEFT JOIN customer_plots cp ON cp.id = r.customer_plot_id
 LEFT JOIN customers c ON c.id = cp.customer_id
-WHERE (? = '' OR c.name LIKE ? COLLATE NOCASE)
+LEFT JOIN plots p ON p.id = cp.plot_id
+WHERE (? = 0 OR p.society_id = ?)
+  AND (? = '' OR c.name LIKE ? COLLATE NOCASE)
 GROUP BY DATE(r.receipt_date), c.name
 ORDER BY DATE(r.receipt_date), c.name''',
-          [kw, kwLike],
+          [societyId, societyId, kw, kwLike],
         );
         return ReportResult(
           lines: rows
@@ -444,7 +462,8 @@ ORDER BY DATE(r.receipt_date), c.name''',
         );
 
       case ReportKind.inventoryStatus:
-        final rows = await db.rawQuery('''
+        final rows = await db.rawQuery(
+          '''
 SELECT s.name AS society, b.name AS block, pt.code AS plot_type,
   SUM(CASE WHEN p.status='Available' THEN 1 ELSE 0 END) AS available,
   SUM(CASE WHEN p.status='Hold' THEN 1 ELSE 0 END) AS hold,
@@ -453,8 +472,11 @@ FROM plots p
 JOIN blocks b ON b.id = p.block_id
 JOIN societies s ON s.id = p.society_id
 JOIN plot_types pt ON pt.id = p.plot_type_id
+WHERE (? = 0 OR p.society_id = ?)
 GROUP BY s.name, b.name, pt.code
-ORDER BY s.name, b.name, pt.code''');
+ORDER BY s.name, b.name, pt.code''',
+          [societyId, societyId],
+        );
         return ReportResult(
           lines: rows
               .map(
@@ -494,16 +516,21 @@ WITH ex AS (
 rc AS (
   SELECT SUM(COALESCE(r.amount,0)) AS cash_in
   FROM receipts r
+  LEFT JOIN customer_plots cp ON cp.id = r.customer_plot_id
+  LEFT JOIN plots p ON p.id = cp.plot_id
   WHERE (? IS NULL OR r.mode = ?)
     AND (? IS NULL OR DATE(r.receipt_date) >= DATE(?))
     AND (? IS NULL OR DATE(r.receipt_date) < DATE(?, '+1 day'))
+    AND (? = 0 OR p.society_id = ?)
 ),
 bc AS (
   SELECT SUM(COALESCE(cp.broker_commission,0)) AS broker_sum
   FROM customer_plots cp
+  JOIN plots p ON p.id = cp.plot_id
   WHERE IFNULL(cp.status,'Active') = 'Active'
     AND (? IS NULL OR DATE(cp.booking_date) >= DATE(?))
     AND (? IS NULL OR DATE(cp.booking_date) < DATE(?, '+1 day'))
+    AND (? = 0 OR p.society_id = ?)
 )
 SELECT
   ROUND(COALESCE(rc.cash_in,0), 2) AS revenue_cash,
@@ -514,7 +541,26 @@ SELECT
   ROUND((COALESCE(rc.cash_in,0) - COALESCE(ex.cogs_sum,0))
         - (COALESCE(ex.opex_sum,0) + COALESCE(bc.broker_sum,0)), 2) AS net_profit_cash
 FROM ex CROSS JOIN rc CROSS JOIN bc''',
-          [df, df, dt, dt, mode, mode, df, df, dt, dt, df, df, dt, dt],
+          [
+            df,
+            df,
+            dt,
+            dt,
+            mode,
+            mode,
+            df,
+            df,
+            dt,
+            dt,
+            societyId,
+            societyId,
+            df,
+            df,
+            dt,
+            dt,
+            societyId,
+            societyId,
+          ],
         );
         final r = rows.isEmpty ? <String, Object?>{} : rows.first;
         return ReportResult(
@@ -566,10 +612,11 @@ JOIN plots p ON p.id = cp.plot_id
 JOIN societies s ON s.id = p.society_id
 WHERE (? IS NULL OR DATE(r.receipt_date) >= DATE(?))
   AND (? IS NULL OR DATE(r.receipt_date) < DATE(?, '+1 day'))
+  AND (? = 0 OR p.society_id = ?)
   AND (? = '' OR r.ref_no LIKE ? COLLATE NOCASE OR c.name LIKE ? COLLATE NOCASE
        OR s.name LIKE ? COLLATE NOCASE OR p.plot_no LIKE ? COLLATE NOCASE)
 ORDER BY r.receipt_date DESC, r.id DESC''',
-          [df, df, dt, dt, kw, kwLike, kwLike, kwLike, kwLike],
+          [df, df, dt, dt, societyId, societyId, kw, kwLike, kwLike, kwLike, kwLike],
         );
         return ReportResult(
           lines: rows

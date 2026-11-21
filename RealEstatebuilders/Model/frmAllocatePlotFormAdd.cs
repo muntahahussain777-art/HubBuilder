@@ -327,9 +327,9 @@ namespace HubBuilders.Model
                     int ins;
                     using (var cmd = new SQLiteCommand(
                         @"INSERT INTO customer_plots
-                    (customer_id, plot_id, price, booking_date, notes, status, broker_id, broker_commission, deal_type, monthly_installment)
+                    (customer_id, plot_id, price, booking_date, notes, status, broker_id, broker_commission, deal_type, monthly_installment, sync_id)
                   VALUES
-                    (@cid, @pid, @price, @bdate, @notes, 'Active', @brokerId, @brokerComm, @dealType, @monthly);",
+                    (@cid, @pid, @price, @bdate, @notes, 'Active', @brokerId, @brokerComm, @dealType, @monthly, lower(hex(randomblob(16))));",
                         MainClass.con, tx))
                     {
                         cmd.Parameters.AddWithValue("@cid", custId);
@@ -366,7 +366,18 @@ namespace HubBuilders.Model
                     tx.Commit();
                     tx = null;
 
-                    try { HubSyncService.NotifyLocalWrite(); } catch { }
+                    // MainClass.SQL bypass — PushOneNow warna sync_id null / cloud miss
+                    try
+                    {
+                        // Plot pehle cloud — warna allocate upsert/FK fail, mobile miss
+                        var syncRows = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, long>>();
+                        if (plotId > 0)
+                            syncRows.Add(new System.Collections.Generic.KeyValuePair<string, long>("plots", plotId));
+                        if (newCpId > 0)
+                            syncRows.Add(new System.Collections.Generic.KeyValuePair<string, long>("customer_plots", newCpId));
+                        HubSyncService.NotifyLocalWrites(syncRows);
+                    }
+                    catch { try { HubSyncService.NotifyLocalWrite(); } catch { } }
 
                     try
                     {

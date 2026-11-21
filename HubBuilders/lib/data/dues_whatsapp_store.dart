@@ -2,6 +2,7 @@ import 'package:intl/intl.dart';
 
 import '../db/app_database.dart';
 import 'block_monthly_store.dart';
+import 'installment_cover.dart';
 import 'plot_inventory_store.dart';
 
 class DuesWhatsAppRow {
@@ -153,7 +154,7 @@ ORDER BY s.name, c.name, p.plot_no''',
 
       final paidRows = await db.rawQuery(
         '''
-SELECT receipt_date, amount
+SELECT receipt_date, amount, notes
 FROM receipts
 WHERE customer_plot_id = ? AND amount > 0 AND receipt_date IS NOT NULL
   AND TRIM(receipt_date) <> ''
@@ -166,7 +167,13 @@ WHERE customer_plot_id = ? AND amount > 0 AND receipt_date IS NOT NULL
       final paidMonths = <String>{};
       final paidDates = <DateTime>[];
       var installmentPaid = 0.0;
+      var hasInstallmentCover = false;
       for (final x in paidRows) {
+        final coverKeys = InstallmentCover.parseKeys(x['notes'] as String?);
+        if (coverKeys.isNotEmpty) {
+          hasInstallmentCover = true;
+          paidMonths.addAll(coverKeys);
+        }
         final raw = (x['receipt_date'] ?? '').toString().trim();
         DateTime? d;
         if (raw.length >= 10) {
@@ -181,7 +188,9 @@ WHERE customer_plot_id = ? AND amount > 0 AND receipt_date IS NOT NULL
         paidMonths.add(
           '${day.year.toString().padLeft(4, '0')}-${day.month.toString().padLeft(2, '0')}',
         );
-        installmentPaid += (x['amount'] as num?)?.toDouble() ?? 0;
+        if (coverKeys.isEmpty) {
+          installmentPaid += (x['amount'] as num?)?.toDouble() ?? 0;
+        }
       }
 
       var monthly = (r['monthly_installment'] as num?)?.toDouble() ?? 0;
@@ -197,12 +206,15 @@ WHERE customer_plot_id = ? AND amount > 0 AND receipt_date IS NOT NULL
         installmentPaid,
         paidDates.length,
       );
-      final cycles = _missed30DayCycles(
+      var cycles = _missed30DayCycles(
         bookingDay,
         asOfDate,
         paidDates,
         missed.clearedKeys,
       );
+      if (hasInstallmentCover && missed.count == 0) {
+        cycles = (csv: 'None', count: 0);
+      }
       // Dues clear / sab months+cycles paid → hide
       if (missed.count == 0 && cycles.count == 0) continue;
       if (missed.count < minMissedMonths && cycles.count < minMissedMonths) {

@@ -55,3 +55,10 @@ Thumbs.db
 **/key.properties
 **/*.jks
 **/*.keystore
+
+# Secrets
+**/supabase_config.json
+**/.env
+**/.env.*
+*.apk
+

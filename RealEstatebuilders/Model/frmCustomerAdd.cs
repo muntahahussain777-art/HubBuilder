@@ -62,8 +62,8 @@ namespace HubBuilders.Model
             if (id == 0)
             {
                 // INSERT (snake_case columns)
-                qry = @"INSERT INTO customers (name, father_name, mobile, cnic, notes, created_at)
-                        VALUES (@name, @father_name, @mobile, @cnic, @notes, @created_at)";
+                qry = @"INSERT INTO customers (name, father_name, mobile, cnic, notes, created_at, sync_id)
+                        VALUES (@name, @father_name, @mobile, @cnic, @notes, @created_at, lower(hex(randomblob(16))))";
             }
             else
             {

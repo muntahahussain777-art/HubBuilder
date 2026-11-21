@@ -297,41 +297,71 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
           ReportKind.ownerPartner,
           'Owner Reports 1',
         ),
-      HubRoute.rptAllocationList =>
-        _rpt(ReportKind.allocationList, 'Customer Plot Booking'),
+      HubRoute.rptAllocationList => _rpt(
+          ReportKind.allocationList,
+          'Customer Plot Booking',
+          society: true,
+        ),
       HubRoute.rptCustomerTotals => _rpt(
           ReportKind.customerTotals,
           'Customer Totals Roll-Up',
           customer: true,
+          society: true,
         ),
-      HubRoute.rptReceiptsDetail =>
-        _rpt(ReportKind.receiptsDetail, 'Receipts Detail'),
-      HubRoute.rptDues => _rpt(ReportKind.dues, 'Dues'),
-      HubRoute.rptAging => _rpt(ReportKind.aging, 'Aging Reports', asOf: true),
-      HubRoute.rptMonthly =>
-        _rpt(ReportKind.monthlyWise, 'MonthlyWise Report', year: true),
-      HubRoute.rptDaily => _rpt(ReportKind.dailyWise, 'Dailywise Report'),
-      HubRoute.rptInventory =>
-        _rpt(ReportKind.inventoryStatus, 'Inventory Status'),
+      HubRoute.rptReceiptsDetail => _rpt(
+          ReportKind.receiptsDetail,
+          'Receipts Detail',
+          society: true,
+        ),
+      HubRoute.rptDues =>
+          _rpt(ReportKind.dues, 'Dues', society: true),
+      HubRoute.rptAging => _rpt(
+          ReportKind.aging,
+          'Aging Reports',
+          asOf: true,
+          society: true,
+        ),
+      HubRoute.rptMonthly => _rpt(
+          ReportKind.monthlyWise,
+          'MonthlyWise Report',
+          year: true,
+          society: true,
+        ),
+      HubRoute.rptDaily => _rpt(
+          ReportKind.dailyWise,
+          'Dailywise Report',
+          society: true,
+        ),
+      HubRoute.rptInventory => _rpt(
+          ReportKind.inventoryStatus,
+          'Inventory Status',
+          society: true,
+        ),
       HubRoute.rptProfitLoss => _rpt(
           ReportKind.profitLoss,
           'Profit & Lost',
           dates: true,
           mode: true,
+          society: true,
         ),
       HubRoute.rptProfitCogs => _rpt(
           ReportKind.profitCogs,
           'Profit – Cash Basis COGS',
           dates: true,
           mode: true,
+          society: true,
         ),
       HubRoute.rptSeparateCustomer => _rpt(
           ReportKind.separateCustomer,
           'Separate Customer Report',
           dates: true,
+          society: true,
         ),
-      HubRoute.rptCustomerSenior =>
-        _rpt(ReportKind.customerSenior, 'Customer DIssnior'),
+      HubRoute.rptCustomerSenior => _rpt(
+          ReportKind.customerSenior,
+          'Customer DIssnior',
+          society: true,
+        ),
       HubRoute.rptBrokerDetails => _rpt(
           ReportKind.brokerDetails,
           'Broker Details',
@@ -344,6 +374,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
           'Customer Receipt Statement (VIP)',
           dates: true,
           customerPlot: true,
+          society: true,
         ),
       HubRoute.rptVipDuesTracker => _rpt(
           ReportKind.vipCompleteDuesTracker,
@@ -364,8 +395,12 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
           society: true,
           broker: true,
         ),
-      HubRoute.rptVipDuesAging =>
-        _rpt(ReportKind.vipDuesAging, 'Dues Aging (VIP)', asOf: true),
+      HubRoute.rptVipDuesAging => _rpt(
+          ReportKind.vipDuesAging,
+          'Dues Aging (VIP)',
+          asOf: true,
+          society: true,
+        ),
       HubRoute.rptTemporaryAllotment => TemporaryAllotmentScreen(
           blankOverlay: false,
           onBack: () => go(HubRoute.reports),
@@ -392,6 +427,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
           ReportKind.receiptsMinusPartnerCredit,
           'Receipts − Partner Credit',
           dates: true,
+          society: true,
         ),
       HubRoute.rptAvailablePlots => _rpt(
           ReportKind.availablePlots,
@@ -440,6 +476,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
           ReportKind.expenseReport,
           'Expense Report',
           dates: true,
+          society: true,
         ),
     };
   }
@@ -633,79 +670,6 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
     _refreshLists();
   }
 
-  Future<void> _runManualSync({required bool pull}) async {
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      const SnackBar(
-        content: Text('Syncing…'),
-        duration: Duration(seconds: 2),
-      ),
-    );
-    // WinForms Sync Now jaisa: Sync ya Pull — dono full sync (pull+push+delete)
-    final ok = await HubSync.syncNow();
-    if (!mounted) return;
-    _refreshLists();
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(
-          ok
-              ? 'Sync complete — entries + deletes updated'
-              : 'Sync busy/fail — thodi der baad dobara try',
-        ),
-        duration: const Duration(seconds: 3),
-      ),
-    );
-  }
-
-  Future<void> _runForceRecover() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Force Recover from Cloud'),
-        content: const Text(
-          'Cloud se missing allocate rows wapas (same sync_id skip). '
-          'Local extras wipe nahi. Intentionally deleted resurrect nahi.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Recover'),
-          ),
-        ],
-      ),
-    );
-    if (confirm != true || !mounted) return;
-
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      const SnackBar(
-        content: Text('Force recovering from cloud…'),
-        duration: Duration(seconds: 4),
-      ),
-    );
-    final result = await HubSync.forceRecoverFromCloud();
-    if (!mounted) return;
-    _refreshLists();
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(
-          result.ok
-              ? result.summary
-              : 'Recover fail — ${result.summary}',
-        ),
-        duration: const Duration(seconds: 5),
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return AtmosphereBackground(
@@ -715,23 +679,6 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
         appBar: AppBar(
           title: Text(_title),
           actions: [
-            IconButton(
-              tooltip: 'Pull / Sync Now',
-              icon: const Icon(Icons.cloud_download_outlined),
-              onPressed: () => _runManualSync(pull: true),
-            ),
-            IconButton(
-              tooltip: 'Sync Now (pull + push + delete)',
-              icon: const Icon(Icons.sync),
-              onPressed: () => _runManualSync(pull: false),
-            ),
-            IconButton(
-              tooltip:
-                  'Force Recover — missing allocate sync_id INSERT only (duplicates skip)',
-              icon: const Icon(Icons.cloud_sync_outlined),
-              color: const Color(0xFFE8A838),
-              onPressed: _runForceRecover,
-            ),
             PopupMenuButton<String>(
               tooltip: 'File',
               icon: const Icon(Icons.folder_open_outlined),

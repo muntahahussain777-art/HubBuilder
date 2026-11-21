@@ -208,6 +208,7 @@
     <Compile Include="HubWhatsAppPdfHelper.cs" />
     <Compile Include="StaffAccess.cs" />
     <Compile Include="BlockMonthlyInstallmentStore.cs" />
+    <Compile Include="InstallmentCoverHelper.cs" />
     <Compile Include="View\frmBlockMonthlyInstallment.cs" />
     <Compile Include="View\frmStaffRolePermissions.cs">
       <SubType>Form</SubType>
@@ -400,6 +401,7 @@
       <DependentUpon>frmTemporaryAllotmentLetterBlank.cs</DependentUpon>
     </Compile>
     <Compile Include="Report Form\LasbelaReceiptToCustomerReceipt.cs" />
+    <Compile Include="Report Form\LasbelaLocalReceiptArchive.cs" />
     <Compile Include="Report Form\frmLasbelaVillageReceipt.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -464,6 +466,15 @@
       <SubType>Form</SubType>
     </Compile>
     <Compile Include="Report Form\frmRoughInstallmentEstimate.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipAllocateReceiptBalance.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipBrokerPartnerCollection.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Report Form\frmVipCustomerAdvanceReceipt.cs">
       <SubType>Form</SubType>
     </Compile>
     <Compile Include="Report Form\frmAvailablePlotsReport.cs">
@@ -931,6 +942,12 @@
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </EmbeddedResource>
     <EmbeddedResource Include="Reports\VipBrokerDetails.rdlc">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Reports\VipBrokerPartnerCollection.rdlc">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Reports\VipCustomerAdvanceReceipt.rdlc">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </EmbeddedResource>
     <EmbeddedResource Include="Reports\VipPartnerCashBook.rdlc">

@@ -40,13 +40,40 @@ namespace HubBuilders.View
             this.dgvDescription = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvDebit = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvCredit = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.lblFromDate = new System.Windows.Forms.Label();
+            this.fromdate = new Guna.UI2.WinForms.Guna2DateTimePicker();
+            this.lblToDate = new System.Windows.Forms.Label();
+            this.todate = new Guna.UI2.WinForms.Guna2DateTimePicker();
+            this.btnLoadDates = new Guna.UI2.WinForms.Guna2Button();
+            this.lblTotalReceiptAmount = new System.Windows.Forms.Label();
+            this.lblTotalAdvance = new System.Windows.Forms.Label();
+            this.lblReceiptCount = new System.Windows.Forms.Label();
             this.panel1.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)(this.guna2DataGridView1)).BeginInit();
             this.SuspendLayout();
             // 
             // panel1
             // 
-            this.panel1.Size = new System.Drawing.Size(982, 87);
+            this.panel1.Controls.Add(this.lblReceiptCount);
+            this.panel1.Controls.Add(this.lblTotalAdvance);
+            this.panel1.Controls.Add(this.lblTotalReceiptAmount);
+            this.panel1.Controls.Add(this.btnLoadDates);
+            this.panel1.Controls.Add(this.todate);
+            this.panel1.Controls.Add(this.lblToDate);
+            this.panel1.Controls.Add(this.fromdate);
+            this.panel1.Controls.Add(this.lblFromDate);
+            this.panel1.Size = new System.Drawing.Size(982, 118);
+            this.panel1.Controls.SetChildIndex(this.label1, 0);
+            this.panel1.Controls.SetChildIndex(this.txtSearch, 0);
+            this.panel1.Controls.SetChildIndex(this.btnAdd, 0);
+            this.panel1.Controls.SetChildIndex(this.lblFromDate, 0);
+            this.panel1.Controls.SetChildIndex(this.fromdate, 0);
+            this.panel1.Controls.SetChildIndex(this.lblToDate, 0);
+            this.panel1.Controls.SetChildIndex(this.todate, 0);
+            this.panel1.Controls.SetChildIndex(this.btnLoadDates, 0);
+            this.panel1.Controls.SetChildIndex(this.lblTotalReceiptAmount, 0);
+            this.panel1.Controls.SetChildIndex(this.lblTotalAdvance, 0);
+            this.panel1.Controls.SetChildIndex(this.lblReceiptCount, 0);
             // 
             // btnAdd
             // 
@@ -75,6 +102,126 @@ namespace HubBuilders.View
             this.txtSearch.HoverState.Parent = this.txtSearch;
             this.txtSearch.ShadowDecoration.Parent = this.txtSearch;
             this.txtSearch.TextChanged += new System.EventHandler(this.txtSearch_TextChanged);
+            // 
+            // lblFromDate
+            // 
+            this.lblFromDate.AutoSize = true;
+            this.lblFromDate.Font = new System.Drawing.Font("Segoe UI Semibold", 9.75F, System.Drawing.FontStyle.Bold);
+            this.lblFromDate.ForeColor = System.Drawing.Color.White;
+            this.lblFromDate.Location = new System.Drawing.Point(250, 14);
+            this.lblFromDate.Name = "lblFromDate";
+            this.lblFromDate.Size = new System.Drawing.Size(40, 17);
+            this.lblFromDate.TabIndex = 20;
+            this.lblFromDate.Text = "From";
+            // 
+            // fromdate
+            // 
+            this.fromdate.AutoRoundedCorners = true;
+            this.fromdate.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(37)))), ((int)(((byte)(41)))), ((int)(((byte)(74)))));
+            this.fromdate.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(112)))), ((int)(((byte)(51)))), ((int)(((byte)(255)))));
+            this.fromdate.BorderRadius = 14;
+            this.fromdate.BorderThickness = 1;
+            this.fromdate.CheckedState.Parent = this.fromdate;
+            this.fromdate.FillColor = System.Drawing.Color.FromArgb(((int)(((byte)(37)))), ((int)(((byte)(41)))), ((int)(((byte)(74)))));
+            this.fromdate.Font = new System.Drawing.Font("Segoe UI Semibold", 9F, System.Drawing.FontStyle.Bold);
+            this.fromdate.ForeColor = System.Drawing.Color.White;
+            this.fromdate.Format = System.Windows.Forms.DateTimePickerFormat.Short;
+            this.fromdate.HoverState.Parent = this.fromdate;
+            this.fromdate.Location = new System.Drawing.Point(294, 10);
+            this.fromdate.MaxDate = new System.DateTime(9998, 12, 31, 0, 0, 0, 0);
+            this.fromdate.MinDate = new System.DateTime(1753, 1, 1, 0, 0, 0, 0);
+            this.fromdate.Name = "fromdate";
+            this.fromdate.ShadowDecoration.Parent = this.fromdate;
+            this.fromdate.Size = new System.Drawing.Size(130, 28);
+            this.fromdate.TabIndex = 21;
+            this.fromdate.Value = new System.DateTime(2026, 1, 1, 0, 0, 0, 0);
+            this.fromdate.ValueChanged += new System.EventHandler(this.fromdate_ValueChanged);
+            // 
+            // lblToDate
+            // 
+            this.lblToDate.AutoSize = true;
+            this.lblToDate.Font = new System.Drawing.Font("Segoe UI Semibold", 9.75F, System.Drawing.FontStyle.Bold);
+            this.lblToDate.ForeColor = System.Drawing.Color.White;
+            this.lblToDate.Location = new System.Drawing.Point(432, 14);
+            this.lblToDate.Name = "lblToDate";
+            this.lblToDate.Size = new System.Drawing.Size(23, 17);
+            this.lblToDate.TabIndex = 22;
+            this.lblToDate.Text = "To";
+            // 
+            // todate
+            // 
+            this.todate.AutoRoundedCorners = true;
+            this.todate.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(37)))), ((int)(((byte)(41)))), ((int)(((byte)(74)))));
+            this.todate.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(112)))), ((int)(((byte)(51)))), ((int)(((byte)(255)))));
+            this.todate.BorderRadius = 14;
+            this.todate.BorderThickness = 1;
+            this.todate.CheckedState.Parent = this.todate;
+            this.todate.FillColor = System.Drawing.Color.FromArgb(((int)(((byte)(37)))), ((int)(((byte)(41)))), ((int)(((byte)(74)))));
+            this.todate.Font = new System.Drawing.Font("Segoe UI Semibold", 9F, System.Drawing.FontStyle.Bold);
+            this.todate.ForeColor = System.Drawing.Color.White;
+            this.todate.Format = System.Windows.Forms.DateTimePickerFormat.Short;
+            this.todate.HoverState.Parent = this.todate;
+            this.todate.Location = new System.Drawing.Point(460, 10);
+            this.todate.MaxDate = new System.DateTime(9998, 12, 31, 0, 0, 0, 0);
+            this.todate.MinDate = new System.DateTime(1753, 1, 1, 0, 0, 0, 0);
+            this.todate.Name = "todate";
+            this.todate.ShadowDecoration.Parent = this.todate;
+            this.todate.Size = new System.Drawing.Size(130, 28);
+            this.todate.TabIndex = 23;
+            this.todate.Value = new System.DateTime(2026, 1, 1, 0, 0, 0, 0);
+            this.todate.ValueChanged += new System.EventHandler(this.todate_ValueChanged);
+            // 
+            // btnLoadDates
+            // 
+            this.btnLoadDates.Animated = true;
+            this.btnLoadDates.AutoRoundedCorners = true;
+            this.btnLoadDates.BorderRadius = 15;
+            this.btnLoadDates.CheckedState.Parent = this.btnLoadDates;
+            this.btnLoadDates.CustomImages.Parent = this.btnLoadDates;
+            this.btnLoadDates.FillColor = System.Drawing.Color.FromArgb(((int)(((byte)(112)))), ((int)(((byte)(51)))), ((int)(((byte)(255)))));
+            this.btnLoadDates.Font = new System.Drawing.Font("Segoe UI Semibold", 11F, System.Drawing.FontStyle.Bold);
+            this.btnLoadDates.ForeColor = System.Drawing.Color.White;
+            this.btnLoadDates.HoverState.Parent = this.btnLoadDates;
+            this.btnLoadDates.Location = new System.Drawing.Point(600, 10);
+            this.btnLoadDates.Name = "btnLoadDates";
+            this.btnLoadDates.ShadowDecoration.Parent = this.btnLoadDates;
+            this.btnLoadDates.Size = new System.Drawing.Size(90, 28);
+            this.btnLoadDates.TabIndex = 24;
+            this.btnLoadDates.Text = "Load";
+            this.btnLoadDates.Click += new System.EventHandler(this.btnLoadDates_Click);
+            // 
+            // lblTotalReceiptAmount
+            // 
+            this.lblTotalReceiptAmount.AutoSize = true;
+            this.lblTotalReceiptAmount.Font = new System.Drawing.Font("Segoe UI Semibold", 10F, System.Drawing.FontStyle.Bold);
+            this.lblTotalReceiptAmount.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(120)))), ((int)(((byte)(220)))), ((int)(((byte)(180)))));
+            this.lblTotalReceiptAmount.Location = new System.Drawing.Point(250, 48);
+            this.lblTotalReceiptAmount.Name = "lblTotalReceiptAmount";
+            this.lblTotalReceiptAmount.Size = new System.Drawing.Size(180, 19);
+            this.lblTotalReceiptAmount.TabIndex = 25;
+            this.lblTotalReceiptAmount.Text = "Total Amount: 0";
+            // 
+            // lblTotalAdvance
+            // 
+            this.lblTotalAdvance.AutoSize = true;
+            this.lblTotalAdvance.Font = new System.Drawing.Font("Segoe UI Semibold", 10F, System.Drawing.FontStyle.Bold);
+            this.lblTotalAdvance.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(120)))), ((int)(((byte)(220)))), ((int)(((byte)(180)))));
+            this.lblTotalAdvance.Location = new System.Drawing.Point(460, 48);
+            this.lblTotalAdvance.Name = "lblTotalAdvance";
+            this.lblTotalAdvance.Size = new System.Drawing.Size(130, 19);
+            this.lblTotalAdvance.TabIndex = 26;
+            this.lblTotalAdvance.Text = "Total Receipt: 0";
+            // 
+            // lblReceiptCount
+            // 
+            this.lblReceiptCount.AutoSize = true;
+            this.lblReceiptCount.Font = new System.Drawing.Font("Segoe UI Semibold", 10F, System.Drawing.FontStyle.Bold);
+            this.lblReceiptCount.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(255)))), ((int)(((byte)(210)))), ((int)(((byte)(120)))));
+            this.lblReceiptCount.Location = new System.Drawing.Point(640, 48);
+            this.lblReceiptCount.Name = "lblReceiptCount";
+            this.lblReceiptCount.Size = new System.Drawing.Size(100, 19);
+            this.lblReceiptCount.TabIndex = 27;
+            this.lblReceiptCount.Text = "Total Advance: 0";
             // 
             // guna2DataGridView1
             // 
@@ -118,14 +265,14 @@ namespace HubBuilders.View
             this.guna2DataGridView1.DefaultCellStyle = dataGridViewCellStyle3;
             this.guna2DataGridView1.EnableHeadersVisualStyles = false;
             this.guna2DataGridView1.GridColor = System.Drawing.Color.FromArgb(((int)(((byte)(32)))), ((int)(((byte)(36)))), ((int)(((byte)(66)))));
-            this.guna2DataGridView1.Location = new System.Drawing.Point(12, 115);
+            this.guna2DataGridView1.Location = new System.Drawing.Point(12, 145);
             this.guna2DataGridView1.MultiSelect = false;
             this.guna2DataGridView1.Name = "guna2DataGridView1";
             this.guna2DataGridView1.ReadOnly = true;
             this.guna2DataGridView1.RowHeadersVisible = false;
             this.guna2DataGridView1.RowTemplate.Height = 30;
             this.guna2DataGridView1.SelectionMode = System.Windows.Forms.DataGridViewSelectionMode.FullRowSelect;
-            this.guna2DataGridView1.Size = new System.Drawing.Size(958, 356);
+            this.guna2DataGridView1.Size = new System.Drawing.Size(958, 326);
             this.guna2DataGridView1.TabIndex = 179;
             this.guna2DataGridView1.Theme = Guna.UI2.WinForms.Enums.DataGridViewPresetThemes.Default;
             this.guna2DataGridView1.ThemeStyle.AlternatingRowsStyle.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(37)))), ((int)(((byte)(41)))), ((int)(((byte)(74)))));
@@ -233,5 +380,13 @@ namespace HubBuilders.View
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvDescription;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvDebit;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvCredit;
+        private System.Windows.Forms.Label lblFromDate;
+        private Guna.UI2.WinForms.Guna2DateTimePicker fromdate;
+        private System.Windows.Forms.Label lblToDate;
+        private Guna.UI2.WinForms.Guna2DateTimePicker todate;
+        private Guna.UI2.WinForms.Guna2Button btnLoadDates;
+        private System.Windows.Forms.Label lblTotalReceiptAmount;
+        private System.Windows.Forms.Label lblTotalAdvance;
+        private System.Windows.Forms.Label lblReceiptCount;
     }
 }

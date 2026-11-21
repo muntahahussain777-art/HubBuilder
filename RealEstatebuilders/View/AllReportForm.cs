@@ -22,6 +22,10 @@ namespace HubBuilders.View
             AddMonthCollectionVipButton();
             AddVipBusinessAnalysisButton();
             AddRoughInstallmentEstimateButton();
+            AddVipAllocateReceiptBalanceButton();
+            AddVipBrokerPartnerCollectionButton();
+            AddVipCustomerAdvanceReceiptButton();
+            AddVipLasbelaReceiptFindButton();
             EnableReportFormScroll();
         }
 
@@ -670,6 +674,178 @@ namespace HubBuilders.View
                 btn.Size = new System.Drawing.Size(972, 43);
                 btn.Text = "Rough Installment Estimate (VIP)";
                 btn.Click += (s, e) => OpenReport(() => new frmRoughInstallmentEstimate());
+                groupBox1.Controls.Add(btn);
+                btn.BringToFront();
+            }
+            catch { }
+        }
+
+        private void AddVipAllocateReceiptBalanceButton()
+        {
+            try
+            {
+                if (groupBox1 == null) return;
+                if (groupBox1.Controls.Find("btnVipAllocateReceiptBalance", true).Length > 0) return;
+
+                try
+                {
+                    groupBox1.Height = 1170;
+                    if (groupBox2 != null)
+                    {
+                        groupBox2.Top = 1190;
+                        int need = groupBox2.Bottom + 16;
+                        if (ClientSize.Height < need)
+                            ClientSize = new System.Drawing.Size(ClientSize.Width, need);
+                    }
+                }
+                catch { }
+
+                var btn = new Guna.UI2.WinForms.Guna2Button();
+                btn.Name = "btnVipAllocateReceiptBalance";
+                btn.Animated = true;
+                btn.AutoRoundedCorners = true;
+                btn.BorderRadius = 20;
+                btn.CheckedState.Parent = btn;
+                btn.CustomImages.Parent = btn;
+                btn.ShadowDecoration.Parent = btn;
+                btn.FillColor = System.Drawing.Color.FromArgb(10, 40, 100);
+                btn.Font = new System.Drawing.Font("Segoe UI Semibold", 12F, System.Drawing.FontStyle.Bold);
+                btn.ForeColor = System.Drawing.Color.White;
+                btn.HoverState.Parent = btn;
+                btn.Location = new System.Drawing.Point(15, 1060);
+                btn.Size = new System.Drawing.Size(972, 43);
+                btn.Text = "Allocate vs Receipts + Advance (VIP)";
+                btn.Click += (s, e) => OpenReport(() => new frmVipAllocateReceiptBalance());
+                groupBox1.Controls.Add(btn);
+                btn.BringToFront();
+            }
+            catch { }
+        }
+
+        private void AddVipBrokerPartnerCollectionButton()
+        {
+            try
+            {
+                if (groupBox1 == null) return;
+                if (groupBox1.Controls.Find("btnVipBrokerPartnerCollection", true).Length > 0) return;
+
+                try
+                {
+                    groupBox1.Height = 1225;
+                    if (groupBox2 != null)
+                    {
+                        groupBox2.Top = 1245;
+                        int need = groupBox2.Bottom + 16;
+                        if (ClientSize.Height < need)
+                            ClientSize = new System.Drawing.Size(ClientSize.Width, need);
+                    }
+                }
+                catch { }
+
+                var btn = new Guna.UI2.WinForms.Guna2Button();
+                btn.Name = "btnVipBrokerPartnerCollection";
+                btn.Animated = true;
+                btn.AutoRoundedCorners = true;
+                btn.BorderRadius = 20;
+                btn.CheckedState.Parent = btn;
+                btn.CustomImages.Parent = btn;
+                btn.ShadowDecoration.Parent = btn;
+                btn.FillColor = System.Drawing.Color.FromArgb(10, 40, 100);
+                btn.Font = new System.Drawing.Font("Segoe UI Semibold", 12F, System.Drawing.FontStyle.Bold);
+                btn.ForeColor = System.Drawing.Color.White;
+                btn.HoverState.Parent = btn;
+                btn.Location = new System.Drawing.Point(15, 1115);
+                btn.Size = new System.Drawing.Size(972, 43);
+                btn.Text = "Broker + Partner + Collection (VIP)";
+                btn.Click += (s, e) => OpenReport(() => new frmVipBrokerPartnerCollection());
+                groupBox1.Controls.Add(btn);
+                btn.BringToFront();
+            }
+            catch { }
+        }
+
+        private void AddVipCustomerAdvanceReceiptButton()
+        {
+            try
+            {
+                if (groupBox1 == null) return;
+                if (groupBox1.Controls.Find("btnVipCustomerAdvanceReceipt", true).Length > 0) return;
+
+                try
+                {
+                    groupBox1.Height = 1280;
+                    if (groupBox2 != null)
+                    {
+                        groupBox2.Top = 1300;
+                        int need = groupBox2.Bottom + 16;
+                        if (ClientSize.Height < need)
+                            ClientSize = new System.Drawing.Size(ClientSize.Width, need);
+                    }
+                }
+                catch { }
+
+                var btn = new Guna.UI2.WinForms.Guna2Button();
+                btn.Name = "btnVipCustomerAdvanceReceipt";
+                btn.Animated = true;
+                btn.AutoRoundedCorners = true;
+                btn.BorderRadius = 20;
+                btn.CheckedState.Parent = btn;
+                btn.CustomImages.Parent = btn;
+                btn.ShadowDecoration.Parent = btn;
+                btn.FillColor = System.Drawing.Color.FromArgb(10, 40, 100);
+                btn.Font = new System.Drawing.Font("Segoe UI Semibold", 12F, System.Drawing.FontStyle.Bold);
+                btn.ForeColor = System.Drawing.Color.White;
+                btn.HoverState.Parent = btn;
+                btn.Location = new System.Drawing.Point(15, 1170);
+                btn.Size = new System.Drawing.Size(972, 43);
+                btn.Text = "Customer Advance / Monthly Receipt (VIP)";
+                btn.Click += (s, e) => OpenReport(() => new frmVipCustomerAdvanceReceipt());
+                groupBox1.Controls.Add(btn);
+                btn.BringToFront();
+            }
+            catch { }
+        }
+
+        private void AddVipLasbelaReceiptFindButton()
+        {
+            try
+            {
+                if (groupBox1 == null) return;
+                if (groupBox1.Controls.Find("btnVipLasbelaReceiptFind", true).Length > 0) return;
+
+                try
+                {
+                    groupBox1.Height = 1335;
+                    if (groupBox2 != null)
+                    {
+                        groupBox2.Top = 1355;
+                        int need = groupBox2.Bottom + 16;
+                        if (ClientSize.Height < need)
+                            ClientSize = new System.Drawing.Size(ClientSize.Width, need);
+                    }
+                }
+                catch { }
+
+                var btn = new Guna.UI2.WinForms.Guna2Button();
+                btn.Name = "btnVipLasbelaReceiptFind";
+                btn.Animated = true;
+                btn.AutoRoundedCorners = true;
+                btn.BorderRadius = 20;
+                btn.CheckedState.Parent = btn;
+                btn.CustomImages.Parent = btn;
+                btn.ShadowDecoration.Parent = btn;
+                btn.FillColor = System.Drawing.Color.FromArgb(10, 40, 100);
+                btn.Font = new System.Drawing.Font("Segoe UI Semibold", 12F, System.Drawing.FontStyle.Bold);
+                btn.ForeColor = System.Drawing.Color.White;
+                btn.HoverState.Parent = btn;
+                btn.Location = new System.Drawing.Point(15, 1225);
+                btn.Size = new System.Drawing.Size(972, 43);
+                btn.Text = "Find Lasbela رسید نمبر (Village + Market) VIP";
+                btn.Click += (s, e) =>
+                {
+                    HubBuilders.AppSafety.Run(() =>
+                        LasbelaLocalReceiptArchive.ShowFindDialog(this, null));
+                };
                 groupBox1.Controls.Add(btn);
                 btn.BringToFront();
             }

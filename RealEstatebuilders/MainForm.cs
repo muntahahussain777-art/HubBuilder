@@ -83,7 +83,7 @@ namespace HubBuilders
             tip.SetToolTip(btnPasswordchange, "Shortcut: Alt+W");
         }
 
-        /// <summary>Minimal Sync/Pull/Recover — existing nav style, no redesign.</summary>
+        /// <summary>Minimal Sync/Pull — Force Recover button removed (galati se press risk).</summary>
         private void AddSyncPullNavButtons()
         {
             try
@@ -91,18 +91,12 @@ namespace HubBuilders
                 var tip = new ToolTip { ShowAlways = true, AutoPopDelay = 10000 };
                 var btnSync = MakeNavActionButton("  Sync Now", 104);
                 var btnPull = MakeNavActionButton("  Pull Now", 105);
-                var btnRecover = MakeNavActionButton("  Force Recover", 106);
-                btnRecover.FillColor = Color.FromArgb(160, 90, 30);
-                btnRecover.Size = new Size(228, 34);
                 tip.SetToolTip(btnSync, "Push local + merge from cloud (safe — no wipe)");
                 tip.SetToolTip(btnPull, "Pull from cloud into SQLite (safe — no wipe)");
-                tip.SetToolTip(btnRecover,
-                    "Missing allocate data cloud se wapas — sirf absent sync_id INSERT, duplicates skip, deleted resurrect nahi");
                 btnSync.Click += async (s, e) =>
                 {
                     btnSync.Enabled = false;
                     btnPull.Enabled = false;
-                    btnRecover.Enabled = false;
                     try
                     {
                         bool ok = await Task.Run(() => HubSyncService.TrySyncNow());
@@ -116,14 +110,12 @@ namespace HubBuilders
                     {
                         btnSync.Enabled = true;
                         btnPull.Enabled = true;
-                        btnRecover.Enabled = true;
                     }
                 };
                 btnPull.Click += async (s, e) =>
                 {
                     btnSync.Enabled = false;
                     btnPull.Enabled = false;
-                    btnRecover.Enabled = false;
                     try
                     {
                         bool ok = await Task.Run(() => HubSyncService.TryPullNow());
@@ -137,50 +129,10 @@ namespace HubBuilders
                     {
                         btnSync.Enabled = true;
                         btnPull.Enabled = true;
-                        btnRecover.Enabled = true;
-                    }
-                };
-                btnRecover.Click += async (s, e) =>
-                {
-                    var ask = MessageBox.Show(this,
-                        "Cloud se missing allocate rows wapas laoga (same sync_id skip).\n"
-                        + "Local extras wipe nahi. Intentionally deleted resurrect nahi.\n\nContinue?",
-                        "Force Recover from Cloud",
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Question);
-                    if (ask != DialogResult.Yes) return;
-
-                    btnSync.Enabled = false;
-                    btnPull.Enabled = false;
-                    btnRecover.Enabled = false;
-                    try
-                    {
-                        string summary = "";
-                        bool ok = false;
-                        await Task.Run(() =>
-                        {
-                            ok = HubSyncService.TryForceRecoverFromCloud(out summary);
-                        });
-                        MessageBox.Show(this,
-                            ok
-                                ? (string.IsNullOrWhiteSpace(summary) ? "Recovered / Sync complete." : summary)
-                                : (string.IsNullOrWhiteSpace(summary)
-                                    ? "Recover busy/fail — 10 sec baad dobara try (internet on)."
-                                    : summary),
-                            "Force Recover",
-                            MessageBoxButtons.OK,
-                            ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
-                    }
-                    finally
-                    {
-                        btnSync.Enabled = true;
-                        btnPull.Enabled = true;
-                        btnRecover.Enabled = true;
                     }
                 };
                 flowLayoutPanel1.Controls.Add(btnSync);
                 flowLayoutPanel1.Controls.Add(btnPull);
-                flowLayoutPanel1.Controls.Add(btnRecover);
             }
             catch { }
         }

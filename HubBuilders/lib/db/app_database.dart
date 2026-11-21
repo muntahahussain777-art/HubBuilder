@@ -300,6 +300,22 @@ END''');
     await db.execute(
       'CREATE INDEX IF NOT EXISTS IX_customer_plots_broker ON customer_plots(broker_id)',
     );
+    // Sync lookups — wipe-safe non-unique
+    for (final t in const [
+      'customers',
+      'customer_plots',
+      'receipts',
+      'ledger',
+      'plots',
+      'partner_money',
+      'customer_plot_partners',
+    ]) {
+      try {
+        await db.execute(
+          'CREATE INDEX IF NOT EXISTS idx_${t}_sync_id ON $t(sync_id)',
+        );
+      } catch (_) {}
+    }
   }
 
   Future<void> _createSchema(Database db) async {

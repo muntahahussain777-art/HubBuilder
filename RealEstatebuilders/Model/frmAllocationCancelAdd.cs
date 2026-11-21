@@ -425,7 +425,16 @@ WHERE id = @pid;", MainClass.con, tx))
 
                 tx.Commit();
 
-                try { HubSyncService.NotifyLocalWrite(); } catch { }
+                try
+                {
+                    var syncRows = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, long>>();
+                    if (CustomerPlotId > 0)
+                        syncRows.Add(new System.Collections.Generic.KeyValuePair<string, long>("customer_plots", CustomerPlotId));
+                    if (_plotId > 0)
+                        syncRows.Add(new System.Collections.Generic.KeyValuePair<string, long>("plots", _plotId));
+                    HubSyncService.NotifyLocalWrites(syncRows);
+                }
+                catch { try { HubSyncService.NotifyLocalWrite(); } catch { } }
 
                 SavedCancellationId = cancellationId;
                 SavedRefundableAmount = refundableAmount;

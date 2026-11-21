@@ -70,6 +70,9 @@ namespace HubBuilders
         public static void ResetSchemaCaches()
         {
             _allocationSchemaReady = false;
+            _customerPlotsColumnsReady = false;
+            _plotStatusRepairDone = false;
+            _dealTypeNormalizeDone = false;
             _staffAuditReady = false;
             _partnerMoneyReady = false;
             _expenseCategoryReady = false;
@@ -358,17 +361,50 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 }
             }
             catch { }
-            try { HubSyncService.MarkDirty(); } catch { }
             try
             {
                 string head = (qry ?? "").TrimStart();
                 bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
                 bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                bool isDelete = head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
                 if ((isInsert || isUpdate)
                     && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
                     && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
                     && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
                 {
+                    string action = isInsert ? "Insert" : "Update";
+                    string table = ExtractSqlTableName(head, action);
+                    long rowId = isInsert ? lastInsertId : IdFromParams(parameters);
+                    if (!string.IsNullOrWhiteSpace(table) && rowId > 0)
+                    {
+                        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            try
+                            {
+                                HubSyncService.MarkDirtyTable(table);
+                                if (HubSyncService.PushOneNow(table, rowId))
+                                    HubSyncService.ClearDirty();
+                                // fail: dirty table rehti hai → tick PushChanged cloud pe retry
+                                HubSyncService.ScheduleBackgroundPushPublic();
+                            }
+                            catch
+                            {
+                                try { HubSyncService.MarkDirtyTable(table); } catch { }
+                                try { HubSyncService.ScheduleBackgroundPushPublic(); } catch { }
+                            }
+                        });
+                    }
+                    else
+                    {
+                        try { HubSyncService.MarkDirty(); } catch { }
+                        HubSyncService.ScheduleBackgroundPushPublic();
+                    }
+                }
+                else if (isDelete
+                    && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
+                    && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    try { HubSyncService.MarkDirty(); } catch { }
                     HubSyncService.ScheduleBackgroundPushPublic();
                 }
             }
@@ -667,6 +703,9 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             var delIds = PeekDeleteSyncIds(qry, ht);
             try
             {
+                // Cloud soft-delete PEHLE — CatchUp resurrect band
+                if (delIds != null && delIds.Count > 0)
+                    PushCloudDeletes(delIds, 1);
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
@@ -1153,6 +1192,9 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     }
                 }
                 catch { }
+                // Cloud soft-delete PEHLE — CatchUp resurrect band
+                if (delIds != null && delIds.Count > 0)
+                    PushCloudDeletes(delIds, 1);
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
@@ -1293,6 +1335,9 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 int n = 0;
                 long lastId = 0;
                 var delIds = PeekDeleteSyncIds(query, parameters);
+                // Cloud soft-delete PEHLE — warna CatchUp local delete se pehle/baad wapas laata hai
+                if (delIds != null && delIds.Count > 0)
+                    PushCloudDeletes(delIds, 1);
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
@@ -1603,6 +1648,9 @@ WHERE type='index' AND tbl_name='customers' AND sql IS NOT NULL;", local))
         /// sirf Active allocation pe one-plot rule enforce karta hai.
         /// </summary>
         private static bool _allocationSchemaReady = false;
+        private static bool _customerPlotsColumnsReady = false;
+        private static bool _plotStatusRepairDone = false;
+        private static bool _dealTypeNormalizeDone = false;
 
         private static bool CustomerPlotsHasColumn(SQLiteConnection c, string col)
         {
@@ -1634,11 +1682,12 @@ WHERE type='index' AND tbl_name='customers' AND sql IS NOT NULL;", local))
 
         /// <summary>
         /// Purani client DB safe — missing cancelled_date / deal_type / etc. add.
-        /// UI nahi; sirf ALTER ADD. Har boot pe chal sakta hai.
+        /// UI nahi; sirf ALTER ADD. Session mein ek baar (open hang avoid).
         /// </summary>
         public static void EnsureCustomerPlotsAllColumns(SQLiteConnection c)
         {
             if (c == null) return;
+            if (_customerPlotsColumnsReady) return;
             try
             {
                 // Table hi na ho to yahan create nahi — EnsureAllocationSchema handle karegi
@@ -1660,15 +1709,20 @@ WHERE type='index' AND tbl_name='customers' AND sql IS NOT NULL;", local))
 
                 try
                 {
-                    using (var cmd = new SQLiteCommand(@"
+                    if (!_dealTypeNormalizeDone)
+                    {
+                        using (var cmd = new SQLiteCommand(@"
 UPDATE customer_plots
 SET deal_type = 'Installment'
 WHERE deal_type IS NULL
    OR TRIM(COALESCE(deal_type,'')) = ''
    OR LOWER(TRIM(deal_type)) NOT IN ('installment','reserve','sold');", c))
-                        cmd.ExecuteNonQuery();
+                            cmd.ExecuteNonQuery();
+                    }
                 }
                 catch { }
+
+                _customerPlotsColumnsReady = true;
             }
             catch { }
         }
@@ -1676,9 +1730,11 @@ WHERE deal_type IS NULL
         /// <summary>
         /// Active/Completed allocation ke plot Available na rahe.
         /// Manual cancel (cancelled_date set) touch nahi.
+        /// Session mein ek baar — har GetData pe UPDATE hang avoid.
         /// </summary>
         public static void RepairAllocatedPlotStatuses()
         {
+            if (_plotStatusRepairDone) return;
             try
             {
                 using (var local = new SQLiteConnection(con_string))
@@ -1723,6 +1779,8 @@ WHERE IFNULL(status,'') = 'Available'
                     {
                         cmd.ExecuteNonQuery();
                     }
+
+                    _plotStatusRepairDone = true;
                 }
             }
             catch { }
@@ -1730,6 +1788,22 @@ WHERE IFNULL(status,'') = 'Available'
 
         public static void EnsureAllocationSchema()
         {
+            // Har form open pe full schema/UPDATE skip — pehle se ready ho to turant return
+            if (_allocationSchemaReady)
+            {
+                try
+                {
+                    if (!_customerPlotsColumnsReady)
+                    {
+                        if (con.State != ConnectionState.Open)
+                            con.Open();
+                        EnsureCustomerPlotsAllColumns(con);
+                    }
+                }
+                catch { }
+                return;
+            }
+
             try
             {
                 if (con.State != ConnectionState.Open)
@@ -2034,21 +2108,10 @@ END;", con))
         private static void EnsureCustomerPlotsDealTypeColumn(SQLiteConnection c)
         {
             if (c == null) return;
+            if (_dealTypeNormalizeDone && _customerPlotsColumnsReady) return;
             try
             {
-                bool has = false;
-                using (var cmd = new SQLiteCommand("PRAGMA table_info(customer_plots);", c))
-                using (var r = cmd.ExecuteReader())
-                {
-                    while (r.Read())
-                    {
-                        if (string.Equals(Convert.ToString(r["name"]), "deal_type", StringComparison.OrdinalIgnoreCase))
-                        {
-                            has = true;
-                            break;
-                        }
-                    }
-                }
+                bool has = CustomerPlotsHasColumn(c, "deal_type");
 
                 if (!has)
                 {
@@ -2057,7 +2120,9 @@ END;", con))
                         cmd.ExecuteNonQuery();
                 }
 
-                using (var cmd = new SQLiteCommand(@"
+                if (!_dealTypeNormalizeDone)
+                {
+                    using (var cmd = new SQLiteCommand(@"
 UPDATE customer_plots
 SET deal_type = 'Installment'
 WHERE deal_type IS NULL
@@ -2067,7 +2132,9 @@ WHERE deal_type IS NULL
 UPDATE customer_plots SET deal_type = 'Installment' WHERE LOWER(TRIM(deal_type)) = 'installment';
 UPDATE customer_plots SET deal_type = 'Reserve'     WHERE LOWER(TRIM(deal_type)) = 'reserve';
 UPDATE customer_plots SET deal_type = 'Sold'        WHERE LOWER(TRIM(deal_type)) = 'sold';", c))
-                    cmd.ExecuteNonQuery();
+                        cmd.ExecuteNonQuery();
+                    _dealTypeNormalizeDone = true;
+                }
             }
             catch { }
         }
@@ -2076,27 +2143,13 @@ UPDATE customer_plots SET deal_type = 'Sold'        WHERE LOWER(TRIM(deal_type))
         private static void EnsureCustomerPlotsMonthlyInstallmentColumn(SQLiteConnection c)
         {
             if (c == null) return;
+            if (_customerPlotsColumnsReady) return;
             try
             {
-                bool has = false;
-                using (var cmd = new SQLiteCommand("PRAGMA table_info(customer_plots);", c))
-                using (var r = cmd.ExecuteReader())
-                {
-                    while (r.Read())
-                    {
-                        if (string.Equals(Convert.ToString(r["name"]), "monthly_installment", StringComparison.OrdinalIgnoreCase))
-                        {
-                            has = true;
-                            break;
-                        }
-                    }
-                }
-                if (!has)
-                {
-                    using (var cmd = new SQLiteCommand(
-                        "ALTER TABLE customer_plots ADD COLUMN monthly_installment REAL NOT NULL DEFAULT 0;", c))
-                        cmd.ExecuteNonQuery();
-                }
+                if (CustomerPlotsHasColumn(c, "monthly_installment")) return;
+                using (var cmd = new SQLiteCommand(
+                    "ALTER TABLE customer_plots ADD COLUMN monthly_installment REAL NOT NULL DEFAULT 0;", c))
+                    cmd.ExecuteNonQuery();
             }
             catch { }
         }

@@ -108,10 +108,21 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
       throw Exception('Access denied: $mod add');
     }
     final db = await AppDatabase.instance.database;
-    final id = await db.insert(table, values);
+    final map = Map<String, Object?>.from(values);
+    if (!map.containsKey('sync_id') ||
+        (map['sync_id']?.toString().trim().isEmpty ?? true)) {
+      try {
+        final sid = await db.rawQuery(
+          "SELECT lower(hex(randomblob(16))) AS s",
+        );
+        final s = (sid.first['s'] ?? '').toString();
+        if (s.isNotEmpty) map['sync_id'] = s;
+      } catch (_) {}
+    }
+    final id = await db.insert(table, map);
     await HubSync.pushNow(table, id);
     await log('Insert', table, detail: 'id=$id');
-    HubSync.notifyLocalWrite();
+    HubSync.notifyLocalWrite(alreadyPushed: true);
     unawaited(AutoBackup.onEntry());
     return id;
   }
@@ -134,9 +145,11 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
           : (where == null ? null : '$where $whereArgs');
       if (whereArgs != null && whereArgs.isNotEmpty) {
         await HubSync.pushNow(table, whereArgs.first);
+        HubSync.notifyLocalWrite(alreadyPushed: true);
+      } else {
+        HubSync.notifyLocalWrite();
       }
       await log('Update', table, detail: detail);
-      HubSync.notifyLocalWrite();
       unawaited(AutoBackup.onEntry());
     }
     return n;
@@ -173,11 +186,14 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
         }
       }
     } catch (_) {}
-    final n = await db.delete(table, where: where, whereArgs: whereArgs);
-    if (n > 0) {
+    // Cloud SoftMark PEHLE — warna doosri device PushChanged tombstone overwrite karti hai
+    if (tombstones.isNotEmpty) {
       for (final t in tombstones) {
         await HubSync.tombstoneLocalRow(table, t.localPk, t.ids);
       }
+    }
+    final n = await db.delete(table, where: where, whereArgs: whereArgs);
+    if (n > 0) {
       for (final un in userNames) {
         await HubSync.pushDeletedUsername(un);
       }

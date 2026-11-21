@@ -1,5 +1,6 @@
 import '../db/app_database.dart';
 import 'hub_sync.dart';
+import 'installment_cover.dart';
 import 'partner_cash_store.dart';
 import 'staff_audit.dart';
 
@@ -69,6 +70,7 @@ class CustomerPlotOption {
     required this.custName,
     required this.plotNo,
     required this.society,
+    required this.societyId,
     required this.block,
     required this.mobile,
     required this.price,
@@ -79,6 +81,7 @@ class CustomerPlotOption {
   final String custName;
   final String plotNo;
   final String society;
+  final int societyId;
   final String block;
   final String mobile;
   final double price;
@@ -132,21 +135,26 @@ class ReceiptLedgerRow {
 abstract final class ReceiptStore {
   static Future<List<CustomerPlotOption>> activeCustomerPlots({
     String query = '',
+    int societyId = 0,
   }) async {
     final db = await AppDatabase.instance.database;
     final q = query.trim().toLowerCase();
-    final rows = await db.rawQuery('''
+    final rows = await db.rawQuery(
+      '''
 SELECT cp.id, cp.price,
        c.name AS cust_name, c.mobile,
-       p.plot_no, s.name AS society, b.name AS block
+       p.plot_no, s.name AS society, s.id AS society_id, b.name AS block
 FROM customer_plots cp
 JOIN customers c ON c.id = cp.customer_id
 JOIN plots p ON p.id = cp.plot_id
 JOIN societies s ON s.id = p.society_id
 JOIN blocks b ON b.id = p.block_id
 WHERE cp.status = 'Active'
+  AND (? = 0 OR s.id = ?)
 ORDER BY c.name COLLATE NOCASE, p.plot_no COLLATE NOCASE
-''');
+''',
+      [societyId, societyId],
+    );
 
     final out = <CustomerPlotOption>[];
     for (final r in rows) {
@@ -156,6 +164,7 @@ ORDER BY c.name COLLATE NOCASE, p.plot_no COLLATE NOCASE
         custName: r['cust_name'] as String? ?? '',
         plotNo: r['plot_no'] as String? ?? '',
         society: r['society'] as String? ?? '',
+        societyId: (r['society_id'] as num?)?.toInt() ?? 0,
         block: r['block'] as String? ?? '',
         mobile: r['mobile'] as String? ?? '',
         price: (r['price'] as num?)?.toDouble() ?? 0,
@@ -182,7 +191,7 @@ ORDER BY c.name COLLATE NOCASE, p.plot_no COLLATE NOCASE
       final rows = await db.rawQuery('''
 SELECT cp.id, cp.price,
        c.name AS cust_name, c.mobile,
-       p.plot_no, s.name AS society, b.name AS block
+       p.plot_no, s.name AS society, s.id AS society_id, b.name AS block
 FROM customer_plots cp
 JOIN customers c ON c.id = cp.customer_id
 JOIN plots p ON p.id = cp.plot_id
@@ -198,6 +207,7 @@ WHERE cp.id = ?
         custName: r['cust_name'] as String? ?? '',
         plotNo: r['plot_no'] as String? ?? '',
         society: r['society'] as String? ?? '',
+        societyId: (r['society_id'] as num?)?.toInt() ?? 0,
         block: r['block'] as String? ?? '',
         mobile: r['mobile'] as String? ?? '',
         price: (r['price'] as num?)?.toDouble() ?? 0,
@@ -355,17 +365,23 @@ WHERE customer_plot_id = ?
     return rows;
   }
 
-  static Future<List<ReceiptLedgerRow>?> searchByRef(String query) async {
+  static Future<List<ReceiptLedgerRow>?> searchByRef(
+    String query, {
+    int societyId = 0,
+  }) async {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return null;
     final db = await AppDatabase.instance.database;
     final matches = await db.rawQuery(
       '''
-SELECT * FROM receipts
-WHERE ref_no IS NOT NULL AND trim(ref_no) != ''
-  AND lower(ref_no) LIKE ?
+SELECT r.* FROM receipts r
+JOIN customer_plots cp ON cp.id = r.customer_plot_id
+JOIN plots p ON p.id = cp.plot_id
+WHERE r.ref_no IS NOT NULL AND trim(r.ref_no) != ''
+  AND lower(r.ref_no) LIKE ?
+  AND (? = 0 OR p.society_id = ?)
 ''',
-      ['%$q%'],
+      ['%$q%', societyId, societyId],
     );
     if (matches.isEmpty) return null;
     return _buildMultiAllocRows(
@@ -401,16 +417,22 @@ WHERE ref_no IS NOT NULL AND trim(ref_no) != ''
   }
 
   static Future<List<ReceiptLedgerRow>?> searchByCustomerName(
-    String query,
-  ) async {
+    String query, {
+    int societyId = 0,
+  }) async {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return null;
     final db = await AppDatabase.instance.database;
-    final allocRows = await db.rawQuery('''
+    final allocRows = await db.rawQuery(
+      '''
 SELECT cp.id FROM customer_plots cp
 JOIN customers c ON c.id = cp.customer_id
+JOIN plots p ON p.id = cp.plot_id
 WHERE lower(c.name) LIKE ?
-''', ['%$q%']);
+  AND (? = 0 OR p.society_id = ?)
+''',
+      ['%$q%', societyId, societyId],
+    );
     if (allocRows.isEmpty) return null;
     final allocIds = allocRows.map((r) => r['id'] as int).toSet();
     final placeholders = List.filled(allocIds.length, '?').join(',');
@@ -537,13 +559,16 @@ WHERE lower(c.name) LIKE ?
         int? customerPlotId,
         String? allocationDisp,
         String mode,
-      })> smartSearch(String query) async {
+      })> smartSearch(
+    String query, {
+    int societyId = 0,
+  }) async {
     final q = query.trim();
     if (q.isEmpty) {
       return (rows: null, customerPlotId: null, allocationDisp: null, mode: '');
     }
 
-    final byRef = await searchByRef(q);
+    final byRef = await searchByRef(q, societyId: societyId);
     if (byRef != null && byRef.isNotEmpty) {
       return (
         rows: byRef,
@@ -553,7 +578,7 @@ WHERE lower(c.name) LIKE ?
       );
     }
 
-    final byCust = await searchByCustomerName(q);
+    final byCust = await searchByCustomerName(q, societyId: societyId);
     if (byCust != null && byCust.isNotEmpty) {
       return (
         rows: byCust,
@@ -563,7 +588,7 @@ WHERE lower(c.name) LIKE ?
       );
     }
 
-    final matches = await activeCustomerPlots(query: q);
+    final matches = await activeCustomerPlots(query: q, societyId: societyId);
     if (matches.length == 1) {
       final m = matches.first;
       return (
@@ -577,8 +602,59 @@ WHERE lower(c.name) LIKE ?
     return (rows: null, customerPlotId: null, allocationDisp: null, mode: '');
   }
 
-  static Future<List<CustomerPlotOption>> searchAllocations(String query) =>
-      activeCustomerPlots(query: query);
+  static Future<List<CustomerPlotOption>> searchAllocations(
+    String query, {
+    int societyId = 0,
+  }) =>
+      activeCustomerPlots(query: query, societyId: societyId);
+
+  /// Context for WhatsApp installment-cover option (additive, no save change).
+  static Future<({DateTime booking, double monthly, Set<String> paidKeys})>
+      installmentCoverContext(int customerPlotId, {int? excludeReceiptId}) async {
+    final db = await AppDatabase.instance.database;
+    final rows = await db.rawQuery(
+      '''
+SELECT cp.booking_date,
+       COALESCE(cp.monthly_installment,0) AS monthly_installment,
+       COALESCE(bmi.monthly_amount,0) AS block_monthly
+FROM customer_plots cp
+JOIN plots p ON p.id = cp.plot_id
+LEFT JOIN block_monthly_installments bmi ON bmi.block_id = p.block_id
+WHERE cp.id = ?
+''',
+      [customerPlotId],
+    );
+    var booking = DateTime.now();
+    var monthly = 0.0;
+    if (rows.isNotEmpty) {
+      final raw = (rows.first['booking_date'] ?? '').toString();
+      booking = DateTime.tryParse(raw.length >= 10 ? raw.substring(0, 10) : raw) ??
+          DateTime.tryParse(raw.replaceFirst(' ', 'T')) ??
+          DateTime.now();
+      monthly = (rows.first['monthly_installment'] as num?)?.toDouble() ?? 0;
+      if (monthly <= 0.009) {
+        monthly = (rows.first['block_monthly'] as num?)?.toDouble() ?? 0;
+      }
+    }
+    final paidRows = await db.rawQuery(
+      '''
+SELECT receipt_date, notes FROM receipts
+WHERE customer_plot_id = ? AND amount > 0
+  AND (? IS NULL OR id != ?)
+''',
+      [customerPlotId, excludeReceiptId, excludeReceiptId],
+    );
+    final paid = <String>{};
+    for (final r in paidRows) {
+      paid.addAll(InstallmentCover.parseKeys(r['notes'] as String?));
+      final raw = (r['receipt_date'] ?? '').toString().trim();
+      DateTime? d;
+      if (raw.length >= 10) d = DateTime.tryParse(raw.substring(0, 10));
+      d ??= DateTime.tryParse(raw.replaceFirst(' ', 'T'));
+      if (d != null) paid.add(InstallmentCover.monthKey(d));
+    }
+    return (booking: booking, monthly: monthly, paidKeys: paid);
+  }
 
   static Future<({bool ok, String message, double remaining, int? receiptId})> saveReceipt({
     required int customerPlotId,
@@ -663,6 +739,11 @@ WHERE lower(c.name) LIKE ?
       );
       receiptIdForPartner = editingReceiptId;
     } else {
+      final sidRows = await db.rawQuery(
+        "SELECT lower(hex(randomblob(16))) AS a, lower(hex(randomblob(16))) AS b",
+      );
+      final ledgerSid = (sidRows.first['a'] ?? '').toString();
+      final receiptSid = (sidRows.first['b'] ?? '').toString();
       final lid = await db.insert('ledger', {
         'customer_plot_id': customerPlotId,
         'txn_date': receiptDate,
@@ -670,6 +751,7 @@ WHERE lower(c.name) LIKE ?
         'debit': 0,
         'credit': amount,
         'txn_type': txnType,
+        if (ledgerSid.isNotEmpty) 'sync_id': ledgerSid,
       });
       receiptIdForPartner = await db.insert('receipts', {
         'customer_plot_id': customerPlotId,
@@ -679,6 +761,7 @@ WHERE lower(c.name) LIKE ?
         'ref_no': cleanRef,
         'notes': cleanNotes,
         'ledger_id': lid,
+        if (receiptSid.isNotEmpty) 'sync_id': receiptSid,
       });
     }
 
@@ -713,7 +796,7 @@ WHERE lower(c.name) LIKE ?
       final lid = existing?.ledgerId;
       if (lid != null) await HubSync.pushNow('ledger', lid);
     }
-    HubSync.notifyLocalWrite();
+    HubSync.notifyLocalWrite(alreadyPushed: true);
     return (ok: true, message: 'Saved', remaining: after.remaining, receiptId: receiptIdForPartner);
   }
 

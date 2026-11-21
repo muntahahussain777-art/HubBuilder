@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import '../data/receipt_store.dart';
 import '../data/hub_sync.dart';
+import '../data/installment_cover.dart';
 import '../data/partner_cash_store.dart';
 import '../data/plot_inventory_store.dart';
 import '../data/whatsapp_open.dart';
@@ -24,6 +25,8 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
   String _allocationDisp = '';
   String _query = '';
   String _searchMode = ''; // '', 'ref', 'cust'
+  int _societyId = 0;
+  List<IdName> _societies = const [];
   List<ReceiptLedgerRow>? _globalRows;
   List<ReceiptLedgerRow> _rows = const [];
   bool _loading = true;
@@ -48,12 +51,50 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
   }
 
   Future<void> _bootstrap() async {
-    final opts = await ReceiptStore.activeCustomerPlots();
+    final societies = await PlotInventoryStore.societies();
+    final opts = await ReceiptStore.activeCustomerPlots(societyId: _societyId);
     if (!mounted) return;
+    setState(() => _societies = societies);
     if (opts.isNotEmpty) {
       _customerPlotId = opts.first.id;
       _allocationDisp = opts.first.disp;
     }
+    await _reloadRows();
+  }
+
+  Future<void> _onSocietyChanged(int? v) async {
+    final sid = v ?? 0;
+    setState(() {
+      _societyId = sid;
+      _searchMode = '';
+      _globalRows = null;
+      _query = '';
+      _search.clear();
+    });
+
+    if (_customerPlotId > 0) {
+      final cur = await ReceiptStore.customerPlotById(_customerPlotId);
+      if (sid > 0 && (cur == null || cur.societyId != sid)) {
+        if (!mounted) return;
+        setState(() {
+          _customerPlotId = 0;
+          _allocationDisp = '';
+          _rows = const [];
+        });
+      }
+    }
+
+    if (_customerPlotId <= 0) {
+      final opts = await ReceiptStore.activeCustomerPlots(societyId: sid);
+      if (!mounted) return;
+      if (opts.length == 1) {
+        setState(() {
+          _customerPlotId = opts.first.id;
+          _allocationDisp = opts.first.disp;
+        });
+      }
+    }
+
     await _reloadRows();
   }
 
@@ -80,7 +121,6 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
 
     final rows = await ReceiptStore.buildLedgerView(
       _customerPlotId,
-      filter: _query,
     );
     if (!mounted) return;
     setState(() {
@@ -120,7 +160,7 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
       return;
     }
 
-    final result = await ReceiptStore.smartSearch(q);
+    final result = await ReceiptStore.smartSearch(q, societyId: _societyId);
     if (!mounted) return;
 
     if (result.mode == 'ref' || result.mode == 'cust') {
@@ -146,7 +186,8 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
     }
 
     if (enterPressed) {
-      final matches = await ReceiptStore.searchAllocations(q);
+      final matches =
+          await ReceiptStore.searchAllocations(q, societyId: _societyId);
       if (!mounted) return;
       setState(() => _searching = false);
       if (matches.length > 1) {
@@ -164,7 +205,10 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
   Future<void> _pickAllocation({String prefilter = ''}) async {
     final picked = await showDialog<CustomerPlotOption>(
       context: context,
-      builder: (ctx) => _AllocationPickerDialog(prefilter: prefilter),
+      builder: (ctx) => _AllocationPickerDialog(
+        prefilter: prefilter,
+        societyId: _societyId,
+      ),
     );
     if (picked == null || !mounted) return;
     setState(() {
@@ -294,6 +338,27 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
               ),
               onChanged: (v) => _applySearch(v),
               onSubmitted: (v) => _applySearch(v, enterPressed: true),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SoftPanel(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: DropdownButtonFormField<int>(
+              value: _societyId,
+              decoration: const InputDecoration(
+                labelText: 'Society',
+                border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                filled: false,
+              ),
+              items: [
+                const DropdownMenuItem(value: 0, child: Text('All Societies')),
+                ..._societies.map(
+                  (s) => DropdownMenuItem(value: s.id, child: Text(s.name)),
+                ),
+              ],
+              onChanged: _onSocietyChanged,
             ),
           ),
           const SizedBox(height: 12),
@@ -468,9 +533,13 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
 }
 
 class _AllocationPickerDialog extends StatefulWidget {
-  const _AllocationPickerDialog({this.prefilter = ''});
+  const _AllocationPickerDialog({
+    this.prefilter = '',
+    this.societyId = 0,
+  });
 
   final String prefilter;
+  final int societyId;
 
   @override
   State<_AllocationPickerDialog> createState() =>
@@ -479,6 +548,8 @@ class _AllocationPickerDialog extends StatefulWidget {
 
 class _AllocationPickerDialogState extends State<_AllocationPickerDialog> {
   late final TextEditingController _q;
+  late int _societyId;
+  List<IdName> _societies = const [];
   List<CustomerPlotOption> _rows = const [];
   bool _loading = true;
 
@@ -486,7 +557,8 @@ class _AllocationPickerDialogState extends State<_AllocationPickerDialog> {
   void initState() {
     super.initState();
     _q = TextEditingController(text: widget.prefilter);
-    _reload();
+    _societyId = widget.societyId;
+    _bootstrap();
   }
 
   @override
@@ -495,9 +567,19 @@ class _AllocationPickerDialogState extends State<_AllocationPickerDialog> {
     super.dispose();
   }
 
+  Future<void> _bootstrap() async {
+    final societies = await PlotInventoryStore.societies();
+    if (!mounted) return;
+    setState(() => _societies = societies);
+    await _reload();
+  }
+
   Future<void> _reload() async {
     setState(() => _loading = true);
-    final rows = await ReceiptStore.activeCustomerPlots(query: _q.text);
+    final rows = await ReceiptStore.activeCustomerPlots(
+      query: _q.text,
+      societyId: _societyId,
+    );
     if (!mounted) return;
     setState(() {
       _rows = rows;
@@ -522,6 +604,24 @@ class _AllocationPickerDialogState extends State<_AllocationPickerDialog> {
                 prefixIcon: Icon(Icons.search),
               ),
               onChanged: (_) => _reload(),
+            ),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<int>(
+              value: _societyId,
+              decoration: const InputDecoration(
+                labelText: 'Society',
+                isDense: true,
+              ),
+              items: [
+                const DropdownMenuItem(value: 0, child: Text('All Societies')),
+                ..._societies.map(
+                  (s) => DropdownMenuItem(value: s.id, child: Text(s.name)),
+                ),
+              ],
+              onChanged: (v) {
+                setState(() => _societyId = v ?? 0);
+                _reload();
+              },
             ),
             const SizedBox(height: 10),
             Expanded(
@@ -590,6 +690,7 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
   double? _remaining;
   bool _loading = true;
   bool _saving = false;
+  bool _coverInstallments = false;
 
   bool get _isEdit => widget.editingReceiptId != null;
 
@@ -668,7 +769,8 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
       _mode = r.mode == 'Bank' ? 'Bank' : 'Cash';
       _refNo.text = r.refNo ?? '';
       _amount.text = r.amount.toStringAsFixed(2);
-      _notes.text = r.notes ?? '';
+      _coverInstallments = InstallmentCover.hasToken(r.notes);
+      _notes.text = InstallmentCover.stripToken(r.notes);
       try {
         _receiptDate = DateTime.parse(r.receiptDate);
       } catch (_) {
@@ -744,13 +846,32 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
     }
 
     setState(() => _saving = true);
+    var notes = _notes.text;
+    if (_coverInstallments) {
+      try {
+        final ctx = await ReceiptStore.installmentCoverContext(
+          _allocation!.id,
+          excludeReceiptId: widget.editingReceiptId,
+        );
+        final keys = InstallmentCover.computeCoverKeys(
+          booking: ctx.booking,
+          asOf: DateTime.now(),
+          amount: amount,
+          monthly: ctx.monthly,
+          alreadyPaid: ctx.paidKeys,
+        );
+        notes = InstallmentCover.applyToken(notes, keys);
+      } catch (_) {}
+    } else {
+      notes = InstallmentCover.stripToken(notes);
+    }
     final result = await ReceiptStore.saveReceipt(
       customerPlotId: _allocation!.id,
       receiptDate: _dateFmt.format(_receiptDate),
       amount: amount,
       mode: _mode!,
       refNo: _refNo.text,
-      notes: _notes.text,
+      notes: notes,
       editingReceiptId: widget.editingReceiptId,
       partnerId: _partner?.id,
     );
@@ -919,6 +1040,16 @@ class _ReceiptFormScreenState extends State<ReceiptFormScreen> {
                           maxLines: 3,
                           decoration:
                               const InputDecoration(labelText: 'Note'),
+                        ),
+                        CheckboxListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _coverInstallments,
+                          onChanged: (v) =>
+                              setState(() => _coverInstallments = v ?? false),
+                          title: const Text(
+                            'Cover previous/current installments only — no upcoming (WhatsApp hide)',
+                          ),
+                          controlAffinity: ListTileControlAffinity.leading,
                         ),
                         if (_allocation != null && _remaining != null) ...[
                           const SizedBox(height: 8),

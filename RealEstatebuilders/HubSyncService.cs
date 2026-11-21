@@ -29,6 +29,28 @@ namespace HubBuilders
             "block_monthly_installments"
         };
 
+        /// Rare/full heal — saari business forms (slow path, har tick nahi).
+        private static readonly string[] HotTables =
+        {
+            "societies", "blocks", "plot_types", "plots", "plans",
+            "customers", "brokers", "users", "customer_plots",
+            "ledger", "receipts", "Expensetbl", "Person", "Deal", "Credit",
+            "customer_plot_partners", "partner_money", "block_monthly_installments"
+        };
+
+        /// Live forms — har tick ~sub-second pull (customer/allocate/receipt).
+        private static readonly string[] LiveTables =
+        {
+            "customers", "customer_plots", "receipts", "ledger",
+            "plots", "partner_money", "customer_plot_partners"
+        };
+
+        private static DateTime _lastFullIncrementalUtc = DateTime.MinValue;
+        private static DateTime _lastDeepHealUtc = DateTime.MinValue;
+        private static readonly object _dirtyTablesLock = new object();
+        private static readonly HashSet<string> _dirtyTables =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         private static readonly Dictionary<string, Dictionary<string, string>> Fks =
             new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
             {
@@ -58,10 +80,17 @@ namespace HubBuilders
         private static System.Windows.Forms.Timer _timer;
         private static int _busy;
         private static int _manualHold;
+        private static volatile int _tickAgain;
         private static volatile bool _dirty = true;
         private static int _quietUi;
-        private static DateTime _lastCatchUpUtc = DateTime.UtcNow;
+        // MinValue: app start pe pehli ticks mein CatchUp — allocate miss na rahe
+        private static DateTime _lastCatchUpUtc = DateTime.MinValue;
+        private static DateTime _lastAllocCatchUpUtc = DateTime.MinValue;
         private static DateTime _lastPruneUtc = DateTime.MinValue;
+        private static DateTime _lastHashPushUtc = DateTime.MinValue;
+        private static DateTime _lastFullPruneUtc = DateTime.MinValue;
+        private static DateTime _lastSafetyPushUtc = DateTime.MinValue;
+        private static DateTime _lastMissingPushUtc = DateTime.MinValue;
 
         private static HttpClient CreateHttp()
         {
@@ -229,6 +258,91 @@ namespace HubBuilders
             return outRow;
         }
 
+        /// <summary>
+        /// Push se pehle: cloud pe jo sync_id already is_deleted=true hain unhe SKIP —
+        /// warna doosri device ka SoftMark overwrite ho jata hai (delete wapas zinda).
+        /// Skipped ids local se bhi delete (confirm prune).
+        /// </summary>
+        private static HashSet<string> FetchCloudDeletedSyncIds(string cloud, List<string> syncIds)
+        {
+            var deleted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(cloud) || syncIds == null || syncIds.Count == 0)
+                return deleted;
+            for (int i = 0; i < syncIds.Count; i += 40)
+            {
+                int n = Math.Min(40, syncIds.Count - i);
+                var sb = new StringBuilder();
+                for (int j = 0; j < n; j++)
+                {
+                    string sid = (syncIds[i + j] ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(sid)) continue;
+                    if (sb.Length > 0) sb.Append(",");
+                    sb.Append(Uri.EscapeDataString(sid));
+                }
+                if (sb.Length == 0) continue;
+                var rows = HttpGetListOk("/rest/v1/" + cloud
+                    + "?sync_id=in.(" + sb + ")&is_deleted=eq.true&select=sync_id&limit=100", 4);
+                if (rows == null) continue;
+                foreach (var row in rows)
+                {
+                    string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "").Trim();
+                    if (!string.IsNullOrWhiteSpace(id)) deleted.Add(id);
+                }
+            }
+            return deleted;
+        }
+
+        private static void DeleteLocalByCloudDeleted(string cloud, HashSet<string> deletedIds)
+        {
+            if (deletedIds == null || deletedIds.Count == 0) return;
+            string local = "";
+            foreach (string t in Tables)
+            {
+                if (string.Equals(CloudTable(t), cloud, StringComparison.OrdinalIgnoreCase))
+                {
+                    local = t;
+                    break;
+                }
+            }
+            if (string.IsNullOrWhiteSpace(local)) return;
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    Exec(con, "PRAGMA foreign_keys = OFF;");
+                    try
+                    {
+                        foreach (string sid in deletedIds)
+                        {
+                            using (var cmd = new SQLiteCommand(
+                                "DELETE FROM \"" + local + "\" WHERE sync_id=@s;", con))
+                            {
+                                cmd.Parameters.AddWithValue("@s", sid);
+                                cmd.ExecuteNonQuery();
+                            }
+                            using (var cmd = new SQLiteCommand("DELETE FROM sync_known WHERE sync_id=@s;", con))
+                            {
+                                cmd.Parameters.AddWithValue("@s", sid);
+                                cmd.ExecuteNonQuery();
+                            }
+                            using (var cmd = new SQLiteCommand("DELETE FROM sync_hash WHERE sync_id=@s;", con))
+                            {
+                                cmd.Parameters.AddWithValue("@s", sid);
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        try { Exec(con, "PRAGMA foreign_keys = ON;"); } catch { }
+                    }
+                }
+                RaiseLiveChanged();
+            }
+            catch { }
+        }
+
         private static bool FlushCloudBatch(List<Dictionary<string, object>> batch)
         {
             if (batch == null || batch.Count == 0) return true;
@@ -244,6 +358,24 @@ namespace HubBuilders
             bool allOk = true;
             foreach (var kv in grouped)
             {
+                var ids = new List<string>();
+                foreach (var row in kv.Value)
+                {
+                    string sid = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "").Trim();
+                    if (!string.IsNullOrWhiteSpace(sid)) ids.Add(sid);
+                }
+                var cloudDeleted = FetchCloudDeletedSyncIds(kv.Key, ids);
+                if (cloudDeleted.Count > 0)
+                {
+                    kv.Value.RemoveAll(row =>
+                    {
+                        string sid = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "").Trim();
+                        return cloudDeleted.Contains(sid);
+                    });
+                    DeleteLocalByCloudDeleted(kv.Key, cloudDeleted);
+                }
+                if (kv.Value.Count == 0) continue;
+
                 var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var row in kv.Value)
                 {
@@ -278,6 +410,17 @@ namespace HubBuilders
 
         private static bool UpsertCloud(string cloud, List<Dictionary<string, object>> rows)
         {
+            return UpsertCloudCore(cloud, rows, false);
+        }
+
+        /// PushOneNow — HttpFast (8s) taake WinForms→mobile <1s.
+        private static bool UpsertCloudFast(string cloud, List<Dictionary<string, object>> rows)
+        {
+            return UpsertCloudCore(cloud, rows, true);
+        }
+
+        private static bool UpsertCloudCore(string cloud, List<Dictionary<string, object>> rows, bool fast)
+        {
             if (rows == null || rows.Count == 0) return true;
             try
             {
@@ -286,7 +429,8 @@ namespace HubBuilders
                 ApplyHeaders(req);
                 req.Headers.TryAddWithoutValidation("Prefer", "resolution=merge-duplicates,return=minimal");
                 req.Content = new StringContent(Json.Serialize(rows), Encoding.UTF8, "application/json");
-                using (var resp = Http.SendAsync(req).GetAwaiter().GetResult())
+                HttpClient client = fast ? HttpFast : Http;
+                using (var resp = client.SendAsync(req).GetAwaiter().GetResult())
                 {
                     if (resp.IsSuccessStatusCode) return true;
                     if (rows.Count > 1)
@@ -294,7 +438,7 @@ namespace HubBuilders
                         bool ok = true;
                         foreach (var row in rows)
                         {
-                            if (!UpsertCloud(cloud, new List<Dictionary<string, object>> { row }))
+                            if (!UpsertCloudCore(cloud, new List<Dictionary<string, object>> { row }, fast))
                                 ok = false;
                         }
                         return ok;
@@ -311,7 +455,7 @@ namespace HubBuilders
                     bool ok = true;
                     foreach (var row in rows)
                     {
-                        if (!UpsertCloud(cloud, new List<Dictionary<string, object>> { row }))
+                        if (!UpsertCloudCore(cloud, new List<Dictionary<string, object>> { row }, fast))
                             ok = false;
                     }
                     return ok;
@@ -416,16 +560,20 @@ namespace HubBuilders
                         EnsureColumn(con, t, "sync_id", "TEXT");
                         Exec(con, "UPDATE \"" + t + "\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)='';");
                     }
+                    // sync_id index = tez + safe apply (SCAN band) — UNIQUE nahi (purani dup break na ho)
+                    EnsureSyncIdIndexes(con);
                 }
                 SeedHashesIfAlreadySynced();
                 try { BlockMonthlyInstallmentStore.EnsureSchema(); } catch { }
                 try { ReconcileOneActiveCustomerPlots(); } catch { }
                 try { BlockMonthlyInstallmentStore.ApplyToEmptyActive(); } catch { }
-                if (GetState("sync_schema") != "8")
+                // Schema bump: last_pull / first_pull WIPE mat karo — entries protect
+                string sch = GetState("sync_schema");
+                if (string.IsNullOrWhiteSpace(sch) || sch != "10")
                 {
-                    SetState("last_pull_utc", "1970-01-01T00:00:00.000Z");
-                    SetState("sync_schema", "8");
-                    SetState("alias_backfill_done", "");
+                    SetState("sync_schema", "10");
+                    if (string.IsNullOrWhiteSpace(GetState("alias_backfill_done")))
+                        SetState("alias_backfill_done", "");
                 }
             }
             catch { }
@@ -438,6 +586,28 @@ namespace HubBuilders
                 }
             }
             catch { }
+        }
+
+        /// <summary>Non-unique sync_id indexes — wipe/dup risk ke bina lookup tez.</summary>
+        private static void EnsureSyncIdIndexes(SQLiteConnection con)
+        {
+            string[] indexed =
+            {
+                "customers", "customer_plots", "receipts", "ledger", "plots",
+                "partner_money", "customer_plot_partners", "brokers", "plans",
+                "societies", "blocks", "plot_types", "users", "Person", "Deal",
+                "Credit", "Expensetbl", "block_monthly_installments"
+            };
+            foreach (string t in indexed)
+            {
+                try
+                {
+                    if (!TableExists(con, t)) continue;
+                    string idx = "idx_" + t.ToLowerInvariant() + "_sync_id";
+                    Exec(con, "CREATE INDEX IF NOT EXISTS \"" + idx + "\" ON \"" + t + "\"(sync_id);");
+                }
+                catch { }
+            }
         }
 
         /// <summary>Cloud duplicate sync_ids → local row (pull FK fix after merge).</summary>
@@ -532,7 +702,10 @@ namespace HubBuilders
         {
             return string.Equals(table, "partner_money", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(table, "receipts", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase);
+                || string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(table, "customers", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(table, "plots", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(table, "ledger", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void AliasCloudTable(
@@ -653,22 +826,149 @@ namespace HubBuilders
                     SetState("last_pull_utc", DateTime.UtcNow.ToString("o"));
                 MarkDirty();
                 RaiseLiveChanged();
-                ScheduleBackgroundPush();
+                ScheduleQuickSync();
             }
             catch { }
         }
 
+        /// <summary>Local insert/update/delete ke baad turant background push + open lists refresh.</summary>
         public static void MarkDirty()
         {
             _dirty = true;
         }
 
-        /// <summary>Local insert/update/delete ke baad turant background push + open lists refresh.</summary>
+        /// <summary>PushOneNow success ke baad — tick sirf pull kare, mass PushChanged na.</summary>
+        public static void ClearDirty()
+        {
+            _dirty = false;
+            lock (_dirtyTablesLock) _dirtyTables.Clear();
+        }
+
+        public static void MarkDirtyTable(string table)
+        {
+            _dirty = true;
+            if (string.IsNullOrWhiteSpace(table)) return;
+            lock (_dirtyTablesLock) _dirtyTables.Add(table.Trim());
+        }
+
         public static void NotifyLocalWrite()
         {
             try { MarkDirty(); } catch { }
             try { ScheduleBackgroundPushPublic(); } catch { }
             try { RaiseLiveChanged(); } catch { }
+        }
+
+        /// <summary>
+        /// Allocate/Receipt jaisi forms jo MainClass.SQL bypass karti hain —
+        /// turant usi row ka sync_id + cloud upsert, phir pull (full PushChanged wait nahi).
+        /// </summary>
+        public static void NotifyLocalWrite(string table, long rowId)
+        {
+            NotifyLocalWrites(new[] { new KeyValuePair<string, long>(table, rowId) });
+        }
+
+        public static void NotifyLocalWrites(IEnumerable<KeyValuePair<string, long>> rows)
+        {
+            try { RaiseLiveChanged(); } catch { }
+            var list = new List<KeyValuePair<string, long>>();
+            if (rows != null)
+            {
+                foreach (var kv in rows)
+                {
+                    if (kv.Value > 0 && !string.IsNullOrWhiteSpace(kv.Key))
+                        list.Add(kv);
+                }
+            }
+            if (list.Count == 0)
+            {
+                NotifyLocalWrite();
+                return;
+            }
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool anyFail = false;
+                foreach (var kv in list)
+                {
+                    try
+                    {
+                        MarkDirtyTable(kv.Key);
+                        long before = 0;
+                        try
+                        {
+                            using (var con = new SQLiteConnection(MainClass.con_string))
+                            {
+                                con.Open();
+                                if (!TableExists(con, kv.Key)) { anyFail = true; continue; }
+                                string pk = Pk(kv.Key);
+                                using (var cmd = new SQLiteCommand(
+                                    "SELECT 1 FROM \"" + kv.Key + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con))
+                                {
+                                    cmd.Parameters.AddWithValue("@id", kv.Value);
+                                    before = cmd.ExecuteScalar() == null ? 0 : 1;
+                                }
+                            }
+                        }
+                        catch { }
+                        if (before <= 0) { anyFail = true; continue; }
+                        if (!PushOneNow(kv.Key, kv.Value)) anyFail = true;
+                    }
+                    catch { anyFail = true; MarkDirtyTable(kv.Key); }
+                }
+                try
+                {
+                    if (!anyFail) ClearDirty();
+                    // Fail par dirty tables rehti hain — tick PushChanged retry
+                    ScheduleQuickSync();
+                }
+                catch { }
+            });
+        }
+
+        /// <summary>Null sync_id — sirf LiveTables (har tick pura DB mat ghumao).</summary>
+        private static void EnsureMissingSyncIds()
+        {
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    int changed = 0;
+                    foreach (string table in LiveTables)
+                    {
+                        if (!TableExists(con, table)) continue;
+                        using (var cmd = new SQLiteCommand(
+                            "UPDATE \"" + table + "\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)='';",
+                            con))
+                        {
+                            int n = cmd.ExecuteNonQuery();
+                            if (n > 0)
+                            {
+                                changed += n;
+                                MarkDirtyTable(table);
+                            }
+                        }
+                    }
+                    if (changed > 0) _dirty = true;
+                }
+            }
+            catch { }
+        }
+
+        private static bool IsLastPullStale(int minutes)
+        {
+            try
+            {
+                string lp = GetState("last_pull_utc");
+                if (string.IsNullOrWhiteSpace(lp)) return true;
+                DateTime t;
+                if (!DateTime.TryParse(lp, null,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out t))
+                    return true;
+                if (t.Kind == DateTimeKind.Unspecified)
+                    t = DateTime.SpecifyKind(t, DateTimeKind.Utc);
+                return (DateTime.UtcNow - t.ToUniversalTime()).TotalMinutes > minutes;
+            }
+            catch { return true; }
         }
 
         /// <summary>Manual Pull Now — wait for auto-tick, phir pull. Busy pe turant fail nahi.</summary>
@@ -695,6 +995,7 @@ namespace HubBuilders
                     else
                     {
                         PullIncremental();
+                        PullRecentHeal(120);
                         CatchUpMissing();
                     }
                     ReconcileUsersFromCloud();
@@ -708,7 +1009,7 @@ namespace HubBuilders
             finally { Interlocked.Decrement(ref _manualHold); }
         }
 
-        /// <summary>Manual Sync Now — wait for auto-tick, pull+push+hard-delete prune.</summary>
+        /// <summary>Manual Sync Now — wait for auto-tick, pull+push+soft-delete prune.</summary>
         public static bool TrySyncNow()
         {
             if (!SupabaseConfig.IsConfigured) return false;
@@ -736,6 +1037,7 @@ namespace HubBuilders
                         else
                         {
                             PullIncremental();
+                            PullRecentHeal(120);
                             CatchUpMissing();
                         }
                         ReconcileUsersFromCloud();
@@ -748,6 +1050,7 @@ namespace HubBuilders
                     else
                     {
                         PullIncremental();
+                        PullRecentHeal(120);
                         CatchUpMissing();
                     }
                     ReconcileUsersFromCloud();
@@ -777,59 +1080,13 @@ namespace HubBuilders
         };
 
         /// <summary>
-        /// Force Recover from Cloud (UI entry): push-pending-deletes (+ restore push if flagged),
-        /// then insert-missing-only for allocate chain. No full merge rewrite, no prune.
+        /// Force Recover UI entry — DISABLED (galati se press = pehle wala masla).
+        /// Normal Sync/Pull use karein. Internal missing-insert logic alag rehti hai.
         /// </summary>
         public static bool TryForceRecoverFromCloud(out string summary)
         {
-            summary = "";
-            if (!SupabaseConfig.IsConfigured)
-            {
-                summary = "Supabase configured nahi / offline";
-                return false;
-            }
-            Interlocked.Increment(ref _manualHold);
-            try
-            {
-                if (!WaitForSyncLock(90))
-                {
-                    summary = "Sync busy — thodi der baad dobara try";
-                    return false;
-                }
-                try
-                {
-                    // Intentional deletes pehle cloud pe soft-mark — warna missing-pull resurrect kar de
-                    PushPendingDeletes();
-                    if (GetState("restore_push_first") == "1")
-                    {
-                        PushChanged();
-                        _dirty = false;
-                        SetState("restore_push_first", "");
-                    }
-
-                    int recovered, skipped, allocateRecovered;
-                    string skipReasons;
-                    ForceRecoverMissingFromCloud(out recovered, out skipped, out allocateRecovered, out skipReasons);
-                    try { ReconcileOneActiveCustomerPlots(); } catch { }
-                    // NO SafePruneGoneFromCloud — local-only extras mat mitao
-                    RaiseLiveChanged();
-
-                    summary = "Recovered " + recovered + " missing rows"
-                        + " (allocate=" + allocateRecovered + ")"
-                        + ", skipped " + skipped + " duplicates (same sync_id)."
-                        + " Local extras wipe nahi.";
-                    if (!string.IsNullOrWhiteSpace(skipReasons))
-                        summary += " Skipped: " + skipReasons;
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    summary = "Recover fail: " + ex.Message;
-                    return false;
-                }
-                finally { Interlocked.Exchange(ref _busy, 0); }
-            }
-            finally { Interlocked.Decrement(ref _manualHold); }
+            summary = "Force Recover band hai — Sync Now / Pull Now use karein. Galati se recover nahi hoga.";
+            return false;
         }
 
         /// <summary>
@@ -911,6 +1168,13 @@ namespace HubBuilders
 
                             if (isAlloc)
                                 EnsureRecoverParentsForCustomerPlots(fetched, skipList);
+                            else if (string.Equals(table, "customers", StringComparison.OrdinalIgnoreCase))
+                                FilterOutRecoverPlaceholderCustomers(fetched, skipList);
+                            else if (string.Equals(table, "receipts", StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(table, "ledger", StringComparison.OrdinalIgnoreCase))
+                                FilterRecoverChildrenToExistingAllocs(table, fetched, skipList);
+
+                            if (fetched.Count == 0) continue;
 
                             int before = LocalRowCount(table);
                             ApplyFetched(AsApplyRows(table, fetched));
@@ -991,13 +1255,14 @@ namespace HubBuilders
         }
 
         /// <summary>
-        /// Force Recover only: fetch missing plot chain + customer (incl. soft-deleted parents).
-        /// If customer_sync_id null/missing but plot resolves → minimal placeholder customer.
+        /// Force Recover only: plot chain + real cloud customer (incl. soft-deleted).
+        /// NO placeholder — orphan / null-customer allocates removed from list (hisab safe).
         /// </summary>
         private static void EnsureRecoverParentsForCustomerPlots(
             List<Dictionary<string, object>> cloudRows, List<string> skipList)
         {
             if (cloudRows == null || cloudRows.Count == 0) return;
+            var keep = new List<Dictionary<string, object>>();
             foreach (var row in cloudRows)
             {
                 try
@@ -1007,6 +1272,14 @@ namespace HubBuilders
                     string custSync = Convert.ToString(row.ContainsKey("customer_sync_id") ? row["customer_sync_id"] : "");
                     string planSync = Convert.ToString(row.ContainsKey("plan_sync_id") ? row["plan_sync_id"] : "");
                     string brokerSync = Convert.ToString(row.ContainsKey("broker_sync_id") ? row["broker_sync_id"] : "");
+                    string shortId = allocSync.Length >= 8 ? allocSync.Substring(0, 8) : allocSync;
+
+                    if (!string.IsNullOrWhiteSpace(custSync)
+                        && custSync.Trim().StartsWith("recover_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        skipList.Add(shortId + ": skip — placeholder customer_sync_id");
+                        continue;
+                    }
 
                     if (!string.IsNullOrWhiteSpace(plotSync))
                         EnsureRecoverPlotChain(plotSync);
@@ -1029,24 +1302,23 @@ namespace HubBuilders
 
                         if (!plotId.HasValue)
                         {
-                            skipList.Add((allocSync.Length >= 8 ? allocSync.Substring(0, 8) : allocSync)
-                                + ": plot parent missing");
+                            skipList.Add(shortId + ": plot parent missing");
                             continue;
                         }
 
-                        if (!custId.HasValue)
+                        if (string.IsNullOrWhiteSpace(custSync) || !custId.HasValue)
                         {
-                            // Placeholder only when plot resolved — needed for customer_id NOT NULL
-                            long ph = EnsureRecoverPlaceholderCustomer(con, custSync, allocSync);
-                            if (ph > 0)
-                            {
-                                // So ApplyRow resolves __fk_customer_id (null cloud customer_sync_id included)
-                                string phSync = string.IsNullOrWhiteSpace(custSync)
-                                    ? ("recover_" + (allocSync ?? "").Trim())
-                                    : custSync.Trim();
-                                row["customer_sync_id"] = phSync;
-                            }
+                            skipList.Add(shortId + ": skip — no valid cloud customer");
+                            continue;
                         }
+
+                        if (IsLocalRecoverPlaceholderCustomer(con, custId.Value))
+                        {
+                            skipList.Add(shortId + ": skip — Recovered placeholder customer");
+                            continue;
+                        }
+
+                        keep.Add(row);
                     }
                 }
                 catch (Exception ex)
@@ -1059,6 +1331,90 @@ namespace HubBuilders
                     catch { }
                 }
             }
+            cloudRows.Clear();
+            cloudRows.AddRange(keep);
+        }
+
+        private static void FilterOutRecoverPlaceholderCustomers(
+            List<Dictionary<string, object>> rows, List<string> skipList)
+        {
+            if (rows == null || rows.Count == 0) return;
+            var keep = new List<Dictionary<string, object>>();
+            foreach (var row in rows)
+            {
+                if (IsForceRecoverPlaceholderCustomerPayload(row))
+                {
+                    string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "?");
+                    skipList.Add((id.Length >= 8 ? id.Substring(0, 8) : id) + ": skip — Recovered placeholder");
+                    continue;
+                }
+                keep.Add(row);
+            }
+            rows.Clear();
+            rows.AddRange(keep);
+        }
+
+        private static void FilterRecoverChildrenToExistingAllocs(
+            string table, List<Dictionary<string, object>> rows, List<string> skipList)
+        {
+            if (rows == null || rows.Count == 0) return;
+            var keep = new List<Dictionary<string, object>>();
+            using (var con = new SQLiteConnection(MainClass.con_string))
+            {
+                con.Open();
+                foreach (var row in rows)
+                {
+                    string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "");
+                    string cpSync = Convert.ToString(
+                        row.ContainsKey("customer_plot_sync_id") ? row["customer_plot_sync_id"] : "");
+                    string shortId = id.Length >= 8 ? id.Substring(0, 8) : id;
+                    if (string.IsNullOrWhiteSpace(cpSync)
+                        || !LocalIdBySync(con, "customer_plots", cpSync.Trim()).HasValue)
+                    {
+                        skipList.Add(shortId + ": skip — parent allocate missing (" + table + ")");
+                        continue;
+                    }
+                    keep.Add(row);
+                }
+            }
+            rows.Clear();
+            rows.AddRange(keep);
+        }
+
+        private static bool IsForceRecoverPlaceholderCustomerPayload(Dictionary<string, object> row)
+        {
+            if (row == null) return false;
+            string sid = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "") ?? "";
+            string name = Convert.ToString(row.ContainsKey("name") ? row["name"] : "") ?? "";
+            string notes = Convert.ToString(row.ContainsKey("notes") ? row["notes"] : "") ?? "";
+            if (sid.Trim().StartsWith("recover_", StringComparison.OrdinalIgnoreCase)) return true;
+            if (notes.IndexOf("force-recover", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (name.StartsWith("Recovered (", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static bool IsLocalRecoverPlaceholderCustomer(SQLiteConnection con, long customerId)
+        {
+            try
+            {
+                using (var cmd = new SQLiteCommand(
+                    "SELECT name, notes, sync_id FROM customers WHERE id=@id LIMIT 1;", con))
+                {
+                    cmd.Parameters.AddWithValue("@id", customerId);
+                    using (var r = cmd.ExecuteReader())
+                    {
+                        if (!r.Read()) return true;
+                        string name = Convert.ToString(r["name"] ?? "");
+                        string notes = Convert.ToString(r["notes"] ?? "");
+                        string sid = Convert.ToString(r["sync_id"] ?? "");
+                        if (sid.Trim().StartsWith("recover_", StringComparison.OrdinalIgnoreCase)) return true;
+                        if (notes.IndexOf("force-recover", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                        if (name.StartsWith("Recovered (", StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                }
+            }
+            catch { return true; }
+            return false;
         }
 
         private static void EnsureRecoverPlotChain(string plotSyncId)
@@ -1089,6 +1445,13 @@ namespace HubBuilders
         private static void FetchAndApplyMissingRows(string table, List<string> syncIds, bool includeDeleted)
         {
             if (syncIds == null || syncIds.Count == 0) return;
+            if (string.Equals(table, "customers", StringComparison.OrdinalIgnoreCase))
+            {
+                syncIds = syncIds.FindAll(s =>
+                    !string.IsNullOrWhiteSpace(s)
+                    && !s.Trim().StartsWith("recover_", StringComparison.OrdinalIgnoreCase));
+                if (syncIds.Count == 0) return;
+            }
             var need = new List<string>();
             using (var con = new SQLiteConnection(MainClass.con_string))
             {
@@ -1115,6 +1478,12 @@ namespace HubBuilders
                 var fetched = HttpGetList(q);
                 if (fetched != null && fetched.Count > 0)
                 {
+                    if (string.Equals(table, "customers", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var skip = new List<string>();
+                        FilterOutRecoverPlaceholderCustomers(fetched, skip);
+                        if (fetched.Count == 0) continue;
+                    }
                     // Soft-deleted parents: insert as live for FK resolve (do not ApplyRow-delete)
                     if (includeDeleted)
                     {
@@ -1126,36 +1495,11 @@ namespace HubBuilders
             }
         }
 
-        /// <summary>
-        /// Force Recover only — minimal local customer so customer_plots.customer_id NOT NULL can insert.
-        /// Uses cloud customer_sync_id when present; else stable recover_&lt;allocSync&gt;.
-        /// </summary>
+        /// <summary>DISABLED — Recovered placeholders caused bad hisab. No-op for safety.</summary>
         private static long EnsureRecoverPlaceholderCustomer(
             SQLiteConnection con, string customerSyncId, string allocSyncId)
         {
-            string sid = (customerSyncId ?? "").Trim();
-            if (sid.Length == 0)
-            {
-                string a = (allocSyncId ?? "").Trim();
-                sid = a.Length > 0 ? ("recover_" + a) : ("recover_" + Guid.NewGuid().ToString("N"));
-            }
-            long? existing = LocalIdBySync(con, "customers", sid);
-            if (existing.HasValue) return existing.Value;
-
-            string name = string.IsNullOrWhiteSpace(customerSyncId)
-                ? "Recovered (no cloud customer)"
-                : "Recovered (cloud customer missing)";
-            using (var cmd = new SQLiteCommand(
-                "INSERT INTO customers (name, father_name, mobile, cnic, notes, sync_id) "
-                + "VALUES (@n,'','','',@note,@s);", con))
-            {
-                cmd.Parameters.AddWithValue("@n", name);
-                cmd.Parameters.AddWithValue("@note", "force-recover placeholder");
-                cmd.Parameters.AddWithValue("@s", sid);
-                cmd.ExecuteNonQuery();
-            }
-            existing = LocalIdBySyncExact(con, "customers", sid);
-            return existing ?? 0;
+            return 0;
         }
 
         /// <summary>Isi table ke sync_id only — alias se missing hide nahi.</summary>
@@ -1253,7 +1597,31 @@ namespace HubBuilders
             catch { return false; }
         }
 
-        /// <summary>Queued deletes — soft-mark retry + hard delete (space).</summary>
+        private static HashSet<string> LoadPendingDeleteSyncIds()
+        {
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT sync_id FROM sync_pending_delete;", con))
+                    using (var r = cmd.ExecuteReader())
+                    {
+                        while (r.Read())
+                        {
+                            string s = Convert.ToString(r[0] ?? "").Trim();
+                            if (!string.IsNullOrWhiteSpace(s)) ids.Add(s);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return ids;
+        }
+
+        /// <summary>Queued deletes — soft-mark tombstone only (no hard-delete; other devices need is_deleted=true).</summary>
         private static bool PushPendingDeletes()
         {
             if (!SupabaseConfig.IsConfigured) return !HasPendingDeletes();
@@ -1283,15 +1651,8 @@ namespace HubBuilders
             bool allOk = true;
             foreach (var p in pending)
             {
-                // Soft-mark pehle — doosre devices pull se delete apply kar saken
-                SoftMarkCloudDeleted(p.Item1, p.Item2);
-                bool aged = PendingDeleteAged(p.Item3, 45);
-                if (!aged)
-                {
-                    allOk = false; // abhi soft window — hard baad mein
-                    continue;
-                }
-                if (HardDeleteCloudRow(p.Item1, p.Item2))
+                // Soft tombstone only — hard delete se mobile/PC delete signal kho jata hai
+                if (SoftMarkCloudDeleted(p.Item1, p.Item2))
                     RemovePendingDelete(p.Item2);
                 else
                     allOk = false;
@@ -1309,35 +1670,176 @@ namespace HubBuilders
             return (DateTime.Now - q.ToLocalTime()).TotalSeconds >= minSec;
         }
 
-        private static void ScheduleBackgroundPush()
+        /// Local save/delete ke baad: poora tick (PULL pehle, phir PUSH) — sirf push se mobile slow rehta tha.
+        private static void ScheduleQuickSync()
         {
+            if (!SupabaseConfig.IsConfigured) return;
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                try
-                {
-                    if (!SupabaseConfig.IsConfigured) return;
-                    PushPendingDeletes();
-                    if (_dirty && CanPush())
-                    {
-                        if (PushChanged()) _dirty = false;
-                    }
-                }
+                try { KickTick(); }
                 catch { }
             });
         }
 
+        private static void KickTick()
+        {
+            if (Interlocked.CompareExchange(ref _manualHold, 0, 0) != 0) return;
+            if (Interlocked.Exchange(ref _busy, 1) == 1)
+            {
+                Interlocked.Exchange(ref _tickAgain, 1);
+                return;
+            }
+            try { TickSafeCore(); }
+            catch { }
+            finally { Interlocked.Exchange(ref _busy, 0); }
+            if (Interlocked.Exchange(ref _tickAgain, 0) != 0)
+                ThreadPool.QueueUserWorkItem(__ => { try { KickTick(); } catch { } });
+        }
+
         public static void ScheduleBackgroundPushPublic()
         {
-            ScheduleBackgroundPush();
+            ScheduleQuickSync();
         }
 
         public static void PushOne(string table, long rowId)
         {
-            if (rowId <= 0 || string.IsNullOrWhiteSpace(table)) return;
-            if (table.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) >= 0) return;
-            if (table.StartsWith("sync_", StringComparison.OrdinalIgnoreCase)) return;
-            MarkDirty();
-            ScheduleBackgroundPush();
+            MarkDirtyTable(table);
+            if (!PushOneNow(table, rowId))
+                MarkDirtyTable(table);
+            else
+                ClearDirty();
+            ScheduleQuickSync();
+        }
+
+        /// <summary>1 row turant cloud. true = cloud OK (mobile pull kar sake).</summary>
+        public static bool PushOneNow(string table, long rowId)
+        {
+            if (rowId <= 0 || string.IsNullOrWhiteSpace(table)) return false;
+            if (table.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (table.StartsWith("sync_", StringComparison.OrdinalIgnoreCase)) return true;
+            if (!SupabaseConfig.IsConfigured) return false;
+            try
+            {
+                // Allocate/receipt: pehle parents cloud — mobile list empty na rahe
+                if (string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using (var con = new SQLiteConnection(MainClass.con_string))
+                        {
+                            con.Open();
+                            using (var cmd = new SQLiteCommand(
+                                "SELECT customer_id, plot_id, broker_id FROM customer_plots WHERE id=@id LIMIT 1;", con))
+                            {
+                                cmd.Parameters.AddWithValue("@id", rowId);
+                                using (var r = cmd.ExecuteReader())
+                                {
+                                    if (r.Read())
+                                    {
+                                        long cid = 0, pid = 0, bid = 0;
+                                        try { cid = Convert.ToInt64(r["customer_id"] ?? 0); } catch { }
+                                        try { pid = Convert.ToInt64(r["plot_id"] ?? 0); } catch { }
+                                        try { if (r["broker_id"] != DBNull.Value) bid = Convert.ToInt64(r["broker_id"]); } catch { }
+                                        if (cid > 0) PushOneNow("customers", cid);
+                                        if (pid > 0) PushOneNow("plots", pid);
+                                        if (bid > 0) PushOneNow("brokers", bid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                else if (string.Equals(table, "receipts", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(table, "ledger", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using (var con = new SQLiteConnection(MainClass.con_string))
+                        {
+                            con.Open();
+                            using (var cmd = new SQLiteCommand(
+                                "SELECT customer_plot_id FROM \"" + table + "\" WHERE id=@id LIMIT 1;", con))
+                            {
+                                cmd.Parameters.AddWithValue("@id", rowId);
+                                object o = cmd.ExecuteScalar();
+                                long allocId;
+                                if (o != null && o != DBNull.Value
+                                    && long.TryParse(Convert.ToString(o), out allocId) && allocId > 0)
+                                    PushOneNow("customer_plots", allocId);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    if (!TableExists(con, table)) return false;
+                    string pk = Pk(table);
+                    using (var fix = new SQLiteCommand(
+                        "UPDATE \"" + table + "\" SET sync_id = lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", con))
+                    {
+                        fix.Parameters.AddWithValue("@id", rowId);
+                        fix.ExecuteNonQuery();
+                    }
+                    Dictionary<string, object> payload = null;
+                    using (var cmd = new SQLiteCommand("SELECT * FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con))
+                    {
+                        cmd.Parameters.AddWithValue("@id", rowId);
+                        using (var r = cmd.ExecuteReader())
+                        {
+                            if (!r.Read()) return false;
+                            payload = ReadPayload(r);
+                        }
+                    }
+                    string syncId = Convert.ToString(payload.ContainsKey("sync_id") ? payload["sync_id"] : "").Trim();
+                    if (string.IsNullOrWhiteSpace(syncId)) return false;
+                    Dictionary<string, string> fks;
+                    if (Fks.TryGetValue(table, out fks))
+                    {
+                        foreach (var kv in fks)
+                        {
+                            object fkVal;
+                            if (!payload.TryGetValue(kv.Key, out fkVal) || fkVal == null) continue;
+                            string parentSync = LookupSyncId(con, kv.Value, fkVal);
+                            if (!string.IsNullOrEmpty(parentSync))
+                                payload["__fk_" + kv.Key] = parentSync;
+                        }
+                    }
+                    string staff = (MainClass.LoggedInName ?? MainClass.LoggedInUsername ?? "").Trim();
+                    string hash = RowHash(payload);
+                    string dupKey = DupKey(table, payload);
+                    var cloudRow = LocalToCloudRow(table, payload, con);
+                    cloudRow["dup_key"] = dupKey ?? "";
+                    cloudRow["is_deleted"] = false;
+                    cloudRow["staff_name"] = staff;
+                    cloudRow["updated_at"] = UtcFilter(DateTime.UtcNow);
+                    string cloud = CloudTable(table);
+                    var rows = new List<Dictionary<string, object>> { cloudRow };
+                    // Fast pehle; fail → slow Http (ClearDirty se pehle cloud lazmi)
+                    if (!UpsertCloudFast(cloud, rows) && !UpsertCloud(cloud, rows))
+                    {
+                        MarkDirtyTable(table);
+                        return false;
+                    }
+                    SaveHash(con, syncId, hash);
+                    using (var cmd = new SQLiteCommand(
+                        "INSERT OR REPLACE INTO sync_known(sync_id, table_name) VALUES(@s,@t);", con))
+                    {
+                        cmd.Parameters.AddWithValue("@s", syncId);
+                        cmd.Parameters.AddWithValue("@t", table);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                RaiseLiveChanged();
+                return true;
+            }
+            catch
+            {
+                try { MarkDirtyTable(table); } catch { }
+                return false;
+            }
         }
 
         internal static string TablePk(string table) { return Pk(table); }
@@ -1603,7 +2105,7 @@ namespace HubBuilders
                 }
             }
             catch { }
-            ScheduleBackgroundPush();
+            ScheduleQuickSync();
         }
 
         /// Local delete ke baad cloud row hard delete (Supabase se bilkul khatam).
@@ -1612,14 +2114,15 @@ namespace HubBuilders
             PushDeletedOne(localTable, syncId);
         }
 
-        /// <summary>Soft-delete signal (pull) + queue hard delete (space). Doosre devices isi se sync.</summary>
+        /// <summary>Soft-delete tombstone for other devices. Hard-delete sync path se band (mobile miss fix).</summary>
         private static bool PushDeletedOne(string localTable, string syncId)
         {
             if (string.IsNullOrWhiteSpace(localTable) || string.IsNullOrWhiteSpace(syncId)) return true;
             QueuePendingDelete(localTable, syncId);
             if (!SupabaseConfig.IsConfigured) return false;
             bool softOk = SoftMarkCloudDeleted(localTable, syncId);
-            // Soft ke baad thodi der soft row rehne do — phir hard (PushPendingDeletes)
+            if (softOk) RemovePendingDelete(syncId);
+            // Soft tombstone cloud pe rehti hai — PushPendingDeletes hard delete nahi karta
             try
             {
                 using (var con = new SQLiteConnection(MainClass.con_string))
@@ -1646,55 +2149,167 @@ namespace HubBuilders
             return softOk;
         }
 
-        /// <summary>is_deleted=true — doosre PC/mobile incremental pull pe ApplyRow delete.</summary>
+        /// <summary>
+        /// Cloud pe is_deleted=true TOMBSTONE lazmi. Row hard-missing ho to INSERT tombstone —
+        /// warna mobile/PC delete signal nahi milta (absence pe local delete band hai).
+        /// </summary>
         private static bool SoftMarkCloudDeleted(string localTable, string syncId)
         {
             if (string.IsNullOrWhiteSpace(localTable) || string.IsNullOrWhiteSpace(syncId)) return true;
+            string sid = syncId.Trim();
+            string cloud = CloudTable(localTable);
+            string patchJson = Json.Serialize(new Dictionary<string, object>
+            {
+                { "is_deleted", true },
+                { "updated_at", UtcFilter(DateTime.UtcNow) }
+            });
+            // Fast PATCH, phir slow Http — mobile delete signal miss na ho
+            foreach (HttpClient client in new[] { HttpFast, Http })
+            {
+                try
+                {
+                    string url = SupabaseConfig.Url.TrimEnd('/') + "/rest/v1/" + cloud
+                        + "?sync_id=eq." + Uri.EscapeDataString(sid);
+                    var req = new HttpRequestMessage(new HttpMethod("PATCH"), url);
+                    ApplyHeaders(req);
+                    req.Headers.TryAddWithoutValidation("Prefer", "return=representation");
+                    req.Content = new StringContent(patchJson, Encoding.UTF8, "application/json");
+                    using (var resp = client.SendAsync(req).GetAwaiter().GetResult())
+                    {
+                        if (resp.IsSuccessStatusCode)
+                        {
+                            string respBody = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() ?? "";
+                            if (respBody.IndexOf("\"is_deleted\":true", StringComparison.OrdinalIgnoreCase) >= 0
+                                || respBody.IndexOf("\"is_deleted\": true", StringComparison.OrdinalIgnoreCase) >= 0)
+                                return true;
+                        }
+                    }
+                }
+                catch { }
+            }
             try
             {
-                string url = SupabaseConfig.Url.TrimEnd('/') + "/rest/v1/" + CloudTable(localTable)
-                    + "?sync_id=eq." + Uri.EscapeDataString(syncId.Trim());
-                var req = new HttpRequestMessage(new HttpMethod("PATCH"), url);
-                ApplyHeaders(req);
-                req.Headers.TryAddWithoutValidation("Prefer", "return=minimal");
-                var body = new Dictionary<string, object>
-                {
-                    { "is_deleted", true },
-                    { "updated_at", DateTime.UtcNow.ToString("o") }
-                };
-                req.Content = new StringContent(Json.Serialize(body), Encoding.UTF8, "application/json");
-                using (var resp = HttpFast.SendAsync(req).GetAwaiter().GetResult())
-                    return resp.IsSuccessStatusCode;
+                var check = HttpGetListOk("/rest/v1/" + cloud
+                    + "?sync_id=eq." + Uri.EscapeDataString(sid)
+                    + "&select=sync_id,is_deleted&limit=1", 4);
+                if (check != null && check.Count > 0 && CloudRowIsDeleted(check[0]))
+                    return true;
+            }
+            catch { }
+            // Tombstone upsert (row missing ya PATCH no-op) — mobile prune isi pe chalta hai
+            try
+            {
+                var tomb = BuildDeleteTombstone(localTable, sid);
+                EnrichTombstoneFromLocal(localTable, sid, tomb);
+                tomb["updated_at"] = UtcFilter(DateTime.UtcNow);
+                if (!UpsertCloudFast(cloud, new List<Dictionary<string, object>> { tomb })
+                    && !UpsertCloud(cloud, new List<Dictionary<string, object>> { tomb }))
+                    return false;
+                var check2 = HttpGetListOk("/rest/v1/" + cloud
+                    + "?sync_id=eq." + Uri.EscapeDataString(sid)
+                    + "&select=sync_id,is_deleted&limit=1", 4);
+                return check2 != null && check2.Count > 0 && CloudRowIsDeleted(check2[0]);
             }
             catch { return false; }
         }
 
-        private static bool HardDeleteCloudRow(string localTable, string syncId)
+        /// <summary>Minimal cloud row so is_deleted tombstone insert NOT NULL fail na kare.</summary>
+        private static Dictionary<string, object> BuildDeleteTombstone(string localTable, string syncId)
         {
-            if (string.IsNullOrWhiteSpace(localTable) || string.IsNullOrWhiteSpace(syncId)) return true;
+            var tomb = new Dictionary<string, object>
+            {
+                { "sync_id", syncId },
+                { "is_deleted", true },
+                { "updated_at", DateTime.UtcNow.ToString("o") },
+                { "staff_name", (MainClass.LoggedInName ?? MainClass.LoggedInUsername ?? "system").Trim() }
+            };
+            string t = (localTable ?? "").Trim();
+            if (string.Equals(t, "customer_plots", StringComparison.OrdinalIgnoreCase))
+            {
+                tomb["booking_date"] = DateTime.Today.ToString("yyyy-MM-dd");
+                tomb["price"] = 0;
+                tomb["down_payment"] = 0;
+                tomb["status"] = "Cancelled";
+                tomb["deal_type"] = "Installment";
+                tomb["notes"] = "";
+            }
+            else if (string.Equals(t, "customers", StringComparison.OrdinalIgnoreCase))
+            {
+                tomb["name"] = "(deleted)";
+                tomb["mobile"] = "";
+                tomb["cnic"] = "";
+            }
+            else if (string.Equals(t, "receipts", StringComparison.OrdinalIgnoreCase))
+            {
+                tomb["receipt_date"] = DateTime.Today.ToString("yyyy-MM-dd");
+                tomb["amount"] = 0;
+                tomb["mode"] = "Cash";
+            }
+            else if (string.Equals(t, "ledger", StringComparison.OrdinalIgnoreCase))
+            {
+                tomb["txn_date"] = DateTime.Today.ToString("yyyy-MM-dd");
+                tomb["txn_type"] = "Adjustment";
+                tomb["debit"] = 0;
+                tomb["credit"] = 0;
+            }
+            return tomb;
+        }
+
+        /// <summary>Local row abhi maujood ho to FK sync_ids tombstone mein daalo (allocate delete pehle cloud).</summary>
+        private static void EnrichTombstoneFromLocal(string localTable, string syncId, Dictionary<string, object> tomb)
+        {
+            if (tomb == null || string.IsNullOrWhiteSpace(localTable) || string.IsNullOrWhiteSpace(syncId)) return;
             try
             {
-                string url = SupabaseConfig.Url.TrimEnd('/') + "/rest/v1/" + CloudTable(localTable)
-                    + "?sync_id=eq." + Uri.EscapeDataString(syncId.Trim());
-                var req = new HttpRequestMessage(HttpMethod.Delete, url);
-                ApplyHeaders(req);
-                req.Headers.TryAddWithoutValidation("Prefer", "return=minimal");
-                using (var resp = HttpFast.SendAsync(req).GetAwaiter().GetResult())
+                using (var con = new SQLiteConnection(MainClass.con_string))
                 {
-                    if (!resp.IsSuccessStatusCode) return false;
+                    con.Open();
+                    if (!TableExists(con, localTable)) return;
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT * FROM \"" + localTable + "\" WHERE sync_id=@s LIMIT 1;", con))
+                    {
+                        cmd.Parameters.AddWithValue("@s", syncId);
+                        using (var r = cmd.ExecuteReader())
+                        {
+                            if (!r.Read()) return;
+                            var payload = ReadPayload(r);
+                            Dictionary<string, string> fks;
+                            if (!Fks.TryGetValue(localTable, out fks) || fks == null) return;
+                            foreach (var kv in fks)
+                            {
+                                object fkVal;
+                                if (!payload.TryGetValue(kv.Key, out fkVal) || fkVal == null) continue;
+                                string parent = LookupSyncId(con, kv.Value, fkVal);
+                                if (!string.IsNullOrEmpty(parent))
+                                    tomb[FkCloudCol(kv.Key)] = parent;
+                            }
+                            if (payload.ContainsKey("booking_date") && payload["booking_date"] != null)
+                                tomb["booking_date"] = Convert.ToString(payload["booking_date"]);
+                            if (payload.ContainsKey("status") && payload["status"] != null)
+                                tomb["status"] = Convert.ToString(payload["status"]);
+                            if (payload.ContainsKey("price") && payload["price"] != null)
+                                tomb["price"] = payload["price"];
+                        }
+                    }
                 }
-                // Verify — RLS no-op delete catch
-                var left = HttpGetListOk("/rest/v1/" + CloudTable(localTable)
-                    + "?sync_id=eq." + Uri.EscapeDataString(syncId.Trim())
-                    + "&select=sync_id&limit=1", 4);
-                if (left != null && left.Count > 0)
-                {
-                    SoftMarkCloudDeleted(localTable, syncId);
-                    return false;
-                }
-                return true;
             }
-            catch { return false; }
+            catch { }
+        }
+
+        private static bool CloudRowIsDeleted(Dictionary<string, object> row)
+        {
+            if (row == null) return false;
+            object del;
+            if (!row.TryGetValue("is_deleted", out del) || del == null) return false;
+            if (del is bool) return (bool)del;
+            string ds = Convert.ToString(del);
+            return string.Equals(ds, "true", StringComparison.OrdinalIgnoreCase) || ds == "1";
+        }
+
+        /// <summary>Sync tables pe hard DELETE band — hamesha soft tombstone (mobile delete signal).</summary>
+        private static bool HardDeleteCloudRow(string localTable, string syncId)
+        {
+            return SoftMarkCloudDeleted(localTable, syncId);
         }
 
         /// Cloud login hard delete — username wale live users Supabase se hatao.
@@ -1721,7 +2336,7 @@ namespace HubBuilders
                 SupabaseConfig.Load();
                 EnsureLocalSchema();
                 if (_timer != null) return;
-                _timer = new System.Windows.Forms.Timer { Interval = 1000 };
+                _timer = new System.Windows.Forms.Timer { Interval = 400 };
                 _timer.Tick += async (s, e) =>
                 {
                     try { await System.Threading.Tasks.Task.Run((Action)TickSafe); }
@@ -1735,12 +2350,15 @@ namespace HubBuilders
 
         private static void TickSafe()
         {
-            // Manual Sync/Pull wait kar raha ho — auto tick skip
-            if (Interlocked.CompareExchange(ref _manualHold, 0, 0) != 0) return;
-            if (Interlocked.Exchange(ref _busy, 1) == 1) return;
+            KickTick();
+        }
+
+        private static void TickSafeCore()
+        {
             try
             {
                 if (!SupabaseConfig.IsConfigured) return;
+                EnsureMissingSyncIds();
                 bool restoreFirst = GetState("restore_push_first") == "1";
                 if (restoreFirst && CanPush())
                 {
@@ -1754,34 +2372,139 @@ namespace HubBuilders
                 if (NeedsFullPull())
                     FullPullAllTables();
                 else
-                    PullIncremental();
-                ReconcileUsersFromCloud();
-                if (CanPush())
                 {
-                    PushPendingDeletes();
-                    if (_dirty)
+                    // FAST PATH (~sub-second):
+                    // 1) Local dirty PUSH pehle — WinForms→mobile cloud pe pehle pahunche
+                    if (CanPush())
                     {
-                        if (PushChanged()) _dirty = false;
+                        PushPendingDeletes();
+                        if (PushChanged())
+                        {
+                            _dirty = false;
+                            _lastHashPushUtc = DateTime.UtcNow;
+                        }
+                    }
+
+                    // Local row cloud pe nahi (hash ne skip kar di) — sirf missing sync_id, delete resurrect nahi
+                    if ((DateTime.UtcNow - _lastMissingPushUtc).TotalSeconds >= 12)
+                    {
+                        try { PushMissingLiveRows(); } catch { }
+                        _lastMissingPushUtc = DateTime.UtcNow;
+                    }
+
+                    // 2) Live PULL — mobile→WinForms
+                    PullRecentDeletesTables(LiveTables, 180);
+                    PullRecentHealTables(LiveTables, 180);
+                    RaiseLiveChanged();
+                    if ((DateTime.UtcNow - _lastAllocCatchUpUtc).TotalSeconds >= 20)
+                    {
+                        _quietUi++;
+                        try { PullRecentDeletesTables(LiveTables, 6 * 3600); }
+                        finally { _quietUi--; }
+                        _lastAllocCatchUpUtc = DateTime.UtcNow;
+                        RaiseLiveChanged();
+                    }
+
+                    if ((DateTime.UtcNow - _lastFullIncrementalUtc).TotalSeconds >= 45)
+                    {
+                        PullIncremental();
+                        _lastFullIncrementalUtc = DateTime.UtcNow;
+                        RaiseLiveChanged();
+                    }
+
+                    // Allocate miss: recent window (full sync_id scan tick ko block na kare)
+                    if ((DateTime.UtcNow - _lastAllocCatchUpUtc).TotalSeconds >= 25)
+                    {
+                        _quietUi++;
+                        try { CatchUpRecentAllocates(180); }
+                        finally { _quietUi--; }
+                        _lastAllocCatchUpUtc = DateTime.UtcNow;
+                        RaiseLiveChanged();
+                    }
+
+                    // 3) Deep heal / prune KABHI-KABHAR — har tick nahi (wipe nahi, sirf timing)
+                    if ((DateTime.UtcNow - _lastDeepHealUtc).TotalSeconds >= 180)
+                    {
+                        PullRecentHealTables(HotTables, 120);
+                        _lastDeepHealUtc = DateTime.UtcNow;
+                        RaiseLiveChanged();
+                    }
+                    if ((DateTime.UtcNow - _lastPruneUtc).TotalSeconds >= 300)
+                    {
+                        SafePruneGoneFromCloud(true);
+                        _lastPruneUtc = DateTime.UtcNow;
+                        RaiseLiveChanged();
                     }
                 }
-                if ((DateTime.UtcNow - _lastCatchUpUtc).TotalSeconds >= 30)
+                if ((DateTime.UtcNow - _lastCatchUpUtc).TotalSeconds >= 300)
                 {
+                    try { ReconcileUsersFromCloud(); } catch { }
                     _quietUi++;
                     try { CatchUpMissing(); }
                     finally { _quietUi--; }
                     _lastCatchUpUtc = DateTime.UtcNow;
                     RaiseLiveChanged();
                 }
-                SafePruneGoneFromCloud(false);
             }
             catch { }
-            finally { Interlocked.Exchange(ref _busy, 0); }
         }
 
+        /// Hash local pe hai lekin cloud pe row nahi — WinForms entry mobile tak nahi pahunchti.
+        /// Cloud is_deleted ko missing mat samjho (delete wapas zinda nahi).
+        private static void PushMissingLiveRows()
+        {
+            string[] tables = { "customers", "customer_plots", "plots", "receipts", "ledger" };
+            int budget = 20;
+            foreach (string table in tables)
+            {
+                if (budget <= 0) break;
+                string cloud = CloudTable(table);
+                var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                bool failed = false;
+                for (int page = 0; page < 40 && !failed; page++)
+                {
+                    var rows = HttpGetListOk("/rest/v1/" + cloud
+                        + "?select=sync_id&order=sync_id.asc&limit=1000&offset=" + (page * 1000), 12);
+                    if (rows == null) { failed = true; break; }
+                    foreach (var row in rows)
+                    {
+                        string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "").Trim();
+                        if (id.Length > 0) present.Add(id);
+                    }
+                    if (rows.Count < 1000) break;
+                }
+                if (failed) continue;
+                var pushIds = new List<long>();
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    if (!TableExists(con, table)) continue;
+                    string pk = Pk(table);
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT \"" + pk + "\", sync_id FROM \"" + table + "\" WHERE sync_id IS NOT NULL AND TRIM(sync_id)<>'';", con))
+                    using (var r = cmd.ExecuteReader())
+                    {
+                        while (r.Read() && pushIds.Count < budget)
+                        {
+                            string sid = Convert.ToString(r[1] ?? "").Trim();
+                            long id;
+                            if (sid.Length == 0 || present.Contains(sid)) continue;
+                            if (!long.TryParse(Convert.ToString(r[0] ?? ""), out id) || id <= 0) continue;
+                            pushIds.Add(id);
+                        }
+                    }
+                }
+                foreach (long id in pushIds)
+                {
+                    if (PushOneNow(table, id)) budget--;
+                }
+            }
+        }
+
+        /// Sirf apni nayi/edit/delete — pura DB hash scan band (tick block = 1 min+ delay).
         private static bool CanPush()
         {
             if (!SupabaseConfig.IsConfigured) return false;
-            if (GetState("first_pull_done") == "1") return true;
             return _dirty || HasPendingDeletes();
         }
 
@@ -1959,11 +2682,35 @@ namespace HubBuilders
         private static bool PushChanged()
         {
             string staff = (MainClass.LoggedInName ?? MainClass.LoggedInUsername ?? "").Trim();
+            var pendingDel = LoadPendingDeleteSyncIds();
             var batch = new List<Dictionary<string, object>>();
+            string[] scanTables;
+            lock (_dirtyTablesLock)
+            {
+                if (_dirtyTables.Count > 0)
+                {
+                    scanTables = new string[_dirtyTables.Count];
+                    _dirtyTables.CopyTo(scanTables);
+                    _dirtyTables.Clear();
+                }
+                else if (_dirty
+                    && (DateTime.UtcNow - _lastSafetyPushUtc).TotalSeconds >= 8)
+                {
+                    // PushOneNow fail fallback — LiveTables jaldi dubara push
+                    scanTables = LiveTables;
+                    _lastSafetyPushUtc = DateTime.UtcNow;
+                }
+                else
+                {
+                    // PushOneNow already cloud pe — mass scan skip
+                    return !_dirty;
+                }
+            }
             using (var con = new SQLiteConnection(MainClass.con_string))
             {
                 con.Open();
-                foreach (string table in Tables)
+                // Sirf dirty/Live — pura HotTables hash-scan tick ko minutes block karta tha
+                foreach (string table in scanTables)
                 {
                     if (!TableExists(con, table)) continue;
                     Exec(con, "UPDATE \"" + table + "\" SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR TRIM(sync_id)='';");
@@ -1975,6 +2722,8 @@ namespace HubBuilders
                             var payload = ReadPayload(r);
                             string syncId = Convert.ToString(payload.ContainsKey("sync_id") ? payload["sync_id"] : "");
                             if (string.IsNullOrWhiteSpace(syncId)) continue;
+                            // Pending SoftMark — live upsert se tombstone overwrite mat karo
+                            if (pendingDel.Contains(syncId)) continue;
 
                             Dictionary<string, string> fks;
                             if (Fks.TryGetValue(table, out fks))
@@ -2133,73 +2882,70 @@ namespace HubBuilders
         }
 
         /// <summary>
-        /// Hard/soft delete doosre devices pe: cloud live nahi + local pe sync_hash → delete.
-        /// Bulk wipe block: ek table pe bohot saari missing ho to skip (110→78 protect).
-        /// Never-pushed (no hash) kabhi prune nahi. Manual Sync/Pull pe force=true.
+        /// Prune: sirf cloud-confirmed is_deleted=true. Live absence se local delete NAHI.
+        /// Soft-delete cleanup = ApplyRow / ye confirm path. Sync/pull behavior untouched.
+        /// Manual Sync/Pull pe force=true (throttle bypass).
         /// </summary>
         private static void SafePruneGoneFromCloud(bool force = false)
         {
-            if (!force && (DateTime.UtcNow - _lastPruneUtc).TotalSeconds < 30) return;
+            // force=false: max 2s throttle (tick pe force=true → turant)
+            if (!force && (DateTime.UtcNow - _lastPruneUtc).TotalSeconds < 2) return;
             try
             {
+                bool fullScan = (DateTime.UtcNow - _lastFullPruneUtc).TotalSeconds >= 30;
+                if (fullScan) _lastFullPruneUtc = DateTime.UtcNow;
+                string sinceQ = "";
+                if (!fullScan)
+                {
+                    string since = DateTime.UtcNow.AddMinutes(-10).ToString("o");
+                    sinceQ = "&updated_at=gt." + Uri.EscapeDataString(since) + "&order=updated_at.asc";
+                }
+                else
+                    sinceQ = "&order=sync_id.asc";
+
                 var pending = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
                 for (int ti = Tables.Length - 1; ti >= 0; ti--)
                 {
                     string table = Tables[ti];
                     string cloud = CloudTable(table);
-                    var live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var confirmedDeleted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     bool failed = false;
-                    for (int page = 0; page < 80; page++)
+                    int pageMax = fullScan ? 80 : 5;
+                    for (int page = 0; page < pageMax; page++)
                     {
+                        // Positive confirm only — is_deleted=true (not "missing from live")
                         var rows = HttpGetListOk("/rest/v1/" + cloud
-                            + "?is_deleted=eq.false&select=sync_id&order=sync_id.asc&limit=1000&offset=" + (page * 1000));
+                            + "?is_deleted=eq.true&select=sync_id" + sinceQ
+                            + "&limit=1000&offset=" + (page * 1000));
                         if (rows == null) { failed = true; break; }
                         if (rows.Count == 0) break;
                         foreach (var row in rows)
                         {
                             string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "");
-                            if (!string.IsNullOrWhiteSpace(id)) live.Add(id.Trim());
+                            if (!string.IsNullOrWhiteSpace(id)) confirmedDeleted.Add(id.Trim());
                         }
                         if (rows.Count < 1000) break;
                     }
-                    if (failed) continue;
+                    if (failed || confirmedDeleted.Count == 0) continue;
 
                     var gone = new List<string>();
                     using (var con = new SQLiteConnection(MainClass.con_string))
                     {
                         con.Open();
                         if (!TableExists(con, table)) continue;
-                        var local = new List<string>();
-                        try
+                        foreach (string sid in confirmedDeleted)
                         {
                             using (var cmd = new SQLiteCommand(
-                                "SELECT sync_id FROM \"" + table + "\" WHERE sync_id IS NOT NULL AND TRIM(sync_id)<>'';", con))
-                            using (var r = cmd.ExecuteReader())
+                                "SELECT 1 FROM \"" + table + "\" WHERE sync_id=@s LIMIT 1;", con))
                             {
-                                while (r.Read())
-                                {
-                                    string sid = Convert.ToString(r["sync_id"] ?? "");
-                                    if (!string.IsNullOrWhiteSpace(sid)) local.Add(sid.Trim());
-                                }
+                                cmd.Parameters.AddWithValue("@s", sid);
+                                if (cmd.ExecuteScalar() == null) continue;
                             }
-                        }
-                        catch { continue; }
-
-                        foreach (string sid in local)
-                        {
-                            if (live.Contains(sid)) continue;
-                            // synced row (hash) YA pehle cloud se known
-                            if (string.IsNullOrWhiteSpace(LoadHash(con, sid))
-                                && !IsSyncKnown(con, sid)) continue;
                             gone.Add(sid);
                         }
                     }
 
-                    // Bulk wipe guard: incomplete cloud (110→78) mat mitao.
-                    // Intentional delete soft-mark + pull se aata hai; prune backup hai.
                     if (gone.Count == 0) continue;
-                    if (gone.Count > 20 && (live.Count < 5 || gone.Count * 4 > live.Count))
-                        continue;
                     pending[table] = gone;
                 }
 
@@ -2523,9 +3269,16 @@ BEGIN
 END;");
         }
 
-        /// <summary>Jo Supabase pe hai aur local pe nahi — automatic pull (nayi mobile/PC).</summary>
+        /// <summary>Jo Supabase pe hai aur local pe nahi — insert-missing only (no wipe). Allocate = parent-ensure pehle.</summary>
         private static void CatchUpMissing()
         {
+            CatchUpMissingTables(Tables);
+        }
+
+        /// <summary>Cloud pe hai, local pe nahi — sync_id se lao (allocate miss fix).</summary>
+        private static void CatchUpMissingTables(string[] tables)
+        {
+            if (tables == null || tables.Length == 0) return;
             try
             {
                 using (var con = new SQLiteConnection(MainClass.con_string))
@@ -2537,24 +3290,31 @@ END;");
                 }
             }
             catch { }
-            foreach (string table in Tables)
+            HashSet<string> pendingDel = LoadPendingDeleteSyncIds();
+            foreach (string table in tables)
             {
                 string cloud = CloudTable(table);
+                bool isAlloc = string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase);
                 HashSet<string> local;
                 using (var con = new SQLiteConnection(MainClass.con_string))
                 {
                     con.Open();
-                    local = LocalSyncIds(con);
+                    // Per-table — dusri table ka sync_id missing allocate hide na kare
+                    local = LocalSyncIdsForTable(con, table);
                 }
                 for (int page = 0; page < 60; page++)
                 {
                     var rows = HttpGetList("/rest/v1/" + cloud + "?is_deleted=eq.false&select=sync_id&order=sync_id.asc&limit=1000&offset=" + (page * 1000));
-                    if (rows.Count == 0) break;
+                    if (rows == null || rows.Count == 0) break;
                     var missing = new List<string>();
                     foreach (var row in rows)
                     {
                         string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "");
-                        if (!string.IsNullOrWhiteSpace(id) && !local.Contains(id))
+                        if (string.IsNullOrWhiteSpace(id)) continue;
+                        string key = id.Trim().ToLowerInvariant();
+                        // Local delete pending / soft-mark in-flight — CatchUp wapas mat lao
+                        if (pendingDel.Contains(key) || pendingDel.Contains(id.Trim())) continue;
+                        if (!local.Contains(key))
                             missing.Add(id);
                     }
                     for (int i = 0; i < missing.Count; i += 30)
@@ -2566,23 +3326,107 @@ END;");
                             if (j > 0) sb.Append(',');
                             sb.Append(missing[i + j]);
                         }
-                        var fetched = HttpGetList("/rest/v1/" + cloud + "?sync_id=in.(" + sb + ")");
-                        if (fetched.Count > 0) ApplyFetched(AsApplyRows(table, fetched));
+                        var fetched = HttpGetList("/rest/v1/" + cloud + "?is_deleted=eq.false&sync_id=in.(" + sb + ")");
+                        if (fetched == null || fetched.Count == 0) continue;
+                        if (isAlloc)
+                        {
+                            var skipList = new List<string>();
+                            EnsureRecoverParentsForCustomerPlots(fetched, skipList);
+                        }
+                        if (fetched.Count > 0)
+                        {
+                            ApplyFetched(AsApplyRows(table, fetched));
+                            foreach (var fr in fetched)
+                            {
+                                string id = Convert.ToString(fr.ContainsKey("sync_id") ? fr["sync_id"] : "");
+                                if (!string.IsNullOrWhiteSpace(id))
+                                    local.Add(id.Trim().ToLowerInvariant());
+                            }
+                        }
                     }
                     if (rows.Count < 1000) break;
                 }
             }
         }
 
+        /// Recent allocates only — full sync_id CatchUp har 20s tick block nahi.
+        private static void CatchUpRecentAllocates(int windowSec)
+        {
+            int sec = Math.Max(60, windowSec);
+            string since = UtcFilter(DateTime.UtcNow.AddSeconds(-sec));
+            string cloud = CloudTable("customer_plots");
+            var all = new List<Dictionary<string, object>>();
+            for (int page = 0; page < 5; page++)
+            {
+                var rows = HttpGetList("/rest/v1/" + cloud
+                    + "?is_deleted=eq.false&updated_at=gt." + Uri.EscapeDataString(since)
+                    + "&order=updated_at.asc,sync_id.asc&limit=200&offset=" + (page * 200));
+                if (rows == null || rows.Count == 0) break;
+                all.AddRange(rows);
+                if (rows.Count < 200) break;
+            }
+            if (all.Count == 0) return;
+            HashSet<string> local;
+            using (var con = new SQLiteConnection(MainClass.con_string))
+            {
+                con.Open();
+                local = LocalSyncIdsForTable(con, "customer_plots");
+            }
+            var missing = new List<Dictionary<string, object>>();
+            foreach (var row in all)
+            {
+                string id = Convert.ToString(row.ContainsKey("sync_id") ? row["sync_id"] : "").Trim();
+                if (string.IsNullOrWhiteSpace(id)) continue;
+                if (local.Contains(id.ToLowerInvariant())) continue;
+                missing.Add(row);
+            }
+            if (missing.Count == 0) return;
+            var skip = new List<string>();
+            EnsureRecoverParentsForCustomerPlots(missing, skip);
+            if (missing.Count > 0)
+                ApplyFetched(AsApplyRows("customer_plots", missing));
+        }
+
+        /// PostgREST filter — 7-digit fractional + local offset avoid.
+        private static string UtcFilter(DateTime utc)
+        {
+            return utc.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+                System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static string UtcFilterIso(string iso)
+        {
+            DateTime t;
+            if (!DateTime.TryParse(iso, null,
+                System.Globalization.DateTimeStyles.RoundtripKind, out t))
+                return iso;
+            if (t.Kind == DateTimeKind.Unspecified)
+                t = DateTime.SpecifyKind(t, DateTimeKind.Utc);
+            return UtcFilter(t.ToUniversalTime());
+        }
+
+        private static string JustBeforeUtc(string iso)
+        {
+            DateTime t;
+            if (!DateTime.TryParse(iso, null,
+                System.Globalization.DateTimeStyles.RoundtripKind, out t))
+                return iso;
+            if (t.Kind == DateTimeKind.Unspecified)
+                t = DateTime.SpecifyKind(t, DateTimeKind.Utc);
+            return t.ToUniversalTime().AddMilliseconds(-1).ToString("o");
+        }
+
         private static void PullIncremental()
         {
-            string since = GetState("last_pull_utc");
-            if (string.IsNullOrWhiteSpace(since))
-                since = "1970-01-01T00:00:00.000Z";
-            string maxTs = since;
+            string sinceRaw = GetState("last_pull_utc");
+            if (string.IsNullOrWhiteSpace(sinceRaw))
+                sinceRaw = "1970-01-01T00:00:00.000Z";
+            string since = UtcFilterIso(sinceRaw);
+            string maxApplied = since;
+            string minDropped = null;
             var bag = new List<Dictionary<string, object>>();
-            var gate = new object();
-            Parallel.ForEach(Tables, new ParallelOptions { MaxDegreeOfParallelism = 8 }, table =>
+            // Sequential — customer_plots se pehle plots/customers parents apply
+            foreach (string table in Tables)
             {
                 string cloud = CloudTable(table);
                 var all = new List<Dictionary<string, object>>();
@@ -2594,22 +3438,171 @@ END;");
                     all.AddRange(rows);
                     if (rows.Count < 200) break;
                 }
-                if (all.Count == 0) return;
-                lock (gate)
+                if (all.Count == 0) continue;
+
+                var ready = all;
+                if (string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase))
                 {
-                    bag.AddRange(AsApplyRows(table, all));
-                    foreach (var row in all)
+                    ready = new List<Dictionary<string, object>>(all);
+                    var skip = new List<string>();
+                    var live = new List<Dictionary<string, object>>();
+                    var deleted = new List<Dictionary<string, object>>();
+                    foreach (var r in ready)
                     {
-                        object ts;
-                        if (!row.TryGetValue("updated_at", out ts)) continue;
-                        string s = Convert.ToString(ts ?? "");
-                        if (string.CompareOrdinal(s, maxTs) > 0) maxTs = s;
+                        if (RowIsDeleted(r)) deleted.Add(r);
+                        else live.Add(r);
                     }
+                    int before = live.Count;
+                    EnsureRecoverParentsForCustomerPlots(live, skip);
+                    if (live.Count < before)
+                    {
+                        foreach (var r in all)
+                        {
+                            if (RowIsDeleted(r)) continue;
+                            string sid = Convert.ToString(r.ContainsKey("sync_id") ? r["sync_id"] : "").Trim();
+                            bool kept = false;
+                            foreach (var k in live)
+                            {
+                                if (string.Equals(sid, Convert.ToString(k.ContainsKey("sync_id") ? k["sync_id"] : ""), StringComparison.OrdinalIgnoreCase))
+                                { kept = true; break; }
+                            }
+                            if (kept) continue;
+                            object ts;
+                            if (!r.TryGetValue("updated_at", out ts)) continue;
+                            string s = Convert.ToString(ts ?? "");
+                            if (string.IsNullOrWhiteSpace(s)) continue;
+                            if (minDropped == null || string.CompareOrdinal(s, minDropped) < 0)
+                                minDropped = s;
+                        }
+                    }
+                    ready = new List<Dictionary<string, object>>();
+                    ready.AddRange(deleted);
+                    ready.AddRange(live);
                 }
+
+                if (ready.Count == 0) continue;
+                bag.AddRange(AsApplyRows(table, ready));
+                foreach (var row in ready)
+                {
+                    object ts;
+                    if (!row.TryGetValue("updated_at", out ts)) continue;
+                    string s = UtcFilterIso(Convert.ToString(ts ?? ""));
+                    if (string.IsNullOrWhiteSpace(s)) continue;
+                    if (string.CompareOrdinal(s, maxApplied) > 0) maxApplied = s;
+                }
+            }
+            try
+            {
+                if (bag.Count > 0) ApplyFetched(bag);
+            }
+            catch { /* last_pull phir bhi aage — stuck na ho */ }
+            string advance = maxApplied;
+            // Parent-miss cap: max 90s peeche rakho — warna last_pull forever stuck
+            if (!string.IsNullOrWhiteSpace(minDropped))
+            {
+                string cap = JustBeforeUtc(minDropped);
+                string floor = UtcFilter(DateTime.UtcNow.AddSeconds(-90));
+                if (string.CompareOrdinal(cap, floor) < 0) cap = floor;
+                if (string.CompareOrdinal(advance, cap) > 0) advance = cap;
+            }
+            if (string.CompareOrdinal(advance, since) > 0)
+                SetState("last_pull_utc", advance);
+        }
+
+        /// <summary>
+        /// Recent window re-apply (incl. is_deleted). last_pull advance nahi —
+        /// missed update/delete heal; same sync_id = update, no duplicate/wipe.
+        /// </summary>
+        private static void PullRecentHeal(int windowSec)
+        {
+            PullRecentHealTables(Tables, windowSec);
+        }
+
+        /// Sirf is_deleted=true recent — delete signal pehle apply.
+        private static void PullRecentDeletesTables(string[] tables, int windowSec)
+        {
+            int sec = Math.Max(30, windowSec);
+            string since = UtcFilter(DateTime.UtcNow.AddSeconds(-sec));
+            var bag = new List<Dictionary<string, object>>();
+            var gate = new object();
+            Parallel.ForEach(tables, new ParallelOptions { MaxDegreeOfParallelism = 8 }, table =>
+            {
+                string cloud = CloudTable(table);
+                var all = new List<Dictionary<string, object>>();
+                for (int page = 0; page < 3; page++)
+                {
+                    var rows = HttpGetList("/rest/v1/" + cloud
+                        + "?is_deleted=eq.true&updated_at=gt." + Uri.EscapeDataString(since)
+                        + "&order=updated_at.asc,sync_id.asc&limit=200&offset=" + (page * 200));
+                    if (rows == null || rows.Count == 0) break;
+                    all.AddRange(rows);
+                    if (rows.Count < 200) break;
+                }
+                if (all.Count == 0) return;
+                lock (gate) bag.AddRange(AsApplyRows(table, all));
             });
             if (bag.Count > 0) ApplyFetched(bag);
-            if (string.CompareOrdinal(maxTs, since) > 0)
-                SetState("last_pull_utc", maxTs);
+        }
+
+        private static void PullRecentHealTables(string[] tables, int windowSec)
+        {
+            int sec = Math.Max(15, windowSec);
+            string since = UtcFilter(DateTime.UtcNow.AddSeconds(-sec));
+            var bag = new List<Dictionary<string, object>>();
+            var gate = new object();
+            // customer_plots sequential + parents — parallel race se allocate miss
+            var parallel = new List<string>();
+            foreach (string t in tables)
+            {
+                if (string.Equals(t, "customer_plots", StringComparison.OrdinalIgnoreCase))
+                {
+                    string cloud = CloudTable(t);
+                    var all = new List<Dictionary<string, object>>();
+                    for (int page = 0; page < 5; page++)
+                    {
+                        var rows = HttpGetList("/rest/v1/" + cloud + "?updated_at=gt." + Uri.EscapeDataString(since)
+                            + "&order=updated_at.asc,sync_id.asc&limit=200&offset=" + (page * 200));
+                        if (rows == null || rows.Count == 0) break;
+                        all.AddRange(rows);
+                        if (rows.Count < 200) break;
+                    }
+                    if (all.Count == 0) continue;
+                    var live = new List<Dictionary<string, object>>();
+                    var deleted = new List<Dictionary<string, object>>();
+                    foreach (var r in all)
+                    {
+                        if (RowIsDeleted(r)) deleted.Add(r);
+                        else live.Add(r);
+                    }
+                    var skip = new List<string>();
+                    EnsureRecoverParentsForCustomerPlots(live, skip);
+                    var ready = new List<Dictionary<string, object>>();
+                    ready.AddRange(deleted);
+                    ready.AddRange(live);
+                    if (ready.Count > 0)
+                        bag.AddRange(AsApplyRows(t, ready));
+                }
+                else parallel.Add(t);
+            }
+            if (parallel.Count > 0)
+            {
+                Parallel.ForEach(parallel, new ParallelOptions { MaxDegreeOfParallelism = 8 }, table =>
+                {
+                    string cloud = CloudTable(table);
+                    var all = new List<Dictionary<string, object>>();
+                    for (int page = 0; page < 5; page++)
+                    {
+                        var rows = HttpGetList("/rest/v1/" + cloud + "?updated_at=gt." + Uri.EscapeDataString(since)
+                            + "&order=updated_at.asc,sync_id.asc&limit=200&offset=" + (page * 200));
+                        if (rows == null || rows.Count == 0) break;
+                        all.AddRange(rows);
+                        if (rows.Count < 200) break;
+                    }
+                    if (all.Count == 0) return;
+                    lock (gate) bag.AddRange(AsApplyRows(table, all));
+                });
+            }
+            if (bag.Count > 0) ApplyFetched(bag);
         }
 
         private static void ApplyRow(SQLiteConnection con, Dictionary<string, object> row, bool promptDup)
@@ -2640,11 +3633,7 @@ END;");
                     }
                     catch { }
                 }
-                using (var cmd = new SQLiteCommand("DELETE FROM \"" + table + "\" WHERE sync_id=@s;", con))
-                {
-                    cmd.Parameters.AddWithValue("@s", syncId);
-                    cmd.ExecuteNonQuery();
-                }
+                DeleteLocalBySync(con, table, syncId);
                 using (var cmd = new SQLiteCommand("DELETE FROM sync_known WHERE sync_id=@s;", con))
                 {
                     cmd.Parameters.AddWithValue("@s", syncId);
@@ -2665,9 +3654,8 @@ END;");
 
             string pk = Pk(table);
             // Union-merge tables: alias se "same row" mat banao — warna dusri device ki entries wipe
-            long? existingBySync = SkipContentDupMerge(table)
-                ? LocalIdBySyncExact(con, table, syncId)
-                : LocalIdBySync(con, table, syncId);
+            // Exact sync_id, warna alias wali wahi row. Nayi duplicate insert nahi.
+            long? existingBySync = LocalIdBySync(con, table, syncId);
             long? existing = existingBySync;
             if (promptDup && existing == null)
             {
@@ -2902,6 +3890,55 @@ END;");
             return null;
         }
 
+        /// Tombstone: isi sync_id ki row + alias wali row. Baqi entries rehti hain.
+        private static void DeleteLocalBySync(SQLiteConnection con, string table, string syncId)
+        {
+            if (string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(syncId)) return;
+            string pk = Pk(table);
+            var ids = new HashSet<long>();
+            long? exact = LocalIdBySyncExact(con, table, syncId);
+            if (exact.HasValue) ids.Add(exact.Value);
+            try
+            {
+                using (var cmd = new SQLiteCommand(
+                    "SELECT local_pk FROM sync_alias WHERE sync_id=@s AND lower(table_name)=lower(@t);", con))
+                {
+                    cmd.Parameters.AddWithValue("@s", syncId);
+                    cmd.Parameters.AddWithValue("@t", table);
+                    using (var r = cmd.ExecuteReader())
+                    {
+                        while (r.Read())
+                        {
+                            long id;
+                            if (long.TryParse(Convert.ToString(r[0] ?? ""), out id) && id > 0)
+                                ids.Add(id);
+                        }
+                    }
+                }
+            }
+            catch { }
+            foreach (long id in ids)
+            {
+                using (var cmd = new SQLiteCommand(
+                    "DELETE FROM \"" + table + "\" WHERE \"" + pk + "\"=@id;", con))
+                {
+                    cmd.Parameters.AddWithValue("@id", id);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            try
+            {
+                using (var cmd = new SQLiteCommand(
+                    "DELETE FROM sync_alias WHERE sync_id=@s AND lower(table_name)=lower(@t);", con))
+                {
+                    cmd.Parameters.AddWithValue("@s", syncId);
+                    cmd.Parameters.AddWithValue("@t", table);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch { }
+        }
+
         private static long? LocalIdBySync(SQLiteConnection con, string table, string syncId)
         {
             long? exact = LocalIdBySyncExact(con, table, syncId);
@@ -3132,7 +4169,8 @@ END;");
                     || string.Equals(k, "deal_id", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(k, "credit_id", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(k, "userID", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(k, "sync_id", StringComparison.OrdinalIgnoreCase))
+                    || string.Equals(k, "sync_id", StringComparison.OrdinalIgnoreCase)
+                    || k.StartsWith("__fk_", StringComparison.OrdinalIgnoreCase))
                     continue;
                 object v;
                 payload.TryGetValue(k, out v);

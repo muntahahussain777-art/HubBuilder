@@ -14,6 +14,7 @@ namespace HubBuilders.Model
     public partial class frmReceiptFormAdd : Sample
     {
         private bool _binding = false;
+        private CheckBox _chkCoverInstallments;
 
         // Edit state
         private long? _editingReceiptId = null;
@@ -68,7 +69,27 @@ namespace HubBuilders.Model
 
             dtpReceiptDate.Format = DateTimePickerFormat.Short;
 
+            EnsureCoverInstallmentsOption();
             ConfigureGrid();
+        }
+
+        /// <summary>Additive checkbox only — existing layout/controls unchanged.</summary>
+        private void EnsureCoverInstallmentsOption()
+        {
+            if (_chkCoverInstallments != null && !_chkCoverInstallments.IsDisposed) return;
+            _chkCoverInstallments = new CheckBox
+            {
+                Name = "chkCoverInstallments",
+                AutoSize = true,
+                Text = "Cover previous/current installments only — no upcoming (WhatsApp hide)",
+                ForeColor = System.Drawing.Color.White,
+                BackColor = System.Drawing.Color.Transparent,
+                Font = new System.Drawing.Font("Segoe UI Semibold", 9f, System.Drawing.FontStyle.Bold),
+                Location = new System.Drawing.Point(280, 167),
+                TabStop = true
+            };
+            this.Controls.Add(_chkCoverInstallments);
+            _chkCoverInstallments.BringToFront();
         }
 
         private void ConfigureGrid()
@@ -458,7 +479,11 @@ WHERE r.id=@id;";
             catch { }
             cmbMode.SelectedItem = r["mode"]?.ToString() == "Bank" ? "Bank" : "Cash";
             txtRefNo.Text = r["ref_no"] == DBNull.Value ? "" : r["ref_no"].ToString();
-            txtReceiptNotes.Text = r["notes"] == DBNull.Value ? "" : r["notes"].ToString();
+            string rawNotes = r["notes"] == DBNull.Value ? "" : r["notes"].ToString();
+            EnsureCoverInstallmentsOption();
+            if (_chkCoverInstallments != null)
+                _chkCoverInstallments.Checked = HubBuilders.InstallmentCoverHelper.HasToken(rawNotes);
+            txtReceiptNotes.Text = HubBuilders.InstallmentCoverHelper.StripToken(rawNotes);
 
             btnSaveReceipt.Text = "Update";
             this.Text = $"Receipt | Editing #{receiptId}";
@@ -546,6 +571,66 @@ WHERE r.id=@id;";
             RefreshGrid(); // recompute opening/closing
         }
 
+        private string ApplyInstallmentCoverIfChecked(int customerPlotId, double amount, string notes)
+        {
+            try
+            {
+                EnsureCoverInstallmentsOption();
+                if (_chkCoverInstallments == null || !_chkCoverInstallments.Checked)
+                    return HubBuilders.InstallmentCoverHelper.StripToken(notes);
+
+                DateTime booking = DateTime.Today;
+                double monthly = 0;
+                var dt = SelectQ(@"
+SELECT cp.booking_date,
+       COALESCE(cp.monthly_installment,0) AS monthly_installment,
+       COALESCE(bmi.monthly_amount,0) AS block_monthly
+FROM customer_plots cp
+JOIN plots p ON p.id = cp.plot_id
+LEFT JOIN block_monthly_installments bmi ON bmi.block_id = p.block_id
+WHERE cp.id=@id;", new Dictionary<string, object> { { "@id", customerPlotId } });
+                if (dt != null && dt.Rows.Count > 0)
+                {
+                    DateTime parsed;
+                    if (DateTime.TryParse(Convert.ToString(dt.Rows[0]["booking_date"]), out parsed))
+                        booking = parsed.Date;
+                    monthly = SafeDouble(dt.Rows[0]["monthly_installment"]);
+                    if (monthly <= 0.009) monthly = SafeDouble(dt.Rows[0]["block_monthly"]);
+                }
+
+                var already = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var paidDt = SelectQ(@"
+SELECT receipt_date, notes FROM receipts
+WHERE customer_plot_id=@id AND amount > 0
+  AND (@ex = 0 OR id <> @exid);",
+                    new Dictionary<string, object>
+                    {
+                        { "@id", customerPlotId },
+                        { "@ex", _editingReceiptId.HasValue ? 1 : 0 },
+                        { "@exid", _editingReceiptId ?? 0 }
+                    });
+                if (paidDt != null)
+                {
+                    foreach (DataRow row in paidDt.Rows)
+                    {
+                        foreach (var k in HubBuilders.InstallmentCoverHelper.ParseKeys(Convert.ToString(row["notes"])))
+                            already.Add(k);
+                        DateTime d;
+                        if (DateTime.TryParse(Convert.ToString(row["receipt_date"]), out d))
+                            already.Add(d.ToString("yyyy-MM"));
+                    }
+                }
+
+                var keys = HubBuilders.InstallmentCoverHelper.ComputeCoverKeys(
+                    booking, DateTime.Today, amount, monthly, already);
+                return HubBuilders.InstallmentCoverHelper.ApplyToken(notes, keys);
+            }
+            catch
+            {
+                return notes;
+            }
+        }
+
         // =============== Save (Insert OR Update) ===============
         private void BtnSaveReceipt_Click(object sender, EventArgs e)
         {
@@ -558,6 +643,7 @@ WHERE r.id=@id;";
             var mode = cmbMode.SelectedItem.ToString(); // 'Cash' or 'Bank'
             var refNo = string.IsNullOrWhiteSpace(txtRefNo.Text) ? null : txtRefNo.Text.Trim();
             var notes = string.IsNullOrWhiteSpace(txtReceiptNotes.Text) ? null : txtReceiptNotes.Text.Trim();
+            notes = ApplyInstallmentCoverIfChecked(cpId, amount, notes);
             var receiptDate = dtpReceiptDate.Value.Date.ToString("yyyy-MM-dd");
 
             bool isUpdate = _editingReceiptId.HasValue;
@@ -611,8 +697,8 @@ WHERE id=@rid;", HubBuilders.MainClass.con, tx))
                     // INSERT: 1) ledger credit
                     long ledgerId;
                     using (var cmd = new SQLiteCommand(@"
-INSERT INTO ledger (customer_plot_id, txn_date, voucher_no, narration, debit, credit, txn_type)
-VALUES (@cpid, @date, @vno, @nar, 0, @amt, @tt);
+INSERT INTO ledger (customer_plot_id, txn_date, voucher_no, narration, debit, credit, txn_type, sync_id)
+VALUES (@cpid, @date, @vno, @nar, 0, @amt, @tt, lower(hex(randomblob(16))));
 SELECT last_insert_rowid();", HubBuilders.MainClass.con, tx))
                     {
                         cmd.Parameters.AddWithValue("@cpid", cpId);
@@ -626,8 +712,8 @@ SELECT last_insert_rowid();", HubBuilders.MainClass.con, tx))
 
                     // 2) receipt
                     using (var cmd = new SQLiteCommand(@"
-INSERT INTO receipts (customer_plot_id, receipt_date, amount, mode, ref_no, notes, ledger_id)
-VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid);", HubBuilders.MainClass.con, tx))
+INSERT INTO receipts (customer_plot_id, receipt_date, amount, mode, ref_no, notes, ledger_id, sync_id)
+VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid, lower(hex(randomblob(16))));", HubBuilders.MainClass.con, tx))
                     {
                         cmd.Parameters.AddWithValue("@cpid", cpId);
                         cmd.Parameters.AddWithValue("@date", receiptDate);
@@ -638,6 +724,9 @@ VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid);", HubBuilders.MainClass.
                         cmd.Parameters.AddWithValue("@lid", ledgerId);
                         cmd.ExecuteNonQuery();
                     }
+                    using (var idCmd = new SQLiteCommand("SELECT last_insert_rowid();", HubBuilders.MainClass.con, tx))
+                        _editingReceiptId = Convert.ToInt64(idCmd.ExecuteScalar());
+                    _editingLedgerId = ledgerId;
                 }
 
                 tx.Commit();
@@ -662,7 +751,19 @@ VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid);", HubBuilders.MainClass.
             }
             catch { }
 
-            try { HubSyncService.NotifyLocalWrite(); } catch { }
+            try
+            {
+                var syncRows = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, long>>();
+                if (_editingLedgerId.HasValue && _editingLedgerId.Value > 0)
+                    syncRows.Add(new System.Collections.Generic.KeyValuePair<string, long>("ledger", _editingLedgerId.Value));
+                if (_editingReceiptId.HasValue && _editingReceiptId.Value > 0)
+                    syncRows.Add(new System.Collections.Generic.KeyValuePair<string, long>("receipts", _editingReceiptId.Value));
+                if (syncRows.Count > 0)
+                    HubSyncService.NotifyLocalWrites(syncRows);
+                else
+                    HubSyncService.NotifyLocalWrite();
+            }
+            catch { try { HubSyncService.NotifyLocalWrite(); } catch { } }
 
             // reset edit state & UI
             _editingReceiptId = null;
@@ -671,6 +772,7 @@ VALUES (@cpid, @date, @amt, @mode, @ref, @notes, @lid);", HubBuilders.MainClass.
             SuggestNextRefNo();
             txtReceiptNotes.Clear();
             numAmount.Value = 0;
+            if (_chkCoverInstallments != null) _chkCoverInstallments.Checked = false;
 
             RefreshGrid();
         }
