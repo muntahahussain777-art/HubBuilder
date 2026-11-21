@@ -76,6 +76,10 @@ abstract final class HubSync {
     'block_monthly_installments': {'block_id': 'blocks'},
   };
 
+  /// Tests only — SoftMark / tick / Supabase init skip (local txn + pending queue still run).
+  @visibleForTesting
+  static bool suppressCloudIo = false;
+
   static Timer? _timer;
   static Future<void>? _inFlight;
   static bool _tickAgain = false;
@@ -201,6 +205,8 @@ abstract final class HubSync {
 
   /// Row + sync_alias — delete se pehle collect karein.
   /// [executor] diya ho to usi SQLite txn/connection par resolve.
+  /// Lookup errors caller tak pohanchte hain (swallow nahi).
+  /// Zero aliases on successful query = valid.
   static Future<List<String>> collectCloudDeleteIds(
     String table,
     int localPk, {
@@ -210,28 +216,25 @@ abstract final class HubSync {
     if (localPk <= 0 || table.trim().isEmpty) return [];
     final db = executor ?? await AppDatabase.instance.database;
     final pk = _pk(table);
-    try {
-      final rows = await db.rawQuery(
-        'SELECT sync_id FROM "$table" WHERE "$pk" = ? LIMIT 1',
-        [localPk],
-      );
-      if (rows.isNotEmpty) {
-        final s = (rows.first['sync_id'] ?? '').toString().trim();
-        if (s.isNotEmpty) ids.add(s);
-      }
-    } catch (_) {}
-    try {
-      final aliases = await db.query(
-        'sync_alias',
-        columns: ['sync_id'],
-        where: 'lower(table_name) = lower(?) AND local_pk = ?',
-        whereArgs: [table, localPk],
-      );
-      for (final r in aliases) {
-        final s = (r['sync_id'] ?? '').toString().trim();
-        if (s.isNotEmpty) ids.add(s);
-      }
-    } catch (_) {}
+    final rows = await db.rawQuery(
+      'SELECT sync_id FROM "$table" WHERE "$pk" = ? LIMIT 1',
+      [localPk],
+    );
+    if (rows.isNotEmpty) {
+      final s = (rows.first['sync_id'] ?? '').toString().trim();
+      if (s.isNotEmpty) ids.add(s);
+    }
+    // Alias lookup must succeed; empty result is OK
+    final aliases = await db.query(
+      'sync_alias',
+      columns: ['sync_id'],
+      where: 'lower(table_name) = lower(?) AND local_pk = ?',
+      whereArgs: [table, localPk],
+    );
+    for (final r in aliases) {
+      final s = (r['sync_id'] ?? '').toString().trim();
+      if (s.isNotEmpty) ids.add(s);
+    }
     return ids.toList();
   }
 
@@ -456,6 +459,7 @@ abstract final class HubSync {
   /// WinForms NotifyLocalWrite — local save/delete ke baad turant pull/push cycle.
   /// [alreadyPushed] true jab [pushNow] pehle chal chuka — sirf pull, full hash-scan skip.
   static void notifyLocalWrite({bool alreadyPushed = false}) {
+    if (suppressCloudIo) return;
     try {
       if (!alreadyPushed) markDirty();
     } catch (_) {}
@@ -1310,7 +1314,7 @@ abstract final class HubSync {
     final table = localTable.trim();
     if (sid.isEmpty || table.isEmpty) return true;
     await _queuePendingDelete(table, sid);
-    if (!SupabaseConfig.isConfigured) return false;
+    if (suppressCloudIo || !SupabaseConfig.isConfigured) return false;
     final softOk = await _softMarkCloudDeleted(table, sid);
     await _clearPendingDeleteMeta(sid);
     if (softOk) await _removePendingDelete(sid);
@@ -1603,6 +1607,7 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
   }
 
   static Future<void> tick() async {
+    if (suppressCloudIo) return;
     if (_manualHold > 0) return;
     if (_inFlight != null) {
       // Busy tick miss mat karo — khatam hote hi dubara chalo (realtime)

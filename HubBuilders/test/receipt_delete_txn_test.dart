@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hub_builders/data/hub_sync.dart';
 import 'package:hub_builders/data/receipt_store.dart';
 import 'package:hub_builders/db/app_database.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 Future<Database> _openTestDb() async {
@@ -39,13 +41,24 @@ CREATE TABLE sync_pending_delete(
 CREATE TABLE sync_alias(
   sync_id TEXT PRIMARY KEY, table_name TEXT NOT NULL, local_pk INTEGER NOT NULL
 )''');
+        await db.execute('''
+CREATE TABLE staff_entry_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action_type TEXT NOT NULL,
+  module_name TEXT NOT NULL,
+  detail TEXT,
+  staff_username TEXT,
+  staff_name TEXT,
+  staff_role TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+)''');
       },
     ),
   );
   return db;
 }
 
-Future<void> _seedOk(Database db) async {
+Future<void> _seedOk(Database db, {bool withAlias = false}) async {
   await db.insert('customer_plots', {
     'id': 1,
     'customer_id': 1,
@@ -80,6 +93,20 @@ Future<void> _seedOk(Database db) async {
     'category': 'Receipt',
     'txn_date': '2026-11-22',
   });
+  if (withAlias) {
+    await db.insert('sync_alias', {
+      'sync_id': 'rec_alias_1',
+      'table_name': 'receipts',
+      'local_pk': 20,
+    });
+  }
+}
+
+Future<double> _ledgerCredit(Database db) async {
+  final rows = await db.rawQuery(
+    'SELECT COALESCE(SUM(credit),0) c FROM ledger WHERE customer_plot_id=1',
+  );
+  return (rows.first['c'] as num).toDouble();
 }
 
 void main() {
@@ -87,73 +114,94 @@ void main() {
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
 
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+    HubSync.suppressCloudIo = true;
+  });
+
   tearDown(() async {
+    HubSync.suppressCloudIo = false;
     AppDatabase.debugSetDatabase(null);
   });
 
-  test('deleteReceipt failure: missing receipt sync_id rolls back — data preserved',
-      () async {
-    final db = await _openTestDb();
-    AppDatabase.debugSetDatabase(db);
-    await _seedOk(db);
-    await db.update('receipts', {'sync_id': null}, where: 'id = 20');
+  test(
+    'deleteReceipt: primary sync_id present but alias lookup fails → rollback, Rs10000 balance safe',
+    () async {
+      final db = await _openTestDb();
+      AppDatabase.debugSetDatabase(db);
+      await _seedOk(db);
+      // Primary ID maujood; alias lookup break
+      await db.execute('DROP TABLE sync_alias');
 
-    final balBefore = await db.rawQuery(
-      'SELECT COALESCE(SUM(credit),0) c FROM ledger WHERE customer_plot_id=1',
-    );
-    final beforeCredit = (balBefore.first['c'] as num).toDouble();
+      final before = await _ledgerCredit(db);
+      expect(before, 10000);
 
-    final r = await ReceiptStore.deleteReceipt(20);
-    expect(r.ok, isFalse, reason: r.message);
-    expect(r.message.toLowerCase(), contains('sync_id'));
+      final r = await ReceiptStore.deleteReceipt(20);
+      expect(r.ok, isFalse, reason: r.message);
+      expect(
+        r.message.toLowerCase(),
+        anyOf(contains('alias'), contains('no such table'), contains('failed')),
+      );
 
-    expect(
-      await db.query('receipts', where: 'id = 20'),
-      isNotEmpty,
-      reason: 'receipt preserved',
-    );
-    expect(
-      await db.query('ledger', where: 'id = 10'),
-      isNotEmpty,
-      reason: 'ledger preserved',
-    );
-    expect(
-      await db.query('partner_money', where: 'id = 30'),
-      isNotEmpty,
-      reason: 'partner cash preserved',
-    );
-    expect(
-      await db.query('sync_pending_delete'),
-      isEmpty,
-      reason: 'no pending after rollback',
-    );
-    final balAfter = await db.rawQuery(
-      'SELECT COALESCE(SUM(credit),0) c FROM ledger WHERE customer_plot_id=1',
-    );
-    expect((balAfter.first['c'] as num).toDouble(), beforeCredit);
-    await db.close();
-  });
+      expect(await db.query('receipts', where: 'id = 20'), isNotEmpty);
+      expect(await db.query('ledger', where: 'id = 10'), isNotEmpty);
+      expect(await db.query('partner_money', where: 'id = 30'), isNotEmpty);
+      expect(await db.query('sync_pending_delete'), isEmpty);
+      expect(await _ledgerCredit(db), 10000);
+      await db.close();
+    },
+  );
 
-  test('deleteReceipt failure: pending_delete queue insert fail rolls back', () async {
-    final db = await _openTestDb();
-    AppDatabase.debugSetDatabase(db);
-    await _seedOk(db);
-    // Break pending_delete so INSERT of required queue fails
-    await db.execute('DROP TABLE sync_pending_delete');
-    await db.execute(
-      'CREATE TABLE sync_pending_delete (sync_id TEXT PRIMARY KEY)',
-    ); // missing table_name NOT NULL → insert fails
+  test(
+    'deleteReceipt success: all expected IDs (primary + alias + ledger + partner) queued',
+    () async {
+      final db = await _openTestDb();
+      AppDatabase.debugSetDatabase(db);
+      await _seedOk(db, withAlias: true);
 
-    final r = await ReceiptStore.deleteReceipt(20);
-    expect(r.ok, isFalse, reason: r.message);
+      final r = await ReceiptStore.deleteReceipt(20);
+      expect(r.ok, isTrue, reason: r.message);
 
-    expect(await db.query('receipts', where: 'id = 20'), isNotEmpty);
-    expect(await db.query('ledger', where: 'id = 10'), isNotEmpty);
-    expect(await db.query('partner_money', where: 'id = 30'), isNotEmpty);
-    final credit = await db.rawQuery(
-      'SELECT credit FROM ledger WHERE id=10',
-    );
-    expect((credit.first['credit'] as num).toDouble(), 10000);
-    await db.close();
-  });
+      expect(await db.query('receipts', where: 'id = 20'), isEmpty);
+      expect(await db.query('ledger', where: 'id = 10'), isEmpty);
+      expect(await db.query('partner_money', where: 'receipt_id = 20'), isEmpty);
+
+      final pending = await db.query('sync_pending_delete');
+      final ids = pending.map((e) => (e['sync_id'] ?? '').toString()).toSet();
+      expect(ids, containsAll(['rec_ok', 'rec_alias_1', 'led_ok', 'pm_ok']));
+      expect(
+        pending.where((e) => e['table_name'] == 'receipts').length,
+        2,
+        reason: 'primary + alias',
+      );
+      expect(
+        pending.where((e) => e['table_name'] == 'ledger').length,
+        1,
+      );
+      expect(
+        pending.where((e) => e['table_name'] == 'partner_money').length,
+        1,
+      );
+      // Balance effect removed with ledger row
+      expect(await _ledgerCredit(db), 0);
+      await db.close();
+    },
+  );
+
+  test(
+    'deleteReceipt: zero aliases with valid primary is OK (success)',
+    () async {
+      final db = await _openTestDb();
+      AppDatabase.debugSetDatabase(db);
+      await _seedOk(db); // no alias rows
+
+      final r = await ReceiptStore.deleteReceipt(20);
+      expect(r.ok, isTrue, reason: r.message);
+      final pending = await db.query('sync_pending_delete');
+      final ids = pending.map((e) => (e['sync_id'] ?? '').toString()).toSet();
+      expect(ids, containsAll(['rec_ok', 'led_ok', 'pm_ok']));
+      expect(ids.contains('rec_alias_1'), isFalse);
+      await db.close();
+    },
+  );
 }
