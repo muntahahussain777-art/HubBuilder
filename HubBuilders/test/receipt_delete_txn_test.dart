@@ -204,4 +204,52 @@ void main() {
       await db.close();
     },
   );
+
+  test(
+    'deleteReceipt: primary empty but alias valid → rollback, Rs10000 + queue empty',
+    () async {
+      final db = await _openTestDb();
+      AppDatabase.debugSetDatabase(db);
+      await _seedOk(db, withAlias: true);
+      await db.update('receipts', {'sync_id': null}, where: 'id = 20');
+
+      final before = await _ledgerCredit(db);
+      expect(before, 10000);
+
+      final r = await ReceiptStore.deleteReceipt(20);
+      expect(r.ok, isFalse, reason: r.message);
+      expect(r.message.toLowerCase(), contains('primary'));
+
+      expect(await db.query('receipts', where: 'id = 20'), isNotEmpty);
+      expect(await db.query('ledger', where: 'id = 10'), isNotEmpty);
+      expect(await db.query('partner_money', where: 'id = 30'), isNotEmpty);
+      expect(await db.query('sync_pending_delete'), isEmpty);
+      expect(await _ledgerCredit(db), 10000);
+      await db.close();
+    },
+  );
+
+  test(
+    'deleteReceipt failure: pending_delete queue insert fail rolls back',
+    () async {
+      final db = await _openTestDb();
+      AppDatabase.debugSetDatabase(db);
+      await _seedOk(db);
+      // Break pending_delete so INSERT of required queue fails
+      await db.execute('DROP TABLE sync_pending_delete');
+      await db.execute(
+        'CREATE TABLE sync_pending_delete (sync_id TEXT PRIMARY KEY)',
+      ); // missing table_name NOT NULL → insert fails
+
+      final r = await ReceiptStore.deleteReceipt(20);
+      expect(r.ok, isFalse, reason: r.message);
+
+      expect(await db.query('receipts', where: 'id = 20'), isNotEmpty);
+      expect(await db.query('ledger', where: 'id = 10'), isNotEmpty);
+      expect(await db.query('partner_money', where: 'id = 30'), isNotEmpty);
+      expect(await db.query('sync_pending_delete'), isEmpty);
+      expect(await _ledgerCredit(db), 10000);
+      await db.close();
+    },
+  );
 }

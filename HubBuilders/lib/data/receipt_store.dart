@@ -910,12 +910,20 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
         }
         final receipt = receiptRows.first;
         final lid = int.tryParse((receipt['ledger_id'] ?? '').toString());
+        // Primary sync_id required — alias alone is not enough.
+        final receiptPrimary =
+            (receipt['sync_id'] ?? '').toString().trim();
+        if (receiptPrimary.isEmpty) {
+          throw StateError(
+            'Receipt primary sync_id missing — delete aborted (data preserved).',
+          );
+        }
         final rIds = await HubSync.collectCloudDeleteIds(
           'receipts',
           receiptId,
           executor: txn,
         );
-        if (rIds.isEmpty) {
+        if (rIds.isEmpty || !rIds.any((s) => s.trim() == receiptPrimary)) {
           throw StateError(
             'Receipt sync_id missing — delete aborted (data preserved).',
           );
@@ -940,12 +948,19 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
               'Linked ledger id=$lid missing — delete aborted (data preserved).',
             );
           }
+          final ledgerPrimary =
+              (ledRows.first['sync_id'] ?? '').toString().trim();
+          if (ledgerPrimary.isEmpty) {
+            throw StateError(
+              'Ledger primary sync_id missing — delete aborted (data preserved).',
+            );
+          }
           final lIds = await HubSync.collectCloudDeleteIds(
             'ledger',
             lid,
             executor: txn,
           );
-          if (lIds.isEmpty) {
+          if (lIds.isEmpty || !lIds.any((s) => s.trim() == ledgerPrimary)) {
             throw StateError(
               'Ledger sync_id missing — delete aborted (data preserved).',
             );
@@ -969,12 +984,18 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
           if (pid <= 0) {
             throw StateError('partner_money row id invalid — delete aborted.');
           }
+          final partnerPrimary = (r['sync_id'] ?? '').toString().trim();
+          if (partnerPrimary.isEmpty) {
+            throw StateError(
+              'partner_money primary sync_id missing for id=$pid — delete aborted.',
+            );
+          }
           final pIds = await HubSync.collectCloudDeleteIds(
             'partner_money',
             pid,
             executor: txn,
           );
-          if (pIds.isEmpty) {
+          if (pIds.isEmpty || !pIds.any((s) => s.trim() == partnerPrimary)) {
             throw StateError(
               'partner_money sync_id missing for id=$pid — delete aborted.',
             );
