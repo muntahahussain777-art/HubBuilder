@@ -882,65 +882,146 @@ WHERE customer_plot_id = ? AND amount > 0
     );
   }
 
+  /// Receipt + linked ledger + partner_money: IDs resolve, pending_delete, local deletes
+  /// EK SQLite transaction. Required sync_id missing / queue fail → rollback + visible failure.
+  /// HTTP SoftMark sirf commit ke baad.
   static Future<({bool ok, String message})> deleteReceipt(int receiptId) async {
-    final existing = await receiptById(receiptId);
-    if (existing == null) {
-      return (ok: false, message: 'Receipt not found.');
+    if (receiptId <= 0) {
+      return (ok: false, message: 'Invalid receipt id.');
     }
-    final lid = existing.ledgerId;
     final db = await AppDatabase.instance.database;
     final tombstones = <({String table, String sid})>[];
     try {
-      final partnerRows = await db.query(
-        'partner_money',
-        columns: ['id'],
-        where: 'receipt_id = ?',
-        whereArgs: [receiptId],
-      );
-      for (final r in partnerRows) {
-        final pid = int.tryParse((r['id'] ?? '').toString()) ?? 0;
-        if (pid <= 0) continue;
-        for (final s in await HubSync.collectCloudDeleteIds('partner_money', pid)) {
-          if (s.trim().isNotEmpty) {
-            tombstones.add((table: 'partner_money', sid: s.trim()));
-          }
+      await db.transaction((txn) async {
+        await txn.execute('''
+CREATE TABLE IF NOT EXISTS sync_pending_delete (
+  sync_id TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  queued_at TEXT DEFAULT (datetime('now','localtime'))
+)''');
+        final receiptRows = await txn.query(
+          'receipts',
+          where: 'id = ?',
+          whereArgs: [receiptId],
+          limit: 1,
+        );
+        if (receiptRows.isEmpty) {
+          throw StateError('Receipt not found.');
         }
-      }
-      final rIds = await HubSync.collectCloudDeleteIds('receipts', receiptId);
-      for (final s in rIds) {
-        if (s.trim().isNotEmpty) {
+        final receipt = receiptRows.first;
+        final lid = int.tryParse((receipt['ledger_id'] ?? '').toString());
+        final rIds = await HubSync.collectCloudDeleteIds(
+          'receipts',
+          receiptId,
+          executor: txn,
+        );
+        if (rIds.isEmpty) {
+          throw StateError(
+            'Receipt sync_id missing — delete aborted (data preserved).',
+          );
+        }
+        for (final s in rIds) {
+          if (s.trim().isEmpty) {
+            throw StateError('Receipt sync_id empty — delete aborted.');
+          }
           tombstones.add((table: 'receipts', sid: s.trim()));
         }
-      }
-      if (lid != null) {
-        final lIds = await HubSync.collectCloudDeleteIds('ledger', lid);
-        for (final s in lIds) {
-          if (s.trim().isNotEmpty) {
+
+        if (lid != null && lid > 0) {
+          final ledRows = await txn.query(
+            'ledger',
+            columns: ['id', 'sync_id'],
+            where: 'id = ?',
+            whereArgs: [lid],
+            limit: 1,
+          );
+          if (ledRows.isEmpty) {
+            throw StateError(
+              'Linked ledger id=$lid missing — delete aborted (data preserved).',
+            );
+          }
+          final lIds = await HubSync.collectCloudDeleteIds(
+            'ledger',
+            lid,
+            executor: txn,
+          );
+          if (lIds.isEmpty) {
+            throw StateError(
+              'Ledger sync_id missing — delete aborted (data preserved).',
+            );
+          }
+          for (final s in lIds) {
+            if (s.trim().isEmpty) {
+              throw StateError('Ledger sync_id empty — delete aborted.');
+            }
             tombstones.add((table: 'ledger', sid: s.trim()));
           }
         }
-      }
-    } catch (_) {}
 
-    await db.transaction((txn) async {
-      for (final t in tombstones) {
-        await txn.insert(
-          'sync_pending_delete',
-          {'sync_id': t.sid, 'table_name': t.table},
-          conflictAlgorithm: ConflictAlgorithm.replace,
+        final partnerRows = await txn.query(
+          'partner_money',
+          columns: ['id', 'sync_id'],
+          where: 'receipt_id = ?',
+          whereArgs: [receiptId],
         );
-      }
-      await txn.delete(
-        'partner_money',
-        where: 'receipt_id = ?',
-        whereArgs: [receiptId],
-      );
-      await txn.delete('receipts', where: 'id = ?', whereArgs: [receiptId]);
-      if (lid != null) {
-        await txn.delete('ledger', where: 'id = ?', whereArgs: [lid]);
-      }
-    });
+        for (final r in partnerRows) {
+          final pid = int.tryParse((r['id'] ?? '').toString()) ?? 0;
+          if (pid <= 0) {
+            throw StateError('partner_money row id invalid — delete aborted.');
+          }
+          final pIds = await HubSync.collectCloudDeleteIds(
+            'partner_money',
+            pid,
+            executor: txn,
+          );
+          if (pIds.isEmpty) {
+            throw StateError(
+              'partner_money sync_id missing for id=$pid — delete aborted.',
+            );
+          }
+          for (final s in pIds) {
+            if (s.trim().isEmpty) {
+              throw StateError('partner_money sync_id empty — delete aborted.');
+            }
+            tombstones.add((table: 'partner_money', sid: s.trim()));
+          }
+        }
 
+        for (final t in tombstones) {
+          await txn.insert(
+            'sync_pending_delete',
+            {'sync_id': t.sid, 'table_name': t.table},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+
+        await txn.delete(
+          'partner_money',
+          where: 'receipt_id = ?',
+          whereArgs: [receiptId],
+        );
+        final nRec = await txn.delete(
+          'receipts',
+          where: 'id = ?',
+          whereArgs: [receiptId],
+        );
+        if (nRec <= 0) {
+          throw StateError('Receipt local delete failed — rolled back.');
+        }
+        if (lid != null && lid > 0) {
+          await txn.delete('ledger', where: 'id = ?', whereArgs: [lid]);
+        }
+      });
+    } on StateError catch (e) {
+      return (ok: false, message: e.message);
+    } catch (e) {
+      return (
+        ok: false,
+        message: 'Receipt delete failed (rolled back): $e',
+      );
+    }
+
+    // HTTP bahar — sirf commit ke baad
     for (final t in tombstones) {
       try {
         await HubSync.pushDeleted(t.table, t.sid);

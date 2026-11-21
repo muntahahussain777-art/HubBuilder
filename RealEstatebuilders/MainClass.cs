@@ -12,10 +12,10 @@ using System.Windows.Forms;
 
 namespace HubBuilders
 {
-    class MainClass
+    public class MainClass
     {
         // Connection string ko ProjectConnection class se le rahe hain
-        public static readonly string con_string = projectconnection.ConnectionString;  // Assuming projectconnection.ConnectionString is the SQLite connection string
+        public static string con_string = projectconnection.ConnectionString;  // Assuming projectconnection.ConnectionString is the SQLite connection string
 
         // SQLiteConnection object (replace SqlConnection with SQLiteConnection)
         public static SQLiteConnection con = new SQLiteConnection(con_string);
@@ -328,9 +328,23 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             catch { }
         }
 
+        /// <summary>Internal tables — check TABLE NAME only (not full SQL text).</summary>
+        private static bool IsInternalSyncTable(string table)
+        {
+            if (string.IsNullOrWhiteSpace(table)) return true;
+            string t = table.Trim().Trim('`', '[', ']', '"', '\'');
+            if (t.Equals("staff_entry_log", StringComparison.OrdinalIgnoreCase)) return true;
+            if (t.Equals("sqlite_master", StringComparison.OrdinalIgnoreCase)) return true;
+            if (t.StartsWith("sync_", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        /// <summary>Test hook: background PushOneNow / Schedule band — outbox verify ke liye.</summary>
+        public static bool SuppressBackgroundSync { get; set; }
+
         /// <summary>
         /// INSERT/UPDATE ke baad: sync_id ensure + outbox SAME txn mein.
-        /// HTTP PushOneNow caller transaction ke bahar kare.
+        /// Internal table → false (skip). Business table outbox fail → throw (caller rollback).
         /// </summary>
         private static bool TryEnqueueOutboxInTxn(
             SQLiteConnection c, SQLiteTransaction tx,
@@ -341,24 +355,23 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             rowId = 0;
             outboxRev = "";
             if (res <= 0 || c == null) return false;
-            try
+            string head = (qry ?? "").TrimStart();
+            bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
+            bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+            if (!isInsert && !isUpdate) return false;
+            string action = isInsert ? "Insert" : "Update";
+            table = ExtractSqlTableName(head, action);
+            rowId = isInsert ? lastInsertId : IdFromParams(parameters);
+            if (string.IsNullOrWhiteSpace(table) || rowId <= 0) return false;
+            if (IsInternalSyncTable(table))
             {
-                string head = (qry ?? "").TrimStart();
-                bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
-                bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
-                if (!isInsert && !isUpdate) return false;
-                if (head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) >= 0) return false;
-                if (head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) >= 0) return false;
-                if (head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) >= 0) return false;
-                string action = isInsert ? "Insert" : "Update";
-                table = ExtractSqlTableName(head, action);
-                rowId = isInsert ? lastInsertId : IdFromParams(parameters);
-                if (string.IsNullOrWhiteSpace(table) || rowId <= 0) return false;
-                // Ensure sync_outbox exists (schema 11) without leaving txn
-                try
-                {
-                    using (var create = tx == null
-                        ? new SQLiteCommand(@"CREATE TABLE IF NOT EXISTS sync_outbox (
+                table = null;
+                rowId = 0;
+                return false;
+            }
+            // Ensure sync_outbox exists (schema 11) without leaving txn
+            using (var create = tx == null
+                ? new SQLiteCommand(@"CREATE TABLE IF NOT EXISTS sync_outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   table_name TEXT NOT NULL,
   local_pk INTEGER NOT NULL,
@@ -367,7 +380,7 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
   op TEXT NOT NULL DEFAULT 'upsert',
   created_at TEXT DEFAULT (datetime('now'))
 );", c)
-                        : new SQLiteCommand(@"CREATE TABLE IF NOT EXISTS sync_outbox (
+                : new SQLiteCommand(@"CREATE TABLE IF NOT EXISTS sync_outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   table_name TEXT NOT NULL,
   local_pk INTEGER NOT NULL,
@@ -376,21 +389,21 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
   op TEXT NOT NULL DEFAULT 'upsert',
   created_at TEXT DEFAULT (datetime('now'))
 );", c, tx))
-                    {
-                        create.ExecuteNonQuery();
-                    }
-                }
-                catch { }
-                string syncIdNow = HubSyncService.EnsureSyncIdOnConnection(c, tx, table, rowId);
-                if (string.IsNullOrWhiteSpace(syncIdNow)) return false;
-                outboxRev = HubSyncService.EnqueueOutboxOnConnection(c, tx, table, rowId, syncIdNow, "upsert");
-                return !string.IsNullOrWhiteSpace(outboxRev);
+            {
+                create.ExecuteNonQuery();
             }
-            catch { return false; }
+            string syncIdNow = HubSyncService.EnsureSyncIdOnConnection(c, tx, table, rowId);
+            if (string.IsNullOrWhiteSpace(syncIdNow))
+                throw new InvalidOperationException("sync_id ensure failed for table " + table + " id=" + rowId);
+            outboxRev = HubSyncService.EnqueueOutboxOnConnection(c, tx, table, rowId, syncIdNow, "upsert");
+            if (string.IsNullOrWhiteSpace(outboxRev))
+                throw new InvalidOperationException("sync_outbox enqueue failed for table " + table + " id=" + rowId);
+            return true;
         }
 
         private static void ScheduleFastPush(string table, long rowId, string outboxRev)
         {
+            if (SuppressBackgroundSync) return;
             if (string.IsNullOrWhiteSpace(table) || rowId <= 0) return;
             try { HubSyncService.RaiseLiveChanged(); } catch { }
             try { HubSyncService.MarkDirtyTable(table); } catch { }
@@ -429,16 +442,12 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 else if (isUpdate || isDelete) idForLog = IdFromParams(parameters);
 
                 string s = (qry ?? "").TrimStart();
-                if (s.Length >= 6
-                    && s.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
-                    && s.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0
-                    && s.IndexOf("sync_state", StringComparison.OrdinalIgnoreCase) < 0
-                    && s.IndexOf("sync_known", StringComparison.OrdinalIgnoreCase) < 0)
+                string action = isInsert ? "Insert" : isUpdate ? "Update" : isDelete ? "Delete" : null;
+                if (action != null)
                 {
-                    string action = isInsert ? "Insert" : isUpdate ? "Update" : isDelete ? "Delete" : null;
-                    if (action != null)
+                    string module = ExtractSqlTableName(s, action);
+                    if (!IsInternalSyncTable(module))
                     {
-                        string module = ExtractSqlTableName(s, action);
                         if (string.IsNullOrWhiteSpace(module)) module = "Unknown";
                         string detail = idForLog > 0
                             ? ("id=" + idForLog)
@@ -454,17 +463,13 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
                 bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
                 bool isDelete = head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
-                if ((isInsert || isUpdate)
-                    && !skipOutboxEnqueue
-                    && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
-                    && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
-                    && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
+                if ((isInsert || isUpdate) && !skipOutboxEnqueue)
                 {
                     // Fallback path — preferred path is TryEnqueueOutboxInTxn (same SQLite txn as write)
                     string action = isInsert ? "Insert" : "Update";
                     string table = ExtractSqlTableName(head, action);
                     long rowId = isInsert ? lastInsertId : IdFromParams(parameters);
-                    if (!string.IsNullOrWhiteSpace(table) && rowId > 0)
+                    if (!IsInternalSyncTable(table) && !string.IsNullOrWhiteSpace(table) && rowId > 0)
                     {
                         string syncIdNow = "";
                         string outboxRev = "";
@@ -481,18 +486,22 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                         catch { }
                         ScheduleFastPush(table, rowId, outboxRev);
                     }
-                    else
+                    else if (string.IsNullOrWhiteSpace(table) || rowId <= 0)
                     {
                         try { HubSyncService.MarkDirty(); } catch { }
-                        HubSyncService.ScheduleBackgroundPushPublic();
+                        if (!SuppressBackgroundSync)
+                            HubSyncService.ScheduleBackgroundPushPublic();
                     }
                 }
-                else if (isDelete
-                    && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
-                    && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0)
+                else if (isDelete)
                 {
-                    try { HubSyncService.MarkDirty(); } catch { }
-                    HubSyncService.ScheduleBackgroundPushPublic();
+                    string delTable = ExtractSqlTableName(head, "Delete");
+                    if (!IsInternalSyncTable(delTable))
+                    {
+                        try { HubSyncService.MarkDirty(); } catch { }
+                        if (!SuppressBackgroundSync)
+                            HubSyncService.ScheduleBackgroundPushPublic();
+                    }
                 }
             }
             catch { }
@@ -502,11 +511,14 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 bool dml = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
                     || head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
                     || head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
-                if (dml
-                    && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
-                    && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
-                    && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
-                    HubAutoBackup.OnLocalWrite();
+                if (dml)
+                {
+                    string action = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase) ? "Insert"
+                        : head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase) ? "Update" : "Delete";
+                    string t = ExtractSqlTableName(head, action);
+                    if (!IsInternalSyncTable(t))
+                        HubAutoBackup.OnLocalWrite();
+                }
             }
             catch { }
             try
@@ -517,11 +529,10 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 bool isDelete = head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
                 if (isInsert || isUpdate || isDelete)
                 {
-                    if (head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
-                        && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0)
+                    string action = isInsert ? "Insert" : isUpdate ? "Update" : "Delete";
+                    string module = ExtractSqlTableName(head, action) ?? "entry";
+                    if (!IsInternalSyncTable(module))
                     {
-                        string action = isInsert ? "Insert" : isUpdate ? "Update" : "Delete";
-                        string module = ExtractSqlTableName(head, action) ?? "entry";
                         HubSyncService.NotifyActivity(action, module);
                     }
                     else
@@ -876,6 +887,8 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             }
             catch (Exception ex)
             {
+                res = 0;
+                lastId = 0;
                 HubBuilders.AppSafety.ShowSoft(ex);
             }
             return res;

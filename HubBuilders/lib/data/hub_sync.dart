@@ -200,13 +200,15 @@ abstract final class HubSync {
   }
 
   /// Row + sync_alias — delete se pehle collect karein.
+  /// [executor] diya ho to usi SQLite txn/connection par resolve.
   static Future<List<String>> collectCloudDeleteIds(
     String table,
-    int localPk,
-  ) async {
+    int localPk, {
+    DatabaseExecutor? executor,
+  }) async {
     final ids = <String>{};
     if (localPk <= 0 || table.trim().isEmpty) return [];
-    final db = await AppDatabase.instance.database;
+    final db = executor ?? await AppDatabase.instance.database;
     final pk = _pk(table);
     try {
       final rows = await db.rawQuery(

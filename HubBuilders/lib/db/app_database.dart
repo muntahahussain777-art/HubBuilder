@@ -17,6 +17,11 @@ class AppDatabase {
 
   Database? _db;
 
+  /// Test-only: inject in-memory / temp DB (production sync offline tests).
+  static void debugSetDatabase(Database? db) {
+    instance._db = db;
+  }
+
   Future<Database> get database async {
     if (_db != null) return _db!;
     _db = await _open();

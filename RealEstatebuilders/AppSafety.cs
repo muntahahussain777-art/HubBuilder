@@ -8,7 +8,7 @@ namespace HubBuilders
     /// App-wide crash shield. Does not change business logic —
     /// only catches unexpected exceptions so the client never sees a hard crash.
     /// </summary>
-    internal static class AppSafety
+    public static class AppSafety
     {
         private static int _showing;
 
@@ -31,8 +31,12 @@ namespace HubBuilders
             ShowSoft(e.ExceptionObject as Exception);
         }
 
+        /// <summary>Test hook — MessageBox band (headless MainClass.SQL tests).</summary>
+        public static bool SuppressUi { get; set; }
+
         public static void ShowSoft(Exception ex)
         {
+            if (SuppressUi) return;
             if (Interlocked.Exchange(ref _showing, 1) == 1) return;
             try
             {
