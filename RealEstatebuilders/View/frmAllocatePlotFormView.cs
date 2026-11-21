@@ -635,14 +635,14 @@ WHERE a.id=@id;",
                         try
                         {
                             var cascade = HubSyncService.CollectAllocationCascade(allocId);
-                            // Cloud soft-delete PEHLE — warna refresh/CatchUp wapas laata hai
-                            try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
 
                             MainClass.AcquireSharedConnection();
                             SQLiteTransaction tx = null;
                             try
                             {
                                 tx = MainClass.con.BeginTransaction();
+                                // pending_delete + local deletes EK transaction; SoftMark HTTP bahar
+                                HubSyncService.QueuePendingDeletesForCascade(MainClass.con, tx, cascade);
 
                                 using (var cmd = new SQLiteCommand(
                                     "DELETE FROM partner_money WHERE customer_plot_id=@id;", MainClass.con, tx))
@@ -699,8 +699,15 @@ WHERE a.id=@id;",
 
                                 tx.Commit();
                                 tx = null;
-                                try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
-                                try { HubSyncService.NotifyLocalWrite(); } catch { }
+                                try { HubSyncService.SoftMarkQueuedCascade(cascade); } catch { }
+                                try
+                                {
+                                    if (string.Equals(aStatus, "Active", StringComparison.OrdinalIgnoreCase))
+                                        HubSyncService.NotifyLocalWrite("plots", plotId);
+                                    else
+                                        HubSyncService.NotifyLocalWrite();
+                                }
+                                catch { try { HubSyncService.NotifyLocalWrite(); } catch { } }
                                 ShowInfo("Allocation delete ho gaya.");
                                 GetData();
                             }

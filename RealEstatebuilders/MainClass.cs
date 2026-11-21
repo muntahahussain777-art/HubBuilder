@@ -328,7 +328,94 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             catch { }
         }
 
-        private static void AfterSuccessfulWrite(string qry, int res, long lastInsertId, System.Collections.IDictionary parameters)
+        /// <summary>
+        /// INSERT/UPDATE ke baad: sync_id ensure + outbox SAME txn mein.
+        /// HTTP PushOneNow caller transaction ke bahar kare.
+        /// </summary>
+        private static bool TryEnqueueOutboxInTxn(
+            SQLiteConnection c, SQLiteTransaction tx,
+            string qry, int res, long lastInsertId, System.Collections.IDictionary parameters,
+            out string table, out long rowId, out string outboxRev)
+        {
+            table = null;
+            rowId = 0;
+            outboxRev = "";
+            if (res <= 0 || c == null) return false;
+            try
+            {
+                string head = (qry ?? "").TrimStart();
+                bool isInsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
+                bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                if (!isInsert && !isUpdate) return false;
+                if (head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                if (head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                if (head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                string action = isInsert ? "Insert" : "Update";
+                table = ExtractSqlTableName(head, action);
+                rowId = isInsert ? lastInsertId : IdFromParams(parameters);
+                if (string.IsNullOrWhiteSpace(table) || rowId <= 0) return false;
+                // Ensure sync_outbox exists (schema 11) without leaving txn
+                try
+                {
+                    using (var create = tx == null
+                        ? new SQLiteCommand(@"CREATE TABLE IF NOT EXISTS sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  local_pk INTEGER NOT NULL,
+  sync_id TEXT NOT NULL,
+  revision TEXT NOT NULL,
+  op TEXT NOT NULL DEFAULT 'upsert',
+  created_at TEXT DEFAULT (datetime('now'))
+);", c)
+                        : new SQLiteCommand(@"CREATE TABLE IF NOT EXISTS sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  local_pk INTEGER NOT NULL,
+  sync_id TEXT NOT NULL,
+  revision TEXT NOT NULL,
+  op TEXT NOT NULL DEFAULT 'upsert',
+  created_at TEXT DEFAULT (datetime('now'))
+);", c, tx))
+                    {
+                        create.ExecuteNonQuery();
+                    }
+                }
+                catch { }
+                string syncIdNow = HubSyncService.EnsureSyncIdOnConnection(c, tx, table, rowId);
+                if (string.IsNullOrWhiteSpace(syncIdNow)) return false;
+                outboxRev = HubSyncService.EnqueueOutboxOnConnection(c, tx, table, rowId, syncIdNow, "upsert");
+                return !string.IsNullOrWhiteSpace(outboxRev);
+            }
+            catch { return false; }
+        }
+
+        private static void ScheduleFastPush(string table, long rowId, string outboxRev)
+        {
+            if (string.IsNullOrWhiteSpace(table) || rowId <= 0) return;
+            try { HubSyncService.RaiseLiveChanged(); } catch { }
+            try { HubSyncService.MarkDirtyTable(table); } catch { }
+            string revCapture = outboxRev ?? "";
+            string tableCapture = table;
+            long idCapture = rowId;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    if (HubSyncService.PushOneNow(tableCapture, idCapture, revCapture))
+                        HubSyncService.ClearDirty();
+                    else
+                        HubSyncService.MarkDirtyTable(tableCapture);
+                    HubSyncService.ScheduleBackgroundPushPublic();
+                }
+                catch
+                {
+                    try { HubSyncService.MarkDirtyTable(tableCapture); } catch { }
+                    try { HubSyncService.ScheduleBackgroundPushPublic(); } catch { }
+                }
+            });
+        }
+
+        private static void AfterSuccessfulWrite(string qry, int res, long lastInsertId, System.Collections.IDictionary parameters, bool skipOutboxEnqueue = false)
         {
             if (res <= 0) return;
             try
@@ -368,10 +455,12 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 bool isUpdate = head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
                 bool isDelete = head.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
                 if ((isInsert || isUpdate)
+                    && !skipOutboxEnqueue
                     && head.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) < 0
                     && head.IndexOf("sync_", StringComparison.OrdinalIgnoreCase) < 0
                     && head.IndexOf("sqlite_master", StringComparison.OrdinalIgnoreCase) < 0)
                 {
+                    // Fallback path — preferred path is TryEnqueueOutboxInTxn (same SQLite txn as write)
                     string action = isInsert ? "Insert" : "Update";
                     string table = ExtractSqlTableName(head, action);
                     long rowId = isInsert ? lastInsertId : IdFromParams(parameters);
@@ -384,49 +473,13 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                             using (var c = new System.Data.SQLite.SQLiteConnection(con_string))
                             {
                                 c.Open();
-                                string pk = HubSyncService.TablePk(table);
-                                using (var q = new System.Data.SQLite.SQLiteCommand(
-                                    "SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", c))
-                                {
-                                    q.Parameters.AddWithValue("@id", rowId);
-                                    syncIdNow = Convert.ToString(q.ExecuteScalar() ?? "").Trim();
-                                }
-                                if (string.IsNullOrWhiteSpace(syncIdNow))
-                                {
-                                    using (var u = new System.Data.SQLite.SQLiteCommand(
-                                        "UPDATE \"" + table + "\" SET sync_id=lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", c))
-                                    {
-                                        u.Parameters.AddWithValue("@id", rowId);
-                                        u.ExecuteNonQuery();
-                                    }
-                                    using (var q2 = new System.Data.SQLite.SQLiteCommand(
-                                        "SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", c))
-                                    {
-                                        q2.Parameters.AddWithValue("@id", rowId);
-                                        syncIdNow = Convert.ToString(q2.ExecuteScalar() ?? "").Trim();
-                                    }
-                                }
+                                syncIdNow = HubSyncService.EnsureSyncIdOnConnection(c, null, table, rowId);
                             }
                             if (!string.IsNullOrWhiteSpace(syncIdNow))
                                 outboxRev = HubSyncService.EnqueueOutbox(table, rowId, syncIdNow, "upsert");
                         }
                         catch { }
-                        string revCapture = outboxRev;
-                        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                        {
-                            try
-                            {
-                                HubSyncService.MarkDirtyTable(table);
-                                if (HubSyncService.PushOneNow(table, rowId, revCapture))
-                                    HubSyncService.ClearDirty();
-                                HubSyncService.ScheduleBackgroundPushPublic();
-                            }
-                            catch
-                            {
-                                try { HubSyncService.MarkDirtyTable(table); } catch { }
-                                try { HubSyncService.ScheduleBackgroundPushPublic(); } catch { }
-                            }
-                        });
+                        ScheduleFastPush(table, rowId, outboxRev);
                     }
                     else
                     {
@@ -747,23 +800,33 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             int res = 0;
             long lastId = 0;
             var delIds = PeekDeleteSyncIds(qry, ht);
+            string pushTable = null;
+            long pushId = 0;
+            string pushRev = "";
+            bool outboxInTxn = false;
             try
             {
-                // Local delete + pending_delete EK transaction; SoftMark HTTP bahar
+                string head = (qry ?? "").TrimStart();
                 bool isDel = delIds != null && delIds.Count > 0;
+                bool isUpsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
+                    || head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                // Customer INSERT (sync_id in SQL) + outbox SAME txn; SoftMark/push HTTP bahar
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        if (isDel)
+                        if (isDel || isUpsert)
                         {
                             using (var tx = con.BeginTransaction())
                             {
                                 try
                                 {
-                                    QueuePendingInTxn(con, tx, delIds);
+                                    if (isDel) QueuePendingInTxn(con, tx, delIds);
                                     res = ExecNonQueryRetry(con, qry, ht, out lastId, tx);
+                                    if (!isDel && res > 0)
+                                        outboxInTxn = TryEnqueueOutboxInTxn(con, tx, qry, res, lastId, ht,
+                                            out pushTable, out pushId, out pushRev);
                                     tx.Commit();
                                 }
                                 catch
@@ -782,14 +845,17 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        if (isDel)
+                        if (isDel || isUpsert)
                         {
                             using (var tx = local.BeginTransaction())
                             {
                                 try
                                 {
-                                    QueuePendingInTxn(local, tx, delIds);
+                                    if (isDel) QueuePendingInTxn(local, tx, delIds);
                                     res = ExecNonQueryRetry(local, qry, ht, out lastId, tx);
+                                    if (!isDel && res > 0)
+                                        outboxInTxn = TryEnqueueOutboxInTxn(local, tx, qry, res, lastId, ht,
+                                            out pushTable, out pushId, out pushRev);
                                     tx.Commit();
                                 }
                                 catch
@@ -803,7 +869,8 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                             res = ExecNonQueryRetry(local, qry, ht, out lastId);
                     }
                 }
-                AfterSuccessfulWrite(qry, res, lastId, ht);
+                AfterSuccessfulWrite(qry, res, lastId, ht, skipOutboxEnqueue: outboxInTxn);
+                if (outboxInTxn) ScheduleFastPush(pushTable, pushId, pushRev);
                 PushCloudDeletes(delIds, res);
                 PushCloudUserDeletes(qry, ht, res);
             }
@@ -1452,20 +1519,30 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 long lastId = 0;
                 var delIds = PeekDeleteSyncIds(query, parameters);
                 bool isDel = delIds != null && delIds.Count > 0;
-                // Local delete + pending_delete EK transaction; SoftMark HTTP bahar
+                string head = (query ?? "").TrimStart();
+                bool isUpsert = head.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
+                    || head.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+                string pushTable = null;
+                long pushId = 0;
+                string pushRev = "";
+                bool outboxInTxn = false;
+                // Local write + outbox/pending_delete EK transaction; HTTP bahar
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        if (isDel)
+                        if (isDel || isUpsert)
                         {
                             using (var tx = con.BeginTransaction())
                             {
                                 try
                                 {
-                                    QueuePendingInTxn(con, tx, delIds);
+                                    if (isDel) QueuePendingInTxn(con, tx, delIds);
                                     n = ExecNonQueryRetry(con, query, parameters, out lastId, tx);
+                                    if (!isDel && n > 0)
+                                        outboxInTxn = TryEnqueueOutboxInTxn(con, tx, query, n, lastId, parameters,
+                                            out pushTable, out pushId, out pushRev);
                                     tx.Commit();
                                 }
                                 catch
@@ -1484,14 +1561,17 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        if (isDel)
+                        if (isDel || isUpsert)
                         {
                             using (var tx = local.BeginTransaction())
                             {
                                 try
                                 {
-                                    QueuePendingInTxn(local, tx, delIds);
+                                    if (isDel) QueuePendingInTxn(local, tx, delIds);
                                     n = ExecNonQueryRetry(local, query, parameters, out lastId, tx);
+                                    if (!isDel && n > 0)
+                                        outboxInTxn = TryEnqueueOutboxInTxn(local, tx, query, n, lastId, parameters,
+                                            out pushTable, out pushId, out pushRev);
                                     tx.Commit();
                                 }
                                 catch
@@ -1505,7 +1585,8 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                             n = ExecNonQueryRetry(local, query, parameters, out lastId);
                     }
                 }
-                AfterSuccessfulWrite(query, n, lastId, parameters);
+                AfterSuccessfulWrite(query, n, lastId, parameters, skipOutboxEnqueue: outboxInTxn);
+                if (outboxInTxn) ScheduleFastPush(pushTable, pushId, pushRev);
                 PushCloudDeletes(delIds, n);
                 PushCloudUserDeletes(query, parameters, n);
                 return n;

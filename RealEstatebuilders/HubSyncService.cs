@@ -1525,11 +1525,18 @@ namespace HubBuilders
                         FilterOutRecoverPlaceholderCustomers(fetched, skip);
                         if (fetched.Count == 0) continue;
                     }
-                    // Soft-deleted parents: insert as live for FK resolve (do not ApplyRow-delete)
+                    // Soft-deleted PLOTS may be needed as FK; deleted ALLOCATIONS must NOT resurrect.
                     if (includeDeleted)
                     {
-                        foreach (var r in fetched)
-                            r["is_deleted"] = false;
+                        if (string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Keep is_deleted as-is — ApplyFetched tombstone removes local Active
+                        }
+                        else
+                        {
+                            foreach (var r in fetched)
+                                r["is_deleted"] = false;
+                        }
                     }
                     ApplyFetched(AsApplyRows(table, fetched));
                 }
@@ -1620,6 +1627,39 @@ namespace HubBuilders
                 }
             }
             MarkDirty();
+        }
+
+        /// <summary>Cascade items ke sync_ids pending_delete mein (HTTP nahi).</summary>
+        public static void QueuePendingDeletesForCascade(
+            SQLiteConnection con, SQLiteTransaction tx, IEnumerable<CloudDeleteItem> items)
+        {
+            if (con == null || items == null) return;
+            foreach (var i in items)
+            {
+                if (i == null || i.SyncIds == null || i.SyncIds.Count == 0) continue;
+                QueuePendingDeleteIds(con, tx, i.Table, i.SyncIds);
+            }
+        }
+
+        /// <summary>Pending pehle txn mein likha — ab sirf SoftMark HTTP (bahar).</summary>
+        public static void SoftMarkQueuedCascade(IEnumerable<CloudDeleteItem> items)
+        {
+            if (items == null) return;
+            foreach (var i in items)
+            {
+                if (i == null || i.SyncIds == null) continue;
+                foreach (string sid in i.SyncIds)
+                {
+                    if (string.IsNullOrWhiteSpace(sid)) continue;
+                    try
+                    {
+                        if (SoftMarkCloudDeleted(i.Table, sid))
+                            RemovePendingDelete(sid);
+                    }
+                    catch { }
+                }
+            }
+            try { ScheduleQuickSync(); } catch { }
         }
 
         private static void RemovePendingDelete(string syncId)
@@ -1803,27 +1843,72 @@ namespace HubBuilders
         public static string EnqueueOutbox(string table, long rowId, string syncId, string op = "upsert")
         {
             string rev = Guid.NewGuid().ToString("N");
-            if (rowId <= 0 || string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(syncId))
-                return rev;
             try
             {
                 using (var con = new SQLiteConnection(MainClass.con_string))
                 {
                     con.Open();
-                    using (var cmd = new SQLiteCommand(
-                        "INSERT INTO sync_outbox(table_name, local_pk, sync_id, revision, op) VALUES(@t,@p,@s,@r,@o);", con))
-                    {
-                        cmd.Parameters.AddWithValue("@t", table);
-                        cmd.Parameters.AddWithValue("@p", rowId);
-                        cmd.Parameters.AddWithValue("@s", syncId.Trim());
-                        cmd.Parameters.AddWithValue("@r", rev);
-                        cmd.Parameters.AddWithValue("@o", op ?? "upsert");
-                        cmd.ExecuteNonQuery();
-                    }
+                    return EnqueueOutboxOnConnection(con, null, table, rowId, syncId, op, rev);
                 }
             }
-            catch { }
+            catch { return rev; }
+        }
+
+        /// <summary>Customer INSERT/UPDATE ke saath SAME SQLite transaction mein outbox.</summary>
+        public static string EnqueueOutboxOnConnection(
+            SQLiteConnection con, SQLiteTransaction tx,
+            string table, long rowId, string syncId, string op = "upsert", string revision = null)
+        {
+            string rev = string.IsNullOrWhiteSpace(revision) ? Guid.NewGuid().ToString("N") : revision;
+            if (con == null || rowId <= 0 || string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(syncId))
+                return rev;
+            using (var cmd = tx == null
+                ? new SQLiteCommand(
+                    "INSERT INTO sync_outbox(table_name, local_pk, sync_id, revision, op) VALUES(@t,@p,@s,@r,@o);", con)
+                : new SQLiteCommand(
+                    "INSERT INTO sync_outbox(table_name, local_pk, sync_id, revision, op) VALUES(@t,@p,@s,@r,@o);", con, tx))
+            {
+                cmd.Parameters.AddWithValue("@t", table);
+                cmd.Parameters.AddWithValue("@p", rowId);
+                cmd.Parameters.AddWithValue("@s", syncId.Trim());
+                cmd.Parameters.AddWithValue("@r", rev);
+                cmd.Parameters.AddWithValue("@o", op ?? "upsert");
+                cmd.ExecuteNonQuery();
+            }
             return rev;
+        }
+
+        /// <summary>Existing non-empty sync_id preserve; empty pe generate. Same connection/tx.</summary>
+        public static string EnsureSyncIdOnConnection(
+            SQLiteConnection con, SQLiteTransaction tx, string table, long rowId)
+        {
+            if (con == null || rowId <= 0 || string.IsNullOrWhiteSpace(table)) return "";
+            string pk = Pk(table);
+            string sid = "";
+            using (var q = tx == null
+                ? new SQLiteCommand("SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con)
+                : new SQLiteCommand("SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con, tx))
+            {
+                q.Parameters.AddWithValue("@id", rowId);
+                sid = Convert.ToString(q.ExecuteScalar() ?? "").Trim();
+            }
+            if (!string.IsNullOrWhiteSpace(sid)) return sid;
+            using (var u = tx == null
+                ? new SQLiteCommand(
+                    "UPDATE \"" + table + "\" SET sync_id=lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", con)
+                : new SQLiteCommand(
+                    "UPDATE \"" + table + "\" SET sync_id=lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", con, tx))
+            {
+                u.Parameters.AddWithValue("@id", rowId);
+                u.ExecuteNonQuery();
+            }
+            using (var q2 = tx == null
+                ? new SQLiteCommand("SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con)
+                : new SQLiteCommand("SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con, tx))
+            {
+                q2.Parameters.AddWithValue("@id", rowId);
+                return Convert.ToString(q2.ExecuteScalar() ?? "").Trim();
+            }
         }
 
         private static void ClearOutboxRevision(string revision)
@@ -2143,9 +2228,13 @@ namespace HubBuilders
             return items;
         }
 
-        /// <summary>partner_money rows — pehle cloud tombstone, phir local delete.</summary>
+        /// <summary>
+        /// partner_money: pending_delete (txn mein agar tx ho) + local delete.
+        /// SoftMark HTTP hamesha SQLite txn se bahar (last step).
+        /// </summary>
         public static void DeletePartnerMoneyWhere(
-            SQLiteConnection con, SQLiteTransaction tx, string whereSql, Action<SQLiteCommand> bind)
+            SQLiteConnection con, SQLiteTransaction tx, string whereSql, Action<SQLiteCommand> bind,
+            bool softMarkCloud = true)
         {
             if (con == null || string.IsNullOrWhiteSpace(whereSql)) return;
             var items = new List<CloudDeleteItem>();
@@ -2169,16 +2258,25 @@ namespace HubBuilders
                         }
                     }
                 }
-                if (items.Count > 0)
+                if (tx != null)
+                    QueuePendingDeletesForCascade(con, tx, items);
+                else
                 {
-                    try { SyncCloudDeleteMany(items); } catch { }
-                    using (var del = new SQLiteCommand("DELETE FROM partner_money WHERE " + whereSql + ";", con, tx))
+                    foreach (var i in items)
                     {
-                        bind?.Invoke(del);
-                        del.ExecuteNonQuery();
+                        if (i.SyncIds == null) continue;
+                        foreach (string sid in i.SyncIds)
+                            QueuePendingDelete("partner_money", sid);
                     }
-                    try { MarkDirty(); } catch { }
                 }
+                using (var del = new SQLiteCommand("DELETE FROM partner_money WHERE " + whereSql + ";", con, tx))
+                {
+                    bind?.Invoke(del);
+                    del.ExecuteNonQuery();
+                }
+                try { MarkDirty(); } catch { }
+                if (softMarkCloud)
+                    SoftMarkQueuedCascade(items);
             }
             catch { }
         }

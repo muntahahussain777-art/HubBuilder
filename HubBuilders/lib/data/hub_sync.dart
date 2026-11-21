@@ -2615,6 +2615,7 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
   }
 
   /// Receipt/ledger: pehle parent allocate (+ uske parents), phir filter.
+  /// Deleted allocation ko Active resurrect mat karo (late receipt race).
   static Future<void> _ensureChildParentsThenFilter(
     String table,
     List<Map<String, dynamic>> rows,
@@ -2625,6 +2626,7 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
       final cp = (row['customer_plot_sync_id'] ?? '').toString().trim();
       if (cp.isNotEmpty) need.add(cp);
     }
+    final deletedParentIds = <String>{};
     if (need.isNotEmpty) {
       final got = await _sbSelect(
         'customer_plots',
@@ -2633,23 +2635,53 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
         syncIds: need.toList(),
         includeDeleted: true,
       );
-      final allocs = got.rows
-          .map((r) => Map<String, dynamic>.from(r))
-          .toList();
-      for (final a in allocs) {
-        // Soft-deleted allocate: child apply se pehle parent resolve ke liye live treat
-        a['is_deleted'] = false;
+      final liveAllocs = <Map<String, dynamic>>[];
+      final tombstones = <Map<String, dynamic>>[];
+      for (final raw in got.rows) {
+        final a = Map<String, dynamic>.from(raw);
+        final sid = (a['sync_id'] ?? '').toString().trim();
+        if (_cloudRowIsDeleted(a)) {
+          if (sid.isNotEmpty) deletedParentIds.add(sid.toLowerCase());
+          // Tombstone apply — Active list se hatao; is_deleted=false mat karo
+          tombstones.add(a);
+          continue;
+        }
+        liveAllocs.add(a);
       }
-      if (allocs.isNotEmpty) {
-        await _ensureRecoverParentsForCustomerPlots(allocs, skipList);
-        if (allocs.isNotEmpty) {
+      if (tombstones.isNotEmpty) {
+        await _applyFetched(
+          _asApplyRows('customer_plots', tombstones),
+          notify: false,
+          bump: false,
+        );
+      }
+      if (liveAllocs.isNotEmpty) {
+        await _ensureRecoverParentsForCustomerPlots(liveAllocs, skipList);
+        if (liveAllocs.isNotEmpty) {
           await _applyFetched(
-            _asApplyRows('customer_plots', allocs),
+            _asApplyRows('customer_plots', liveAllocs),
             notify: false,
             bump: false,
           );
         }
       }
+    }
+    // Late receipt + deleted parent: pending_apply mat banao (parent kabhi Active nahi hoga)
+    if (deletedParentIds.isNotEmpty) {
+      final keep = <Map<String, dynamic>>[];
+      for (final row in rows) {
+        final cp = (row['customer_plot_sync_id'] ?? '').toString().trim().toLowerCase();
+        final id = (row['sync_id'] ?? '').toString();
+        final short = id.length >= 8 ? id.substring(0, 8) : id;
+        if (cp.isNotEmpty && deletedParentIds.contains(cp)) {
+          skipList.add('$short: skip — parent allocate is_deleted (no resurrect)');
+          continue;
+        }
+        keep.add(row);
+      }
+      rows
+        ..clear()
+        ..addAll(keep);
     }
     await _filterRecoverChildrenToExistingAllocs(table, rows, skipList);
   }

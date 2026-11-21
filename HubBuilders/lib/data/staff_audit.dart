@@ -131,11 +131,10 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
         if (table == 'customers') HubSync.noteCustomerLocalSave(sid);
       }
     });
-    // UI save dikhao — HTTP bahar
-    unawaited(() async {
-      await HubSync.pushNow(table, id, outboxRevision: outboxRev);
-      HubSync.notifyLocalWrite(alreadyPushed: true);
-    }());
+    // Commit ke turant baad local UI refresh — HTTP background
+    HubSync.notifyLocalWrite(alreadyPushed: true);
+    if (table == 'customers') HubSync.noteCustomerUiRefresh();
+    unawaited(HubSync.pushNow(table, id, outboxRevision: outboxRev));
     await log('Insert', table, detail: 'id=$id');
     unawaited(AutoBackup.onEntry());
     return id;
@@ -198,11 +197,9 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
           ? 'id=${whereArgs.first}'
           : (where == null ? null : '$where $whereArgs');
       if (pkArg != null) {
-        unawaited(() async {
-          await HubSync.pushNow(table, pkArg, outboxRevision: outboxRev);
-          HubSync.notifyLocalWrite(alreadyPushed: true);
-          if (table == 'customers') HubSync.noteCustomerUiRefresh();
-        }());
+        HubSync.notifyLocalWrite(alreadyPushed: true);
+        if (table == 'customers') HubSync.noteCustomerUiRefresh();
+        unawaited(HubSync.pushNow(table, pkArg, outboxRevision: outboxRev));
       } else {
         HubSync.notifyLocalWrite();
       }

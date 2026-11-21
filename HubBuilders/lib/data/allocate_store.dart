@@ -1,3 +1,5 @@
+import 'package:sqflite/sqflite.dart';
+
 import '../db/app_database.dart';
 import 'hub_sync.dart';
 import 'partner_cash_store.dart';
@@ -247,6 +249,7 @@ WHERE cp.customer_id = ?''',
   }
 
   /// Hard delete allocation — linked receipts/ledger/partner cash bhi (WinForms cascade).
+  /// Local deletes + exact sync_id pending_delete EK transaction; SoftMark HTTP bahar.
   static Future<({bool ok, String message})> deleteAllocation(
     int customerPlotId,
   ) async {
@@ -263,56 +266,110 @@ WHERE cp.customer_id = ?''',
     final plotId = rows.first['plot_id'] as int;
     final status = (rows.first['status'] as String?) ?? '';
 
-    try {
+    Future<void> collect(
+      String table,
+      String where,
+      List<Object?> args,
+      List<({String table, String sid})> out,
+    ) async {
       try {
-        await db.delete(
-          'allocation_cancellations',
-          where: 'customer_plot_id = ?',
-          whereArgs: [customerPlotId],
-        );
+        final found = await db.query(table, columns: ['id'], where: where, whereArgs: args);
+        for (final r in found) {
+          final id = int.tryParse((r['id'] ?? '').toString()) ?? 0;
+          if (id <= 0) continue;
+          for (final sid in await HubSync.collectCloudDeleteIds(table, id)) {
+            if (sid.trim().isNotEmpty) {
+              out.add((table: table, sid: sid.trim()));
+            }
+          }
+        }
       } catch (_) {}
-      await StaffAudit.delete(
-        'partner_money',
-        where: 'customer_plot_id = ?',
-        whereArgs: [customerPlotId],
-      );
-      await StaffAudit.delete(
-        'receipts',
-        where: 'customer_plot_id = ?',
-        whereArgs: [customerPlotId],
-      );
-      await StaffAudit.delete(
-        'ledger',
-        where: 'customer_plot_id = ?',
-        whereArgs: [customerPlotId],
-      );
-      try {
-        await StaffAudit.delete(
-          'customer_plot_partners',
-          where: 'customer_plot_id = ?',
-          whereArgs: [customerPlotId],
-        );
-      } catch (_) {}
+    }
 
-      final n = await StaffAudit.delete(
-        'customer_plots',
-        where: 'id = ?',
-        whereArgs: [customerPlotId],
-      );
-      if (n <= 0) {
-        return (ok: false, message: 'Allocation delete failed.');
+    final tombstones = <({String table, String sid})>[];
+    await collect('partner_money', 'customer_plot_id = ?', [customerPlotId], tombstones);
+    await collect('receipts', 'customer_plot_id = ?', [customerPlotId], tombstones);
+    await collect('ledger', 'customer_plot_id = ?', [customerPlotId], tombstones);
+    await collect(
+      'customer_plot_partners',
+      'customer_plot_id = ?',
+      [customerPlotId],
+      tombstones,
+    );
+    for (final sid
+        in await HubSync.collectCloudDeleteIds('customer_plots', customerPlotId)) {
+      if (sid.trim().isNotEmpty) {
+        tombstones.add((table: 'customer_plots', sid: sid.trim()));
       }
+    }
 
-      if (status == 'Active' || status == 'Hold') {
-        await db.update(
-          'plots',
-          {'status': 'Available'},
-          where: "id = ? AND status IN ('Hold','Sold')",
-          whereArgs: [plotId],
+    try {
+      var deleted = 0;
+      await db.transaction((txn) async {
+        try {
+          await txn.delete(
+            'allocation_cancellations',
+            where: 'customer_plot_id = ?',
+            whereArgs: [customerPlotId],
+          );
+        } catch (_) {}
+        for (final t in tombstones) {
+          await txn.insert(
+            'sync_pending_delete',
+            {'sync_id': t.sid, 'table_name': t.table},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+        await txn.delete(
+          'partner_money',
+          where: 'customer_plot_id = ?',
+          whereArgs: [customerPlotId],
         );
+        await txn.delete(
+          'receipts',
+          where: 'customer_plot_id = ?',
+          whereArgs: [customerPlotId],
+        );
+        await txn.delete(
+          'ledger',
+          where: 'customer_plot_id = ?',
+          whereArgs: [customerPlotId],
+        );
+        try {
+          await txn.delete(
+            'customer_plot_partners',
+            where: 'customer_plot_id = ?',
+            whereArgs: [customerPlotId],
+          );
+        } catch (_) {}
+        deleted = await txn.delete(
+          'customer_plots',
+          where: 'id = ?',
+          whereArgs: [customerPlotId],
+        );
+        if (deleted <= 0) {
+          throw StateError('Allocation delete failed.');
+        }
+        if (status == 'Active' || status == 'Hold') {
+          await txn.update(
+            'plots',
+            {'status': 'Available'},
+            where: "id = ? AND status IN ('Hold','Sold')",
+            whereArgs: [plotId],
+          );
+        }
+      });
+
+      for (final t in tombstones) {
+        try {
+          await HubSync.pushDeleted(t.table, t.sid);
+        } catch (_) {}
+      }
+      if (status == 'Active' || status == 'Hold') {
         await HubSync.pushNow('plots', plotId);
       }
-      HubSync.notifyLocalWrite();
+      await StaffAudit.log('Delete', 'customer_plots', detail: 'id=$customerPlotId');
+      HubSync.notifyLocalWrite(alreadyPushed: true);
       return (ok: true, message: 'Allocation delete ho gaya.');
     } catch (e) {
       return (ok: false, message: 'Allocation delete failed: $e');

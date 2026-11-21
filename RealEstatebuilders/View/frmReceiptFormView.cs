@@ -1872,8 +1872,6 @@ ORDER BY c.name, p.plot_no;", null);
                     }
 
                     var cascade = HubSyncService.CollectReceiptCascade(rid, ledgerId);
-                    // Cloud soft-delete PEHLE — CatchUp/refresh resurrect band
-                    try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
 
                     SQLiteTransaction tx = null;
                     try
@@ -1883,11 +1881,14 @@ ORDER BY c.name, p.plot_no;", null);
                             pragma.ExecuteNonQuery();
 
                         tx = HubBuilders.MainClass.con.BeginTransaction();
+                        // pending_delete + local deletes EK transaction; SoftMark HTTP bahar
+                        HubSyncService.QueuePendingDeletesForCascade(HubBuilders.MainClass.con, tx, cascade);
 
                         HubSyncService.DeletePartnerMoneyWhere(
                             HubBuilders.MainClass.con, tx,
                             "receipt_id=@rid",
-                            cmd => cmd.Parameters.AddWithValue("@rid", rid));
+                            cmd => cmd.Parameters.AddWithValue("@rid", rid),
+                            softMarkCloud: false);
 
                         using (var cmd = new SQLiteCommand("DELETE FROM receipts WHERE id=@id;", HubBuilders.MainClass.con, tx))
                         { cmd.Parameters.AddWithValue("@id", rid); cmd.ExecuteNonQuery(); }
@@ -1900,7 +1901,7 @@ ORDER BY c.name, p.plot_no;", null);
 
                         tx.Commit();
 
-                        try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
+                        try { HubSyncService.SoftMarkQueuedCascade(cascade); } catch { }
                         try { HubSyncService.NotifyLocalWrite(); } catch { }
                         try { HubSyncService.RaiseLiveChanged(); } catch { }
 

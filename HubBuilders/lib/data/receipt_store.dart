@@ -891,6 +891,21 @@ WHERE customer_plot_id = ? AND amount > 0
     final db = await AppDatabase.instance.database;
     final tombstones = <({String table, String sid})>[];
     try {
+      final partnerRows = await db.query(
+        'partner_money',
+        columns: ['id'],
+        where: 'receipt_id = ?',
+        whereArgs: [receiptId],
+      );
+      for (final r in partnerRows) {
+        final pid = int.tryParse((r['id'] ?? '').toString()) ?? 0;
+        if (pid <= 0) continue;
+        for (final s in await HubSync.collectCloudDeleteIds('partner_money', pid)) {
+          if (s.trim().isNotEmpty) {
+            tombstones.add((table: 'partner_money', sid: s.trim()));
+          }
+        }
+      }
       final rIds = await HubSync.collectCloudDeleteIds('receipts', receiptId);
       for (final s in rIds) {
         if (s.trim().isNotEmpty) {
@@ -907,10 +922,6 @@ WHERE customer_plot_id = ? AND amount > 0
       }
     } catch (_) {}
 
-    try {
-      await PartnerCashStore.deletePartnerMoneyForReceipt(receiptId);
-    } catch (_) {}
-
     await db.transaction((txn) async {
       for (final t in tombstones) {
         await txn.insert(
@@ -919,6 +930,11 @@ WHERE customer_plot_id = ? AND amount > 0
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
       }
+      await txn.delete(
+        'partner_money',
+        where: 'receipt_id = ?',
+        whereArgs: [receiptId],
+      );
       await txn.delete('receipts', where: 'id = ?', whereArgs: [receiptId]);
       if (lid != null) {
         await txn.delete('ledger', where: 'id = ?', whereArgs: [lid]);

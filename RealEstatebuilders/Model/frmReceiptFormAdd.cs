@@ -514,11 +514,14 @@ WHERE r.id=@id;";
                 var cascade = HubSyncService.CollectReceiptCascade(receiptId, ledgerId);
 
                 tx = HubBuilders.MainClass.con.BeginTransaction();
+                // pending_delete + local deletes EK transaction; SoftMark HTTP bahar
+                HubSyncService.QueuePendingDeletesForCascade(HubBuilders.MainClass.con, tx, cascade);
 
                 HubSyncService.DeletePartnerMoneyWhere(
                     HubBuilders.MainClass.con, tx,
                     "receipt_id=@rid",
-                    cmd => cmd.Parameters.AddWithValue("@rid", receiptId));
+                    cmd => cmd.Parameters.AddWithValue("@rid", receiptId),
+                    softMarkCloud: false);
 
                 // delete receipt
                 using (var cmd = new SQLiteCommand("DELETE FROM receipts WHERE id=@id;", HubBuilders.MainClass.con, tx))
@@ -539,7 +542,7 @@ WHERE r.id=@id;";
 
                 tx.Commit();
                 tx = null;
-                try { HubSyncService.SyncCloudDeleteMany(cascade); } catch { }
+                try { HubSyncService.SoftMarkQueuedCascade(cascade); } catch { }
                 try { HubSyncService.NotifyLocalWrite(); } catch { }
             }
             catch (Exception ex)
