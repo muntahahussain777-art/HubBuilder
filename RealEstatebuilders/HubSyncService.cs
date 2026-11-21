@@ -554,6 +554,32 @@ namespace HubBuilders
   table_name TEXT NOT NULL,
   queued_at TEXT DEFAULT (datetime('now','localtime'))
 );");
+                    Exec(con, @"CREATE TABLE IF NOT EXISTS sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  local_pk INTEGER NOT NULL,
+  sync_id TEXT NOT NULL,
+  revision TEXT NOT NULL,
+  op TEXT NOT NULL DEFAULT 'upsert',
+  created_at TEXT DEFAULT (datetime('now'))
+);");
+                    Exec(con, @"CREATE TABLE IF NOT EXISTS sync_pending_apply (
+  sync_id TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  wait_parent_table TEXT,
+  wait_parent_sync_id TEXT,
+  cloud_updated_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);");
+                    Exec(con, @"CREATE TABLE IF NOT EXISTS sync_conflict (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  sync_id TEXT NOT NULL,
+  local_json TEXT,
+  cloud_json TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);");
                     foreach (string t in Tables)
                     {
                         if (!TableExists(con, t)) continue;
@@ -569,9 +595,10 @@ namespace HubBuilders
                 try { BlockMonthlyInstallmentStore.ApplyToEmptyActive(); } catch { }
                 // Schema bump: last_pull / first_pull WIPE mat karo — entries protect
                 string sch = GetState("sync_schema");
-                if (string.IsNullOrWhiteSpace(sch) || sch != "10")
+                // 11 = outbox + pending_apply + anti-resurrect (entries wipe nahi)
+                if (string.IsNullOrWhiteSpace(sch) || string.CompareOrdinal(sch, "11") < 0)
                 {
-                    SetState("sync_schema", "10");
+                    SetState("sync_schema", "11");
                     if (string.IsNullOrWhiteSpace(GetState("alias_backfill_done")))
                         SetState("alias_backfill_done", "");
                 }
@@ -884,40 +911,51 @@ namespace HubBuilders
                 NotifyLocalWrite();
                 return;
             }
+            // Outbox pehle (durable) — phir HTTP bahar
+            var jobs = new List<Tuple<string, long, string>>();
+            foreach (var kv in list)
+            {
+                try
+                {
+                    MarkDirtyTable(kv.Key);
+                    string syncId = "";
+                    using (var con = new SQLiteConnection(MainClass.con_string))
+                    {
+                        con.Open();
+                        if (!TableExists(con, kv.Key)) continue;
+                        string pk = Pk(kv.Key);
+                        using (var u = new SQLiteCommand(
+                            "UPDATE \"" + kv.Key + "\" SET sync_id=lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", con))
+                        {
+                            u.Parameters.AddWithValue("@id", kv.Value);
+                            u.ExecuteNonQuery();
+                        }
+                        using (var q = new SQLiteCommand(
+                            "SELECT sync_id FROM \"" + kv.Key + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con))
+                        {
+                            q.Parameters.AddWithValue("@id", kv.Value);
+                            syncId = Convert.ToString(q.ExecuteScalar() ?? "").Trim();
+                        }
+                    }
+                    string rev = EnqueueOutbox(kv.Key, kv.Value, syncId, "upsert");
+                    jobs.Add(Tuple.Create(kv.Key, kv.Value, rev));
+                }
+                catch { MarkDirtyTable(kv.Key); }
+            }
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 bool anyFail = false;
-                foreach (var kv in list)
+                foreach (var j in jobs)
                 {
                     try
                     {
-                        MarkDirtyTable(kv.Key);
-                        long before = 0;
-                        try
-                        {
-                            using (var con = new SQLiteConnection(MainClass.con_string))
-                            {
-                                con.Open();
-                                if (!TableExists(con, kv.Key)) { anyFail = true; continue; }
-                                string pk = Pk(kv.Key);
-                                using (var cmd = new SQLiteCommand(
-                                    "SELECT 1 FROM \"" + kv.Key + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con))
-                                {
-                                    cmd.Parameters.AddWithValue("@id", kv.Value);
-                                    before = cmd.ExecuteScalar() == null ? 0 : 1;
-                                }
-                            }
-                        }
-                        catch { }
-                        if (before <= 0) { anyFail = true; continue; }
-                        if (!PushOneNow(kv.Key, kv.Value)) anyFail = true;
+                        if (!PushOneNow(j.Item1, j.Item2, j.Item3)) anyFail = true;
                     }
-                    catch { anyFail = true; MarkDirtyTable(kv.Key); }
+                    catch { anyFail = true; MarkDirtyTable(j.Item1); }
                 }
                 try
                 {
                     if (!anyFail) ClearDirty();
-                    // Fail par dirty tables rehti hain — tick PushChanged retry
                     ScheduleQuickSync();
                 }
                 catch { }
@@ -1303,12 +1341,14 @@ namespace HubBuilders
                         if (!plotId.HasValue)
                         {
                             skipList.Add(shortId + ": plot parent missing");
+                            SavePendingApply("customer_plots", row, "plots", plotSync);
                             continue;
                         }
 
                         if (string.IsNullOrWhiteSpace(custSync) || !custId.HasValue)
                         {
                             skipList.Add(shortId + ": skip — no valid cloud customer");
+                            SavePendingApply("customer_plots", row, "customers", custSync);
                             continue;
                         }
 
@@ -1372,6 +1412,7 @@ namespace HubBuilders
                         || !LocalIdBySync(con, "customer_plots", cpSync.Trim()).HasValue)
                     {
                         skipList.Add(shortId + ": skip — parent allocate missing (" + table + ")");
+                        SavePendingApply(table, row, "customer_plots", cpSync);
                         continue;
                     }
                     keep.Add(row);
@@ -1537,7 +1578,7 @@ namespace HubBuilders
             return false;
         }
 
-        /// <summary>Offline delete queue — internet aane par background hard delete.</summary>
+        /// <summary>Offline delete queue — internet aane par SoftMark retry.</summary>
         private static void QueuePendingDelete(string localTable, string syncId)
         {
             string sid = (syncId ?? "").Trim();
@@ -1558,6 +1599,26 @@ namespace HubBuilders
                 }
             }
             catch { }
+            MarkDirty();
+        }
+
+        /// <summary>Local DELETE ke saath same transaction mein pending_delete likho.</summary>
+        public static void QueuePendingDeleteIds(
+            SQLiteConnection con, SQLiteTransaction tx, string table, System.Collections.IEnumerable syncIds)
+        {
+            if (con == null || syncIds == null || string.IsNullOrWhiteSpace(table)) return;
+            foreach (object o in syncIds)
+            {
+                string sid = Convert.ToString(o ?? "").Trim();
+                if (sid.Length == 0) continue;
+                using (var cmd = new SQLiteCommand(
+                    "INSERT OR REPLACE INTO sync_pending_delete(sync_id, table_name) VALUES(@s,@t);", con, tx))
+                {
+                    cmd.Parameters.AddWithValue("@s", sid);
+                    cmd.Parameters.AddWithValue("@t", table.Trim());
+                    cmd.ExecuteNonQuery();
+                }
+            }
             MarkDirty();
         }
 
@@ -1711,8 +1772,105 @@ namespace HubBuilders
             ScheduleQuickSync();
         }
 
-        /// <summary>1 row turant cloud. true = cloud OK (mobile pull kar sake).</summary>
+        private static void DrainOutbox()
+        {
+            var jobs = new List<Tuple<string, long, string>>();
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    if (!TableExists(con, "sync_outbox")) return;
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT table_name, local_pk, revision FROM sync_outbox ORDER BY id ASC LIMIT 40;", con))
+                    using (var r = cmd.ExecuteReader())
+                    {
+                        while (r.Read())
+                        {
+                            long pk;
+                            if (!long.TryParse(Convert.ToString(r[1] ?? ""), out pk) || pk <= 0) continue;
+                            jobs.Add(Tuple.Create(Convert.ToString(r[0] ?? ""), pk, Convert.ToString(r[2] ?? "")));
+                        }
+                    }
+                }
+            }
+            catch { return; }
+            foreach (var j in jobs)
+                PushOneNow(j.Item1, j.Item2, j.Item3);
+        }
+
+        /// <summary>Local save ke saath outbox — revision se late ACK purani edit clear nahi kare.</summary>
+        public static string EnqueueOutbox(string table, long rowId, string syncId, string op = "upsert")
+        {
+            string rev = Guid.NewGuid().ToString("N");
+            if (rowId <= 0 || string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(syncId))
+                return rev;
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    using (var cmd = new SQLiteCommand(
+                        "INSERT INTO sync_outbox(table_name, local_pk, sync_id, revision, op) VALUES(@t,@p,@s,@r,@o);", con))
+                    {
+                        cmd.Parameters.AddWithValue("@t", table);
+                        cmd.Parameters.AddWithValue("@p", rowId);
+                        cmd.Parameters.AddWithValue("@s", syncId.Trim());
+                        cmd.Parameters.AddWithValue("@r", rev);
+                        cmd.Parameters.AddWithValue("@o", op ?? "upsert");
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch { }
+            return rev;
+        }
+
+        private static void ClearOutboxRevision(string revision)
+        {
+            if (string.IsNullOrWhiteSpace(revision)) return;
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    using (var cmd = new SQLiteCommand(
+                        "DELETE FROM sync_outbox WHERE revision=@r;", con))
+                    {
+                        cmd.Parameters.AddWithValue("@r", revision);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static bool IsPendingDeleteSyncId(string syncId)
+        {
+            if (string.IsNullOrWhiteSpace(syncId)) return false;
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT 1 FROM sync_pending_delete WHERE sync_id=@s LIMIT 1;", con))
+                    {
+                        cmd.Parameters.AddWithValue("@s", syncId.Trim());
+                        return cmd.ExecuteScalar() != null;
+                    }
+                }
+            }
+            catch { return false; }
+        }
+
+        /// <summary>1 row turant cloud. Non-empty sync_id kabhi regenerate nahi. Deleted resurrect nahi.</summary>
         public static bool PushOneNow(string table, long rowId)
+        {
+            return PushOneNow(table, rowId, null);
+        }
+
+        public static bool PushOneNow(string table, long rowId, string outboxRevision)
         {
             if (rowId <= 0 || string.IsNullOrWhiteSpace(table)) return false;
             if (table.IndexOf("staff_entry_log", StringComparison.OrdinalIgnoreCase) >= 0) return true;
@@ -1720,7 +1878,7 @@ namespace HubBuilders
             if (!SupabaseConfig.IsConfigured) return false;
             try
             {
-                // Allocate/receipt: pehle parents cloud — mobile list empty na rahe
+                // Allocate/receipt: pehle parents — success check (missing parent = child outbox mein rahe)
                 if (string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase))
                 {
                     try
@@ -1740,8 +1898,10 @@ namespace HubBuilders
                                         try { cid = Convert.ToInt64(r["customer_id"] ?? 0); } catch { }
                                         try { pid = Convert.ToInt64(r["plot_id"] ?? 0); } catch { }
                                         try { if (r["broker_id"] != DBNull.Value) bid = Convert.ToInt64(r["broker_id"]); } catch { }
-                                        if (cid > 0) PushOneNow("customers", cid);
-                                        if (pid > 0) PushOneNow("plots", pid);
+                                        if (cid > 0 && !PushOneNow("customers", cid))
+                                        { MarkDirtyTable(table); return false; }
+                                        if (pid > 0 && !PushOneNow("plots", pid))
+                                        { MarkDirtyTable(table); return false; }
                                         if (bid > 0) PushOneNow("brokers", bid);
                                     }
                                 }
@@ -1766,7 +1926,10 @@ namespace HubBuilders
                                 long allocId;
                                 if (o != null && o != DBNull.Value
                                     && long.TryParse(Convert.ToString(o), out allocId) && allocId > 0)
-                                    PushOneNow("customer_plots", allocId);
+                                {
+                                    if (!PushOneNow("customer_plots", allocId))
+                                    { MarkDirtyTable(table); return false; }
+                                }
                             }
                         }
                     }
@@ -1777,6 +1940,7 @@ namespace HubBuilders
                     con.Open();
                     if (!TableExists(con, table)) return false;
                     string pk = Pk(table);
+                    // SIRF empty sync_id — existing ID kabhi mat chhedo
                     using (var fix = new SQLiteCommand(
                         "UPDATE \"" + table + "\" SET sync_id = lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", con))
                     {
@@ -1795,6 +1959,11 @@ namespace HubBuilders
                     }
                     string syncId = Convert.ToString(payload.ContainsKey("sync_id") ? payload["sync_id"] : "").Trim();
                     if (string.IsNullOrWhiteSpace(syncId)) return false;
+                    // Local pending delete / cloud tombstone — live upsert se resurrect mat karo
+                    if (IsPendingDeleteSyncId(syncId)) return true;
+                    var cloudDeleted = FetchCloudDeletedSyncIds(CloudTable(table), new List<string> { syncId });
+                    if (cloudDeleted.Contains(syncId)) return true;
+
                     Dictionary<string, string> fks;
                     if (Fks.TryGetValue(table, out fks))
                     {
@@ -1817,11 +1986,17 @@ namespace HubBuilders
                     cloudRow["updated_at"] = UtcFilter(DateTime.UtcNow);
                     string cloud = CloudTable(table);
                     var rows = new List<Dictionary<string, object>> { cloudRow };
-                    // Fast pehle; fail → slow Http (ClearDirty se pehle cloud lazmi)
                     if (!UpsertCloudFast(cloud, rows) && !UpsertCloud(cloud, rows))
                     {
                         MarkDirtyTable(table);
                         return false;
+                    }
+                    // Race: upsert ke baad phir check — delete jeet gaya to SoftMark dubara
+                    var stillDel = FetchCloudDeletedSyncIds(cloud, new List<string> { syncId });
+                    if (stillDel.Contains(syncId))
+                    {
+                        SoftMarkCloudDeleted(table, syncId);
+                        return true;
                     }
                     SaveHash(con, syncId, hash);
                     using (var cmd = new SQLiteCommand(
@@ -1832,6 +2007,9 @@ namespace HubBuilders
                         cmd.ExecuteNonQuery();
                     }
                 }
+                if (!string.IsNullOrWhiteSpace(outboxRevision))
+                    ClearOutboxRevision(outboxRevision);
+                try { ProcessPendingApplyQueue(); } catch { }
                 RaiseLiveChanged();
                 return true;
             }
@@ -2378,12 +2556,14 @@ namespace HubBuilders
                     if (CanPush())
                     {
                         PushPendingDeletes();
+                        try { DrainOutbox(); } catch { }
                         if (PushChanged())
                         {
                             _dirty = false;
                             _lastHashPushUtc = DateTime.UtcNow;
                         }
                     }
+                    try { ProcessPendingApplyQueue(); } catch { }
 
                     // Local row cloud pe nahi (hash ne skip kar di) — sirf missing sync_id, delete resurrect nahi
                     if ((DateTime.UtcNow - _lastMissingPushUtc).TotalSeconds >= 12)
@@ -2396,6 +2576,7 @@ namespace HubBuilders
                     PullRecentDeletesTables(LiveTables, 180);
                     PullRecentHealTables(LiveTables, 180);
                     RaiseLiveChanged();
+                    try { ProcessPendingApplyQueue(); } catch { }
                     if ((DateTime.UtcNow - _lastAllocCatchUpUtc).TotalSeconds >= 20)
                     {
                         _quietUi++;
@@ -3424,6 +3605,8 @@ END;");
             string since = UtcFilterIso(sinceRaw);
             string maxApplied = since;
             string minDropped = null;
+            bool anyFetchFail = false;
+            bool anyApplyFail = false;
             var bag = new List<Dictionary<string, object>>();
             // Sequential — customer_plots se pehle plots/customers parents apply
             foreach (string table in Tables)
@@ -3432,12 +3615,15 @@ END;");
                 var all = new List<Dictionary<string, object>>();
                 for (int page = 0; page < 40; page++)
                 {
-                    var rows = HttpGetList("/rest/v1/" + cloud + "?updated_at=gt." + Uri.EscapeDataString(since)
-                        + "&order=updated_at.asc,sync_id.asc&limit=200&offset=" + (page * 200));
-                    if (rows == null || rows.Count == 0) break;
+                    // HttpGetListOk: null = network/HTTP fail (empty list se alag)
+                    var rows = HttpGetListOk("/rest/v1/" + cloud + "?updated_at=gt." + Uri.EscapeDataString(since)
+                        + "&order=updated_at.asc,sync_id.asc&limit=200&offset=" + (page * 200), 20);
+                    if (rows == null) { anyFetchFail = true; break; }
+                    if (rows.Count == 0) break;
                     all.AddRange(rows);
                     if (rows.Count < 200) break;
                 }
+                if (anyFetchFail) break;
                 if (all.Count == 0) continue;
 
                 var ready = all;
@@ -3495,18 +3681,130 @@ END;");
             {
                 if (bag.Count > 0) ApplyFetched(bag);
             }
-            catch { /* last_pull phir bhi aage — stuck na ho */ }
+            catch { anyApplyFail = true; }
+            // Fetch/apply fail → last_pull aage mat badhao (doosri table success se miss na ho)
+            if (anyFetchFail || anyApplyFail) return;
             string advance = maxApplied;
-            // Parent-miss cap: max 90s peeche rakho — warna last_pull forever stuck
+            // Parent-miss: durable pending_apply pe save; cursor sirf JustBefore(minDropped)
             if (!string.IsNullOrWhiteSpace(minDropped))
             {
                 string cap = JustBeforeUtc(minDropped);
-                string floor = UtcFilter(DateTime.UtcNow.AddSeconds(-90));
-                if (string.CompareOrdinal(cap, floor) < 0) cap = floor;
                 if (string.CompareOrdinal(advance, cap) > 0) advance = cap;
             }
             if (string.CompareOrdinal(advance, since) > 0)
                 SetState("last_pull_utc", advance);
+            try { ProcessPendingApplyQueue(); } catch { }
+        }
+
+        private static void SavePendingApply(string table, Dictionary<string, object> cloudRow,
+            string waitParentTable, string waitParentSync)
+        {
+            if (cloudRow == null) return;
+            string sid = Convert.ToString(cloudRow.ContainsKey("sync_id") ? cloudRow["sync_id"] : "").Trim();
+            if (string.IsNullOrWhiteSpace(sid) || string.IsNullOrWhiteSpace(table)) return;
+            try
+            {
+                string json = Json.Serialize(cloudRow);
+                string ts = Convert.ToString(cloudRow.ContainsKey("updated_at") ? cloudRow["updated_at"] : "");
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    using (var cmd = new SQLiteCommand(
+                        @"INSERT OR REPLACE INTO sync_pending_apply
+(sync_id, table_name, payload_json, wait_parent_table, wait_parent_sync_id, cloud_updated_at)
+VALUES(@s,@t,@j,@wt,@ws,@u);", con))
+                    {
+                        cmd.Parameters.AddWithValue("@s", sid);
+                        cmd.Parameters.AddWithValue("@t", table);
+                        cmd.Parameters.AddWithValue("@j", json ?? "");
+                        cmd.Parameters.AddWithValue("@wt", waitParentTable ?? "");
+                        cmd.Parameters.AddWithValue("@ws", waitParentSync ?? "");
+                        cmd.Parameters.AddWithValue("@u", ts ?? "");
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>Parent milte hi skipped allocate/receipt apply — restart ke baad bhi.</summary>
+        public static void ProcessPendingApplyQueue()
+        {
+            List<Dictionary<string, object>> items = new List<Dictionary<string, object>>();
+            try
+            {
+                using (var con = new SQLiteConnection(MainClass.con_string))
+                {
+                    con.Open();
+                    if (!TableExists(con, "sync_pending_apply")) return;
+                    using (var cmd = new SQLiteCommand(
+                        "SELECT sync_id, table_name, payload_json, wait_parent_table, wait_parent_sync_id FROM sync_pending_apply LIMIT 80;", con))
+                    using (var r = cmd.ExecuteReader())
+                    {
+                        while (r.Read())
+                        {
+                            items.Add(new Dictionary<string, object>
+                            {
+                                { "sync_id", Convert.ToString(r[0] ?? "") },
+                                { "table_name", Convert.ToString(r[1] ?? "") },
+                                { "payload_json", Convert.ToString(r[2] ?? "") },
+                                { "wait_parent_table", Convert.ToString(r[3] ?? "") },
+                                { "wait_parent_sync_id", Convert.ToString(r[4] ?? "") }
+                            });
+                        }
+                    }
+                }
+            }
+            catch { return; }
+            foreach (var it in items)
+            {
+                string waitT = Convert.ToString(it["wait_parent_table"] ?? "").Trim();
+                string waitS = Convert.ToString(it["wait_parent_sync_id"] ?? "").Trim();
+                string table = Convert.ToString(it["table_name"] ?? "").Trim();
+                string sid = Convert.ToString(it["sync_id"] ?? "").Trim();
+                if (!string.IsNullOrWhiteSpace(waitT) && !string.IsNullOrWhiteSpace(waitS))
+                {
+                    using (var con = new SQLiteConnection(MainClass.con_string))
+                    {
+                        con.Open();
+                        if (!LocalIdBySync(con, waitT, waitS).HasValue) continue;
+                    }
+                }
+                try
+                {
+                    var payload = Json.Deserialize<Dictionary<string, object>>(
+                        Convert.ToString(it["payload_json"] ?? "{}"));
+                    if (payload == null) continue;
+                    payload["sync_id"] = sid;
+                    if (RowIsDeleted(payload))
+                    {
+                        ApplyFetched(AsApplyRows(table, new List<Dictionary<string, object>> { payload }));
+                    }
+                    else
+                    {
+                        var list = new List<Dictionary<string, object>> { payload };
+                        var skip = new List<string>();
+                        if (string.Equals(table, "customer_plots", StringComparison.OrdinalIgnoreCase))
+                            EnsureRecoverParentsForCustomerPlots(list, skip);
+                        else if (string.Equals(table, "receipts", StringComparison.OrdinalIgnoreCase)
+                              || string.Equals(table, "ledger", StringComparison.OrdinalIgnoreCase))
+                            FilterRecoverChildrenToExistingAllocs(table, list, skip);
+                        if (list.Count == 0) continue;
+                        ApplyFetched(AsApplyRows(table, list));
+                    }
+                    using (var con = new SQLiteConnection(MainClass.con_string))
+                    {
+                        con.Open();
+                        using (var cmd = new SQLiteCommand(
+                            "DELETE FROM sync_pending_apply WHERE sync_id=@s;", con))
+                        {
+                            cmd.Parameters.AddWithValue("@s", sid);
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+                }
+                catch { }
+            }
         }
 
         /// <summary>
@@ -3657,6 +3955,49 @@ END;");
             // Exact sync_id, warna alias wali wahi row. Nayi duplicate insert nahi.
             long? existingBySync = LocalIdBySync(con, table, syncId);
             long? existing = existingBySync;
+            // Offline dual-edit: local outbox pending → cloud silently overwrite mat karo
+            if (existing.HasValue && TableExists(con, "sync_outbox"))
+            {
+                try
+                {
+                    using (var chk = new SQLiteCommand(
+                        "SELECT 1 FROM sync_outbox WHERE sync_id=@s LIMIT 1;", con))
+                    {
+                        chk.Parameters.AddWithValue("@s", syncId);
+                        if (chk.ExecuteScalar() != null)
+                        {
+                            string localJson = "{}";
+                            try
+                            {
+                                using (var lr = new SQLiteCommand(
+                                    "SELECT * FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", con))
+                                {
+                                    lr.Parameters.AddWithValue("@id", existing.Value);
+                                    using (var r = lr.ExecuteReader())
+                                    {
+                                        if (r.Read())
+                                            localJson = Json.Serialize(ReadPayload(r));
+                                    }
+                                }
+                            }
+                            catch { }
+                            using (var ins = new SQLiteCommand(
+                                @"INSERT INTO sync_conflict(table_name, sync_id, local_json, cloud_json)
+VALUES(@t,@s,@l,@c);", con))
+                            {
+                                ins.Parameters.AddWithValue("@t", table);
+                                ins.Parameters.AddWithValue("@s", syncId);
+                                ins.Parameters.AddWithValue("@l", localJson ?? "{}");
+                                ins.Parameters.AddWithValue("@c", Json.Serialize(payload) ?? "{}");
+                                ins.ExecuteNonQuery();
+                            }
+                            NotePull(Convert.ToString(row.ContainsKey("staff_name") ? row["staff_name"] : ""), "conflict", table);
+                            return;
+                        }
+                    }
+                }
+                catch { }
+            }
             if (promptDup && existing == null)
             {
                 string otherStaff = Convert.ToString(row.ContainsKey("staff_name") ? row["staff_name"] : "");

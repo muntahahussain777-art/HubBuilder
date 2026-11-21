@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' show min;
+import 'dart:math' show Random, min;
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
@@ -86,7 +86,11 @@ abstract final class HubSync {
   static DateTime _lastUserMirror = DateTime.fromMillisecondsSinceEpoch(0);
   static final revision = ValueNotifier<int>(0);
   static final notice = ValueNotifier<String?>(null);
+  /// Customer sync latency stages (ms) — local save / cloud ack / remote apply / UI refresh.
+  static final syncTiming = ValueNotifier<Map<String, int>>({});
   static final snackKey = GlobalKey<ScaffoldMessengerState>();
+  static DateTime? _custLocalSaveAt;
+  static String? _custTimingSyncId;
   static final _pullNotes = <String>[];
   static DateTime _lastCatchUp = DateTime.fromMillisecondsSinceEpoch(0);
   static DateTime _lastAllocCatchUp = DateTime.fromMillisecondsSinceEpoch(0);
@@ -743,10 +747,22 @@ abstract final class HubSync {
 
         if (plotId == null) {
           skipList.add('$short: plot parent missing');
+          await _savePendingApply(
+            'customer_plots',
+            row,
+            waitParentTable: 'plots',
+            waitParentSyncId: plotSync,
+          );
           continue;
         }
         if (custSync.isEmpty || custId == null) {
           skipList.add('$short: skip — no valid cloud customer');
+          await _savePendingApply(
+            'customer_plots',
+            row,
+            waitParentTable: 'customers',
+            waitParentSyncId: custSync,
+          );
           continue;
         }
         if (await _isLocalRecoverPlaceholderCustomer(db, custId)) {
@@ -798,6 +814,12 @@ abstract final class HubSync {
       if (cpSync.isEmpty ||
           await _localIdBySync(db, 'customer_plots', cpSync) == null) {
         skipList.add('$short: skip — parent allocate missing ($table)');
+        await _savePendingApply(
+          table,
+          row,
+          waitParentTable: 'customer_plots',
+          waitParentSyncId: cpSync,
+        );
         continue;
       }
       keep.add(row);
@@ -997,7 +1019,104 @@ abstract final class HubSync {
     }
   }
 
-  static Future<void> pushNow(String table, Object? rowId) async {
+  /// Local save ke saath outbox — late ACK purani revision clear nahi kare.
+  static Future<String> enqueueOutbox(
+    DatabaseExecutor db,
+    String table,
+    int rowId,
+    String syncId, {
+    String op = 'upsert',
+  }) async {
+    final rev = _newRevision();
+    if (rowId <= 0 || table.isEmpty || syncId.trim().isEmpty) return rev;
+    try {
+      await db.insert('sync_outbox', {
+        'table_name': table,
+        'local_pk': rowId,
+        'sync_id': syncId.trim(),
+        'revision': rev,
+        'op': op,
+      });
+    } catch (_) {}
+    return rev;
+  }
+
+  static String _newRevision() {
+    final r = Random();
+    final b = List<int>.generate(16, (_) => r.nextInt(256));
+    return b.map((e) => e.toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  static Future<void> _clearOutboxRevision(String? revision) async {
+    if (revision == null || revision.trim().isEmpty) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.delete(
+        'sync_outbox',
+        where: 'revision = ?',
+        whereArgs: [revision],
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> _drainOutbox() async {
+    try {
+      final db = await AppDatabase.instance.database;
+      if (!await _tableExists(db, 'sync_outbox')) return;
+      final jobs = await db.query(
+        'sync_outbox',
+        columns: ['table_name', 'local_pk', 'revision'],
+        orderBy: 'id ASC',
+        limit: 40,
+      );
+      for (final j in jobs) {
+        final t = (j['table_name'] ?? '').toString();
+        final pk = int.tryParse((j['local_pk'] ?? '').toString()) ?? 0;
+        final rev = (j['revision'] ?? '').toString();
+        if (t.isEmpty || pk <= 0) continue;
+        await pushNow(t, pk, outboxRevision: rev);
+      }
+    } catch (e) {
+      debugPrint('HubSync drainOutbox: $e');
+    }
+  }
+
+  static void noteCustomerLocalSave(String syncId) {
+    _custLocalSaveAt = DateTime.now();
+    _custTimingSyncId = syncId.trim().toLowerCase();
+    syncTiming.value = {
+      ...syncTiming.value,
+      'local_save_ms': 0,
+      'cloud_ack_ms': -1,
+      'remote_apply_ms': -1,
+      'ui_refresh_ms': -1,
+    };
+  }
+
+  static void noteCustomerCloudAck(String syncId) {
+    final t0 = _custLocalSaveAt;
+    if (t0 == null) return;
+    if (syncId.trim().toLowerCase() != (_custTimingSyncId ?? '')) return;
+    syncTiming.value = {
+      ...syncTiming.value,
+      'cloud_ack_ms': DateTime.now().difference(t0).inMilliseconds,
+    };
+  }
+
+  static void noteCustomerUiRefresh() {
+    final t0 = _custLocalSaveAt;
+    if (t0 == null) return;
+    syncTiming.value = {
+      ...syncTiming.value,
+      'ui_refresh_ms': DateTime.now().difference(t0).inMilliseconds,
+    };
+  }
+
+  static Future<void> pushNow(
+    String table,
+    Object? rowId, {
+    String? outboxRevision,
+  }) async {
     if (rowId == null) return;
     if (table == 'staff_entry_log' || table.startsWith('sync_')) return;
     if (!await _ensureSb()) return;
@@ -1064,15 +1183,41 @@ abstract final class HubSync {
         }
       }
       final staff = (StaffAudit.displayName ?? StaffAudit.username ?? '').trim();
+      // Pending delete / cloud tombstone — live upsert se resurrect mat karo
+      final pending = await _loadPendingDeleteSyncIds();
+      if (pending.contains(syncId.trim().toLowerCase())) return;
+      try {
+        final check = await Supabase.instance.client
+            .from(_cloudTable(table))
+            .select('sync_id,is_deleted')
+            .eq('sync_id', syncId)
+            .limit(1);
+        if (check.isNotEmpty && _cloudRowIsDeleted(check.first)) return;
+      } catch (_) {}
       cloudRow['dup_key'] = _dupKey(table, payload);
       cloudRow['is_deleted'] = false;
       cloudRow['staff_name'] = staff;
       cloudRow['updated_at'] = _utcFilter(DateTime.now().toUtc());
       final ok = await _httpUpsertIds(_cloudTable(table), [cloudRow]);
       if (ok.contains(syncId)) {
+        // Race: delete jeet gaya to SoftMark dubara
+        try {
+          final again = await Supabase.instance.client
+              .from(_cloudTable(table))
+              .select('is_deleted')
+              .eq('sync_id', syncId)
+              .limit(1);
+          if (again.isNotEmpty && _cloudRowIsDeleted(again.first)) {
+            await _softMarkCloudDeleted(table, syncId);
+            return;
+          }
+        } catch (_) {}
         await _saveHash(db, syncId, hash);
+        await _clearOutboxRevision(outboxRevision);
+        if (table == 'customers') noteCustomerCloudAck(syncId);
         _dirty = false;
         _bump();
+        await _processPendingApplyQueue();
       }
       try {
         await db.insert(
@@ -1337,6 +1482,35 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
   table_name TEXT NOT NULL,
   queued_at TEXT DEFAULT (datetime('now','localtime'))
 )''');
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  local_pk INTEGER NOT NULL,
+  sync_id TEXT NOT NULL,
+  revision TEXT NOT NULL,
+  op TEXT NOT NULL DEFAULT 'upsert',
+  created_at TEXT DEFAULT (datetime('now'))
+)''');
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS sync_pending_apply (
+  sync_id TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  wait_parent_table TEXT,
+  wait_parent_sync_id TEXT,
+  cloud_updated_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+)''');
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS sync_conflict (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  sync_id TEXT NOT NULL,
+  local_json TEXT,
+  cloud_json TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+)''');
     for (final t in _tables) {
       if (!await _tableExists(db, t)) continue;
       if (!await _hasColumn(db, t, 'sync_id')) {
@@ -1352,9 +1526,9 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
       } catch (_) {}
     }
     await _seedHashesIfAlreadySynced();
-    // Schema 10: indexes only — first_pull / last_pull WIPE mat karo (entries protect)
+    // Schema 11: outbox + pending_apply (entries wipe nahi)
     final sch = await _getState('sync_schema');
-    if (sch != '10') {
+    if (sch != '11') {
       final populated = (await _localRowCount('customer_plots')) +
               (await _localRowCount('customers')) >=
           20;
@@ -1370,11 +1544,10 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
           );
         }
       } else if (sch.isEmpty) {
-        // Sirf bilkul empty pehle install — full pull allow
         await _setState('last_pull_utc', '');
         await _setState('first_pull_done', '');
       }
-      await _setState('sync_schema', '10');
+      await _setState('sync_schema', '11');
     }
     if (SupabaseConfig.isConfigured && await _getState('alias_backfill_done') != '1') {
       try {
@@ -1455,6 +1628,9 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
       }
       await _healSyncFlagsIfLocalReady();
       await _ensureMissingSyncIds();
+      // Outbox drain pehle — local saves foran cloud pe
+      await _drainOutbox();
+      await _processPendingApplyQueue();
       if (await _needsFullPull()) {
         await _fullPullAllTables();
       } else {
@@ -1464,6 +1640,7 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
 
         if (await _canPush()) {
           await _pushPendingDeletes();
+          await _drainOutbox();
           final pushed = await _pushChanged();
           if (pushed) {
             _dirty = false;
@@ -1516,46 +1693,51 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     }
   }
 
-  /// updated_at cursor. Pehli dafa 2 din — miss hui WinForms entries. Phir sirf nayi.
-  /// Same sync_id update. is_deleted = sirf woh row. Wipe nahi.
+  /// Per-table (updated_at, sync_id) cursor — same timestamp pe pehli 80 stuck nahi.
+  /// Cursor sirf apply / durable pending_apply ke baad advance.
   static Future<void> _pullLiveCursor() async {
-    var raw = (await _getState('live_cursor_utc')).trim();
-    if (raw.isEmpty) {
-      raw = _utcFilter(
-        DateTime.now().toUtc().subtract(const Duration(days: 2)),
-      );
-    }
-    final cursor = _utcFilterIso(raw);
-    DateTime? hold;
     var anyFail = false;
-    final bag = <Map<String, dynamic>>[];
     for (final table in _liveTables) {
-      final got = await _sbSelect(
+      final key = 'live_cur_$table';
+      var raw = (await _getState(key)).trim();
+      if (raw.isEmpty) {
+        raw =
+            '${_utcFilter(DateTime.now().toUtc().subtract(const Duration(days: 2)))}|';
+      }
+      final parts = raw.split('|');
+      final curTs = _utcFilterIso(parts.isNotEmpty ? parts[0] : '');
+      final curId = parts.length > 1 ? parts[1] : '';
+      final got = await _sbSelectPaged(
         _cloudTable(table),
-        from: 0,
-        to: 79,
-        updatedAfter: cursor,
+        afterUpdatedAt: curTs,
+        afterSyncId: curId,
+        limit: 80,
         includeDeleted: true,
       );
       if (!got.ok) {
         anyFail = true;
-        continue;
+        continue; // is table ka cursor aage mat badhao
       }
-      if (got.rows.length >= 80) {
-        final last = DateTime.tryParse(
-          (got.rows.last['updated_at'] ?? '').toString(),
-        )?.toUtc();
-        if (last != null && (hold == null || last.isBefore(hold))) hold = last;
-      }
+      if (got.rows.isEmpty) continue;
       final ready = await _preparePulledRows(table, got.rows);
-      if (ready.isNotEmpty) bag.addAll(_asApplyRows(table, ready));
+      // Parent-miss → sync_pending_apply (durable). Ready rows pehle apply.
+      if (ready.isNotEmpty) {
+        try {
+          await _applyFetched(_asApplyRows(table, ready));
+        } catch (e) {
+          anyFail = true;
+          debugPrint('HubSync live apply $table: $e');
+          continue; // apply fail → cursor mat advance
+        }
+      }
+      final last = got.rows.last;
+      final lastTs = _utcFilterIso((last['updated_at'] ?? '').toString());
+      final lastId = (last['sync_id'] ?? '').toString().trim();
+      if (lastTs.isNotEmpty && lastId.isNotEmpty) {
+        await _setState(key, '$lastTs|$lastId');
+      }
     }
-    if (bag.isNotEmpty) await _applyFetched(bag);
-    if (anyFail) return;
-    final next = hold != null
-        ? _utcFilter(hold.subtract(const Duration(seconds: 1)))
-        : _utcFilter(DateTime.now().toUtc().subtract(const Duration(seconds: 15)));
-    if (next.compareTo(cursor) > 0) await _setState('live_cursor_utc', next);
+    if (!anyFail) await _processPendingApplyQueue();
   }
 
   /// Sirf is_deleted=true (last N sec) — allocate/receipt delete ~1s mein.
@@ -2485,10 +2667,13 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
     final since = _utcFilterIso(sinceRaw);
     var maxApplied = since;
     String? minDropped;
+    var anyFetchFail = false;
+    var anyApplyFail = false;
     final bag = <Map<String, dynamic>>[];
     final fetched = await Future.wait(_tables.map((table) async {
       final cloud = _cloudTable(table);
       final all = <Map<String, dynamic>>[];
+      var fail = false;
       for (var page = 0; page < 40; page++) {
         final from = page * 200;
         final got = await _sbSelect(
@@ -2498,13 +2683,21 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
           updatedAfter: since,
           includeDeleted: true,
         );
-        if (!got.ok || got.rows.isEmpty) break;
+        if (!got.ok) {
+          fail = true;
+          break;
+        }
+        if (got.rows.isEmpty) break;
         all.addAll(got.rows);
         if (got.rows.length < 200) break;
       }
-      return (table: table, rows: all);
+      return (table: table, rows: all, fail: fail);
     }));
     for (final item in fetched) {
+      if (item.fail) {
+        anyFetchFail = true;
+        break; // doosri table success se failed table cursor aage na badhe
+      }
       if (item.rows.isEmpty) continue;
       final rawLiveIds = <String>{};
       for (final row in item.rows) {
@@ -2535,13 +2728,20 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
       if (ready.isEmpty) continue;
       bag.addAll(_asApplyRows(item.table, ready));
     }
-    if (bag.isNotEmpty) await _applyFetched(bag);
+    try {
+      if (bag.isNotEmpty) await _applyFetched(bag);
+    } catch (_) {
+      anyApplyFail = true;
+    }
+    if (anyFetchFail || anyApplyFail) return;
     var advance = maxApplied;
-    if (minDropped != null) {
-      final cap = _justBeforeUtc(minDropped!);
+    final dropped = minDropped;
+    if (dropped != null) {
+      final cap = _justBeforeUtc(dropped);
       if (advance.compareTo(cap) > 0) advance = cap;
     }
     if (advance.compareTo(since) > 0) await _setState('last_pull_utc', advance);
+    await _processPendingApplyQueue();
   }
 
   /// Recent window re-apply (incl. deletes). Does NOT advance last_pull —
@@ -2627,6 +2827,114 @@ CREATE TABLE IF NOT EXISTS sync_pending_delete (
       _lastGetOk = false;
       debugPrint('HubSync GET $cloud $e');
       return (ok: false, rows: <Map<String, dynamic>>[]);
+    }
+  }
+
+  /// Stable keyset pagination — same updated_at pe stuck nahi.
+  static Future<({bool ok, List<Map<String, dynamic>> rows})> _sbSelectPaged(
+    String cloud, {
+    required String afterUpdatedAt,
+    required String afterSyncId,
+    required int limit,
+    bool includeDeleted = false,
+  }) async {
+    try {
+      if (!await _ensureSb()) {
+        return (ok: false, rows: <Map<String, dynamic>>[]);
+      }
+      final ts = afterUpdatedAt.trim();
+      final sid = afterSyncId.trim();
+      var q = Supabase.instance.client.from(cloud).select('*');
+      if (!includeDeleted) q = q.eq('is_deleted', false);
+      if (ts.isEmpty) {
+        // bootstrap — nothing
+      } else if (sid.isEmpty) {
+        q = q.gt('updated_at', ts);
+      } else {
+        q = q.or(
+          'updated_at.gt.$ts,and(updated_at.eq.$ts,sync_id.gt.$sid)',
+        );
+      }
+      final data = await q
+          .order('updated_at', ascending: true)
+          .order('sync_id', ascending: true)
+          .limit(limit);
+      _lastGetOk = true;
+      final list = (data as List)
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      return (ok: true, rows: list);
+    } catch (e) {
+      _lastGetOk = false;
+      debugPrint('HubSync GET paged $cloud $e');
+      return (ok: false, rows: <Map<String, dynamic>>[]);
+    }
+  }
+
+  static Future<void> _savePendingApply(
+    String table,
+    Map<String, dynamic> cloudRow, {
+    String? waitParentTable,
+    String? waitParentSyncId,
+  }) async {
+    final sid = (cloudRow['sync_id'] ?? '').toString().trim();
+    if (sid.isEmpty || table.isEmpty) return;
+    try {
+      final db = await AppDatabase.instance.database;
+      await db.insert(
+        'sync_pending_apply',
+        {
+          'sync_id': sid,
+          'table_name': table,
+          'payload_json': jsonEncode(cloudRow),
+          'wait_parent_table': waitParentTable ?? '',
+          'wait_parent_sync_id': waitParentSyncId ?? '',
+          'cloud_updated_at': (cloudRow['updated_at'] ?? '').toString(),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> _processPendingApplyQueue() async {
+    try {
+      final db = await AppDatabase.instance.database;
+      final rows = await db.query('sync_pending_apply', limit: 80);
+      for (final r in rows) {
+        final table = (r['table_name'] ?? '').toString();
+        final sid = (r['sync_id'] ?? '').toString().trim();
+        final waitT = (r['wait_parent_table'] ?? '').toString().trim();
+        final waitS = (r['wait_parent_sync_id'] ?? '').toString().trim();
+        if (waitT.isNotEmpty && waitS.isNotEmpty) {
+          if (await _localIdBySync(db, waitT, waitS) == null) continue;
+        }
+        Map<String, dynamic> payload;
+        try {
+          final decoded = jsonDecode((r['payload_json'] ?? '{}').toString());
+          if (decoded is! Map) continue;
+          payload = Map<String, dynamic>.from(decoded);
+        } catch (_) {
+          continue;
+        }
+        payload['sync_id'] = sid;
+        final list = [payload];
+        final skip = <String>[];
+        if (table == 'customer_plots') {
+          await _ensureRecoverParentsForCustomerPlots(list, skip);
+        } else if (table == 'receipts' || table == 'ledger') {
+          await _ensureChildParentsThenFilter(table, list, skip);
+        }
+        if (list.isEmpty) continue;
+        await _applyFetched(_asApplyRows(table, list));
+        await db.delete(
+          'sync_pending_apply',
+          where: 'sync_id = ?',
+          whereArgs: [sid],
+        );
+      }
+    } catch (e) {
+      debugPrint('HubSync pending apply: $e');
     }
   }
 
@@ -2958,6 +3266,37 @@ WHERE IFNULL(status,'') = 'Active'
 
     if (existing != null && existingBySync == null) {
       await saveSyncAlias(db, table, syncId, existing);
+    }
+
+    // Offline dual-edit: local outbox pending → cloud overwrite mat karo; dono recoverable.
+    if (existing != null && !deleted) {
+      try {
+        final pending = await db.query(
+          'sync_outbox',
+          where: 'sync_id = ?',
+          whereArgs: [syncId],
+          limit: 1,
+        );
+        if (pending.isNotEmpty) {
+          final localRows = await db.query(
+            table,
+            where: '$pk = ?',
+            whereArgs: [existing],
+            limit: 1,
+          );
+          await db.insert('sync_conflict', {
+            'table_name': table,
+            'sync_id': syncId,
+            'local_json':
+                localRows.isEmpty ? '{}' : jsonEncode(localRows.first),
+            'cloud_json': jsonEncode(payload),
+          });
+          if (notify) {
+            _noteRemote(row, 'conflict', table);
+          }
+          return;
+        }
+      } catch (_) {}
     }
 
     if (existing != null) {

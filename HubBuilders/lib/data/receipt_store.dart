@@ -1,3 +1,5 @@
+import 'package:sqflite/sqflite.dart';
+
 import '../db/app_database.dart';
 import 'hub_sync.dart';
 import 'installment_cover.dart';
@@ -703,66 +705,139 @@ WHERE customer_plot_id = ? AND amount > 0
 
     final db = await AppDatabase.instance.database;
     late final int receiptIdForPartner;
+    late final int? ledgerIdForPush;
+    var receiptRev = '';
+    var ledgerRev = '';
 
-    if (editingReceiptId != null) {
-      final existing = await receiptById(editingReceiptId);
-      if (existing == null) {
-        return (ok: false, message: 'Receipt not found.', remaining: 0.0, receiptId: null);
-      }
-
-      if (existing.ledgerId != null) {
-        await db.update(
-          'ledger',
-          {
+    try {
+      await db.transaction((txn) async {
+        if (editingReceiptId != null) {
+          final existingRows = await txn.query(
+            'receipts',
+            where: 'id = ?',
+            whereArgs: [editingReceiptId],
+            limit: 1,
+          );
+          if (existingRows.isEmpty) {
+            throw StateError('Receipt not found.');
+          }
+          final existingLid =
+              int.tryParse((existingRows.first['ledger_id'] ?? '').toString());
+          if (existingLid != null) {
+            await txn.update(
+              'ledger',
+              {
+                'txn_date': receiptDate,
+                'credit': amount,
+                'txn_type': txnType,
+                'narration': narration,
+              },
+              where: 'id = ?',
+              whereArgs: [existingLid],
+            );
+          }
+          await txn.update(
+            'receipts',
+            {
+              'customer_plot_id': customerPlotId,
+              'receipt_date': receiptDate,
+              'amount': amount,
+              'mode': mode,
+              'ref_no': cleanRef,
+              'notes': cleanNotes,
+            },
+            where: 'id = ?',
+            whereArgs: [editingReceiptId],
+          );
+          receiptIdForPartner = editingReceiptId;
+          ledgerIdForPush = existingLid;
+        } else {
+          final sidRows = await txn.rawQuery(
+            "SELECT lower(hex(randomblob(16))) AS a, lower(hex(randomblob(16))) AS b",
+          );
+          final ledgerSid = (sidRows.first['a'] ?? '').toString();
+          final receiptSid = (sidRows.first['b'] ?? '').toString();
+          final lid = await txn.insert('ledger', {
+            'customer_plot_id': customerPlotId,
             'txn_date': receiptDate,
+            'narration': narration,
+            'debit': 0,
             'credit': amount,
             'txn_type': txnType,
-            'narration': narration,
-          },
+            if (ledgerSid.isNotEmpty) 'sync_id': ledgerSid,
+          });
+          receiptIdForPartner = await txn.insert('receipts', {
+            'customer_plot_id': customerPlotId,
+            'receipt_date': receiptDate,
+            'amount': amount,
+            'mode': mode,
+            'ref_no': cleanRef,
+            'notes': cleanNotes,
+            'ledger_id': lid,
+            if (receiptSid.isNotEmpty) 'sync_id': receiptSid,
+          });
+          ledgerIdForPush = lid;
+        }
+
+        // Ensure sync_ids + outbox same txn
+        await txn.execute(
+          "UPDATE receipts SET sync_id=lower(hex(randomblob(16))) "
+          "WHERE id=? AND (sync_id IS NULL OR TRIM(sync_id)='')",
+          [receiptIdForPartner],
+        );
+        final rSidRows = await txn.query(
+          'receipts',
+          columns: ['sync_id'],
           where: 'id = ?',
-          whereArgs: [existing.ledgerId],
+          whereArgs: [receiptIdForPartner],
+          limit: 1,
+        );
+        final rSid =
+            (rSidRows.first['sync_id'] ?? '').toString().trim();
+        if (rSid.isNotEmpty) {
+          receiptRev = await HubSync.enqueueOutbox(
+            txn,
+            'receipts',
+            receiptIdForPartner,
+            rSid,
+          );
+        }
+        if (ledgerIdForPush != null) {
+          await txn.execute(
+            "UPDATE ledger SET sync_id=lower(hex(randomblob(16))) "
+            "WHERE id=? AND (sync_id IS NULL OR TRIM(sync_id)='')",
+            [ledgerIdForPush],
+          );
+          final lSidRows = await txn.query(
+            'ledger',
+            columns: ['sync_id'],
+            where: 'id = ?',
+            whereArgs: [ledgerIdForPush],
+            limit: 1,
+          );
+          final lSid =
+              (lSidRows.first['sync_id'] ?? '').toString().trim();
+          if (lSid.isNotEmpty) {
+            ledgerRev = await HubSync.enqueueOutbox(
+              txn,
+              'ledger',
+              ledgerIdForPush!,
+              lSid,
+            );
+          }
+        }
+
+      });
+    } catch (e) {
+      if (e is StateError) {
+        return (
+          ok: false,
+          message: e.message,
+          remaining: 0.0,
+          receiptId: null,
         );
       }
-
-      await db.update(
-        'receipts',
-        {
-          'customer_plot_id': customerPlotId,
-          'receipt_date': receiptDate,
-          'amount': amount,
-          'mode': mode,
-          'ref_no': cleanRef,
-          'notes': cleanNotes,
-        },
-        where: 'id = ?',
-        whereArgs: [editingReceiptId],
-      );
-      receiptIdForPartner = editingReceiptId;
-    } else {
-      final sidRows = await db.rawQuery(
-        "SELECT lower(hex(randomblob(16))) AS a, lower(hex(randomblob(16))) AS b",
-      );
-      final ledgerSid = (sidRows.first['a'] ?? '').toString();
-      final receiptSid = (sidRows.first['b'] ?? '').toString();
-      final lid = await db.insert('ledger', {
-        'customer_plot_id': customerPlotId,
-        'txn_date': receiptDate,
-        'narration': narration,
-        'debit': 0,
-        'credit': amount,
-        'txn_type': txnType,
-        if (ledgerSid.isNotEmpty) 'sync_id': ledgerSid,
-      });
-      receiptIdForPartner = await db.insert('receipts', {
-        'customer_plot_id': customerPlotId,
-        'receipt_date': receiptDate,
-        'amount': amount,
-        'mode': mode,
-        'ref_no': cleanRef,
-        'notes': cleanNotes,
-        'ledger_id': lid,
-        if (receiptSid.isNotEmpty) 'sync_id': receiptSid,
-      });
+      rethrow;
     }
 
     try {
@@ -776,7 +851,7 @@ WHERE customer_plot_id = ? AND amount > 0
         note: cleanNotes,
       );
     } catch (_) {
-      // Partner cash sync additive — never block receipt save.
+      // Partner cash additive — never block receipt save.
     }
 
     final after = await getRemaining(customerPlotId);
@@ -786,18 +861,25 @@ WHERE customer_plot_id = ? AND amount > 0
       detail:
           'amount=$amount; mode=$mode; cpid=$customerPlotId; partner=${partnerId ?? 0}',
     );
-    await HubSync.pushNow('receipts', receiptIdForPartner);
-    if (editingReceiptId == null) {
-      final saved = await receiptById(receiptIdForPartner);
-      final lid = saved?.ledgerId;
-      if (lid != null) await HubSync.pushNow('ledger', lid);
-    } else {
-      final existing = await receiptById(editingReceiptId);
-      final lid = existing?.ledgerId;
-      if (lid != null) await HubSync.pushNow('ledger', lid);
+    await HubSync.pushNow(
+      'receipts',
+      receiptIdForPartner,
+      outboxRevision: receiptRev,
+    );
+    if (ledgerIdForPush != null) {
+      await HubSync.pushNow(
+        'ledger',
+        ledgerIdForPush,
+        outboxRevision: ledgerRev,
+      );
     }
     HubSync.notifyLocalWrite(alreadyPushed: true);
-    return (ok: true, message: 'Saved', remaining: after.remaining, receiptId: receiptIdForPartner);
+    return (
+      ok: true,
+      message: 'Saved',
+      remaining: after.remaining,
+      receiptId: receiptIdForPartner,
+    );
   }
 
   static Future<({bool ok, String message})> deleteReceipt(int receiptId) async {
@@ -806,13 +888,50 @@ WHERE customer_plot_id = ? AND amount > 0
       return (ok: false, message: 'Receipt not found.');
     }
     final lid = existing.ledgerId;
+    final db = await AppDatabase.instance.database;
+    final tombstones = <({String table, String sid})>[];
+    try {
+      final rIds = await HubSync.collectCloudDeleteIds('receipts', receiptId);
+      for (final s in rIds) {
+        if (s.trim().isNotEmpty) {
+          tombstones.add((table: 'receipts', sid: s.trim()));
+        }
+      }
+      if (lid != null) {
+        final lIds = await HubSync.collectCloudDeleteIds('ledger', lid);
+        for (final s in lIds) {
+          if (s.trim().isNotEmpty) {
+            tombstones.add((table: 'ledger', sid: s.trim()));
+          }
+        }
+      }
+    } catch (_) {}
+
     try {
       await PartnerCashStore.deletePartnerMoneyForReceipt(receiptId);
     } catch (_) {}
-    await StaffAudit.delete('receipts', where: 'id = ?', whereArgs: [receiptId]);
-    if (lid != null) {
-      await StaffAudit.delete('ledger', where: 'id = ?', whereArgs: [lid]);
+
+    await db.transaction((txn) async {
+      for (final t in tombstones) {
+        await txn.insert(
+          'sync_pending_delete',
+          {'sync_id': t.sid, 'table_name': t.table},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await txn.delete('receipts', where: 'id = ?', whereArgs: [receiptId]);
+      if (lid != null) {
+        await txn.delete('ledger', where: 'id = ?', whereArgs: [lid]);
+      }
+    });
+
+    for (final t in tombstones) {
+      try {
+        await HubSync.pushDeleted(t.table, t.sid);
+      } catch (_) {}
     }
+    await StaffAudit.log('Delete', 'receipts', detail: 'id=$receiptId');
+    HubSync.notifyLocalWrite(alreadyPushed: true);
     return (ok: true, message: 'Receipt deleted successfully.');
   }
 

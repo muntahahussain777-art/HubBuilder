@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:sqflite/sqflite.dart';
+
 import '../db/app_database.dart';
 import 'dummy_data.dart';
 import 'hub_sync.dart';
@@ -109,20 +111,32 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
     }
     final db = await AppDatabase.instance.database;
     final map = Map<String, Object?>.from(values);
-    if (!map.containsKey('sync_id') ||
-        (map['sync_id']?.toString().trim().isEmpty ?? true)) {
-      try {
-        final sid = await db.rawQuery(
-          "SELECT lower(hex(randomblob(16))) AS s",
-        );
-        final s = (sid.first['s'] ?? '').toString();
-        if (s.isNotEmpty) map['sync_id'] = s;
-      } catch (_) {}
-    }
-    final id = await db.insert(table, map);
-    await HubSync.pushNow(table, id);
+    String outboxRev = '';
+    late final int id;
+    await db.transaction((txn) async {
+      if (!map.containsKey('sync_id') ||
+          (map['sync_id']?.toString().trim().isEmpty ?? true)) {
+        try {
+          final sid = await txn.rawQuery(
+            "SELECT lower(hex(randomblob(16))) AS s",
+          );
+          final s = (sid.first['s'] ?? '').toString();
+          if (s.isNotEmpty) map['sync_id'] = s;
+        } catch (_) {}
+      }
+      id = await txn.insert(table, map);
+      final sid = (map['sync_id'] ?? '').toString().trim();
+      if (sid.isNotEmpty) {
+        outboxRev = await HubSync.enqueueOutbox(txn, table, id, sid);
+        if (table == 'customers') HubSync.noteCustomerLocalSave(sid);
+      }
+    });
+    // UI save dikhao — HTTP bahar
+    unawaited(() async {
+      await HubSync.pushNow(table, id, outboxRevision: outboxRev);
+      HubSync.notifyLocalWrite(alreadyPushed: true);
+    }());
     await log('Insert', table, detail: 'id=$id');
-    HubSync.notifyLocalWrite(alreadyPushed: true);
     unawaited(AutoBackup.onEntry());
     return id;
   }
@@ -138,14 +152,57 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
       throw Exception('Access denied: $mod edit');
     }
     final db = await AppDatabase.instance.database;
-    final n = await db.update(table, values, where: where, whereArgs: whereArgs);
+    String outboxRev = '';
+    var n = 0;
+    final pkArg =
+        (whereArgs != null && whereArgs.isNotEmpty) ? whereArgs.first : null;
+    await db.transaction((txn) async {
+      n = await txn.update(table, values, where: where, whereArgs: whereArgs);
+      if (n > 0 && pkArg != null) {
+        final pkCol = HubSync.tablePk(table);
+        final rows = await txn.query(
+          table,
+          columns: ['sync_id'],
+          where: '$pkCol = ?',
+          whereArgs: [pkArg],
+          limit: 1,
+        );
+        var sid =
+            rows.isEmpty ? '' : (rows.first['sync_id'] ?? '').toString().trim();
+        if (sid.isEmpty) {
+          await txn.execute(
+            'UPDATE "$table" SET sync_id = lower(hex(randomblob(16))) '
+            'WHERE "$pkCol" = ? AND (sync_id IS NULL OR TRIM(sync_id)=\'\')',
+            [pkArg],
+          );
+          final again = await txn.query(
+            table,
+            columns: ['sync_id'],
+            where: '$pkCol = ?',
+            whereArgs: [pkArg],
+            limit: 1,
+          );
+          sid = again.isEmpty
+              ? ''
+              : (again.first['sync_id'] ?? '').toString().trim();
+        }
+        if (sid.isNotEmpty) {
+          final id = int.tryParse(pkArg.toString()) ?? 0;
+          outboxRev = await HubSync.enqueueOutbox(txn, table, id, sid);
+          if (table == 'customers') HubSync.noteCustomerLocalSave(sid);
+        }
+      }
+    });
     if (n > 0) {
       final detail = (whereArgs != null && whereArgs.isNotEmpty)
           ? 'id=${whereArgs.first}'
           : (where == null ? null : '$where $whereArgs');
-      if (whereArgs != null && whereArgs.isNotEmpty) {
-        await HubSync.pushNow(table, whereArgs.first);
-        HubSync.notifyLocalWrite(alreadyPushed: true);
+      if (pkArg != null) {
+        unawaited(() async {
+          await HubSync.pushNow(table, pkArg, outboxRevision: outboxRev);
+          HubSync.notifyLocalWrite(alreadyPushed: true);
+          if (table == 'customers') HubSync.noteCustomerUiRefresh();
+        }());
       } else {
         HubSync.notifyLocalWrite();
       }
@@ -186,14 +243,33 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
         }
       }
     } catch (_) {}
-    // Cloud SoftMark PEHLE — warna doosri device PushChanged tombstone overwrite karti hai
-    if (tombstones.isNotEmpty) {
+    // Local delete + pending_delete IDs EK transaction — HTTP bahar
+    var n = 0;
+    await db.transaction((txn) async {
       for (final t in tombstones) {
-        await HubSync.tombstoneLocalRow(table, t.localPk, t.ids);
+        for (final sid in t.ids) {
+          if (sid.trim().isEmpty) continue;
+          await txn.insert(
+            'sync_pending_delete',
+            {
+              'sync_id': sid.trim(),
+              'table_name': table,
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
       }
-    }
-    final n = await db.delete(table, where: where, whereArgs: whereArgs);
+      n = await txn.delete(table, where: where, whereArgs: whereArgs);
+    });
     if (n > 0) {
+      // SoftMark HTTP transaction ke bahar
+      for (final t in tombstones) {
+        for (final sid in t.ids) {
+          try {
+            await HubSync.pushDeleted(table, sid);
+          } catch (_) {}
+        }
+      }
       for (final un in userNames) {
         await HubSync.pushDeletedUsername(un);
       }
@@ -201,7 +277,7 @@ CREATE TABLE IF NOT EXISTS staff_entry_log (
           ? 'id=${whereArgs.first}'
           : (where == null ? null : '$where $whereArgs');
       await log('Delete', table, detail: detail);
-      HubSync.notifyLocalWrite();
+      HubSync.notifyLocalWrite(alreadyPushed: true);
       unawaited(AutoBackup.onEntry());
     }
     return n;

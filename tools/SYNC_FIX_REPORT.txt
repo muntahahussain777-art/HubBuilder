@@ -1,0 +1,45 @@
+HubBuilder sync fix report — 2026-11-22
+========================================
+Scope: Customer / Allocate Plot / Receipt (+ linked plot status, ledger)
+NO production Supabase / PC DB / mobile DB writes were executed.
+
+FIXED
+-----
+1. Existing sync_id never regenerated when non-empty (both apps).
+2. Local save + sync_outbox revision in same SQLite txn; UI save then background push.
+   Late ACK clears only matching revision (not newer edits).
+3. Allocation/receipt missing parents → sync_pending_apply; retry after parent / restart.
+4. Receipt + ledger local save/delete + pending_delete in one txn (Flutter); SoftMark HTTP outside.
+5. User deletes: pending_delete + local delete same txn (WinForms SQL/ExecuteNonQuery + Flutter StaffAudit).
+6. Anti-resurrect: skip cloud is_deleted on push; SoftMark race re-check; migration
+   supabase/migrations/20261122_prevent_undelete.sql (NOT deployed to production).
+7. Offline dual-edit → sync_conflict (both recoverable; no silent overwrite).
+8. Pull: failed fetch ≠ empty success; failed table does not advance cursor/last_pull.
+9. Flutter live cursor: (updated_at, sync_id) keyset; advance only after apply/pending save.
+10. Customer syncTiming stages: local_save / cloud_ack / ui_refresh (ValueNotifier).
+
+ISOLATED TESTS
+--------------
+tools/sync_isolated_tests.ps1 → 14 passed, 0 failed
+tools/sync_isolated_tests.py  → same logic (needs Python if available)
+tools/ambiguous_sync_report.py → read-only report (no auto merge/delete)
+tools/upgrade_compare_snapshot.py → before/after ID/count/balance compare on copies
+
+BUILDS
+------
+WinForms Release: PASS → RealEstatebuilders/bin/Release/HubBuilders.exe
+Flutter analyze / APK: see chat report (emulator vs real device)
+
+UNVERIFIED (real PC ↔ Android)
+------------------------------
+- End-to-end create/edit/allocate/receipt both directions on live devices
+- Dropped-ACK Rs 10,000 receipt on real network
+- Offline delete resurrection race across real devices
+Mark these unverified until physical verification.
+
+BEFORE PRODUCTION DEPLOY
+------------------------
+1. Deploy migration 20261122_prevent_undelete.sql on ISOLATED test Supabase first.
+2. Only after verify, deploy to project ref fkvinhehqajjnxnducgc (separate approval).
+3. Do NOT wipe/reimport production local DBs.
+4. Uncommitted Report Form/* left untouched intentionally.

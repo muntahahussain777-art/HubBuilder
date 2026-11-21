@@ -377,14 +377,48 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     long rowId = isInsert ? lastInsertId : IdFromParams(parameters);
                     if (!string.IsNullOrWhiteSpace(table) && rowId > 0)
                     {
+                        string syncIdNow = "";
+                        string outboxRev = "";
+                        try
+                        {
+                            using (var c = new System.Data.SQLite.SQLiteConnection(con_string))
+                            {
+                                c.Open();
+                                string pk = HubSyncService.TablePk(table);
+                                using (var q = new System.Data.SQLite.SQLiteCommand(
+                                    "SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", c))
+                                {
+                                    q.Parameters.AddWithValue("@id", rowId);
+                                    syncIdNow = Convert.ToString(q.ExecuteScalar() ?? "").Trim();
+                                }
+                                if (string.IsNullOrWhiteSpace(syncIdNow))
+                                {
+                                    using (var u = new System.Data.SQLite.SQLiteCommand(
+                                        "UPDATE \"" + table + "\" SET sync_id=lower(hex(randomblob(16))) WHERE \"" + pk + "\"=@id AND (sync_id IS NULL OR TRIM(sync_id)='');", c))
+                                    {
+                                        u.Parameters.AddWithValue("@id", rowId);
+                                        u.ExecuteNonQuery();
+                                    }
+                                    using (var q2 = new System.Data.SQLite.SQLiteCommand(
+                                        "SELECT sync_id FROM \"" + table + "\" WHERE \"" + pk + "\"=@id LIMIT 1;", c))
+                                    {
+                                        q2.Parameters.AddWithValue("@id", rowId);
+                                        syncIdNow = Convert.ToString(q2.ExecuteScalar() ?? "").Trim();
+                                    }
+                                }
+                            }
+                            if (!string.IsNullOrWhiteSpace(syncIdNow))
+                                outboxRev = HubSyncService.EnqueueOutbox(table, rowId, syncIdNow, "upsert");
+                        }
+                        catch { }
+                        string revCapture = outboxRev;
                         System.Threading.ThreadPool.QueueUserWorkItem(_ =>
                         {
                             try
                             {
                                 HubSyncService.MarkDirtyTable(table);
-                                if (HubSyncService.PushOneNow(table, rowId))
+                                if (HubSyncService.PushOneNow(table, rowId, revCapture))
                                     HubSyncService.ClearDirty();
-                                // fail: dirty table rehti hai → tick PushChanged cloud pe retry
                                 HubSyncService.ScheduleBackgroundPushPublic();
                             }
                             catch
@@ -668,7 +702,7 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 || m.IndexOf("busy", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        private static int ExecNonQueryRetry(SQLiteConnection c, string qry, IDictionary ht, out long lastId)
+        private static int ExecNonQueryRetry(SQLiteConnection c, string qry, IDictionary ht, out long lastId, SQLiteTransaction tx = null)
         {
             lastId = 0;
             Exception last = null;
@@ -676,7 +710,9 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             {
                 try
                 {
-                    using (SQLiteCommand cmd = new SQLiteCommand(qry, c))
+                    using (SQLiteCommand cmd = tx == null
+                        ? new SQLiteCommand(qry, c)
+                        : new SQLiteCommand(qry, c, tx))
                     {
                         cmd.CommandType = CommandType.Text;
                         BindIDict(cmd, ht);
@@ -696,6 +732,16 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             return 0;
         }
 
+        private static void QueuePendingInTxn(SQLiteConnection c, SQLiteTransaction tx, List<DeleteTarget> delIds)
+        {
+            if (delIds == null) return;
+            foreach (var t in delIds)
+            {
+                if (t.SyncIds == null || t.SyncIds.Count == 0) continue;
+                HubSyncService.QueuePendingDeleteIds(c, tx, t.Table, t.SyncIds);
+            }
+        }
+
         public static int SQL(string qry, Hashtable ht)
         {
             int res = 0;
@@ -703,15 +749,32 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
             var delIds = PeekDeleteSyncIds(qry, ht);
             try
             {
-                // Cloud soft-delete PEHLE — CatchUp resurrect band
-                if (delIds != null && delIds.Count > 0)
-                    PushCloudDeletes(delIds, 1);
+                // Local delete + pending_delete EK transaction; SoftMark HTTP bahar
+                bool isDel = delIds != null && delIds.Count > 0;
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        res = ExecNonQueryRetry(con, qry, ht, out lastId);
+                        if (isDel)
+                        {
+                            using (var tx = con.BeginTransaction())
+                            {
+                                try
+                                {
+                                    QueuePendingInTxn(con, tx, delIds);
+                                    res = ExecNonQueryRetry(con, qry, ht, out lastId, tx);
+                                    tx.Commit();
+                                }
+                                catch
+                                {
+                                    try { tx.Rollback(); } catch { }
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                            res = ExecNonQueryRetry(con, qry, ht, out lastId);
                     }
                 }
                 else
@@ -719,7 +782,25 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        res = ExecNonQueryRetry(local, qry, ht, out lastId);
+                        if (isDel)
+                        {
+                            using (var tx = local.BeginTransaction())
+                            {
+                                try
+                                {
+                                    QueuePendingInTxn(local, tx, delIds);
+                                    res = ExecNonQueryRetry(local, qry, ht, out lastId, tx);
+                                    tx.Commit();
+                                }
+                                catch
+                                {
+                                    try { tx.Rollback(); } catch { }
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                            res = ExecNonQueryRetry(local, qry, ht, out lastId);
                     }
                 }
                 AfterSuccessfulWrite(qry, res, lastId, ht);
@@ -1192,15 +1273,32 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     }
                 }
                 catch { }
-                // Cloud soft-delete PEHLE — CatchUp resurrect band
-                if (delIds != null && delIds.Count > 0)
-                    PushCloudDeletes(delIds, 1);
+                // Local delete + pending_delete EK transaction; SoftMark HTTP bahar
+                bool isDel = delIds != null && delIds.Count > 0;
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        res = ExecNonQueryRetry(con, qry, ht, out lastId);
+                        if (isDel)
+                        {
+                            using (var tx = con.BeginTransaction())
+                            {
+                                try
+                                {
+                                    QueuePendingInTxn(con, tx, delIds);
+                                    res = ExecNonQueryRetry(con, qry, ht, out lastId, tx);
+                                    tx.Commit();
+                                }
+                                catch
+                                {
+                                    try { tx.Rollback(); } catch { }
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                            res = ExecNonQueryRetry(con, qry, ht, out lastId);
                     }
                 }
                 else
@@ -1208,7 +1306,25 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        res = ExecNonQueryRetry(local, qry, ht, out lastId);
+                        if (isDel)
+                        {
+                            using (var tx = local.BeginTransaction())
+                            {
+                                try
+                                {
+                                    QueuePendingInTxn(local, tx, delIds);
+                                    res = ExecNonQueryRetry(local, qry, ht, out lastId, tx);
+                                    tx.Commit();
+                                }
+                                catch
+                                {
+                                    try { tx.Rollback(); } catch { }
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                            res = ExecNonQueryRetry(local, qry, ht, out lastId);
                     }
                 }
                 AfterSuccessfulWrite(qry, res, lastId, ht);
@@ -1335,15 +1451,32 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                 int n = 0;
                 long lastId = 0;
                 var delIds = PeekDeleteSyncIds(query, parameters);
-                // Cloud soft-delete PEHLE — warna CatchUp local delete se pehle/baad wapas laata hai
-                if (delIds != null && delIds.Count > 0)
-                    PushCloudDeletes(delIds, 1);
+                bool isDel = delIds != null && delIds.Count > 0;
+                // Local delete + pending_delete EK transaction; SoftMark HTTP bahar
                 if (_sharedWorkDepth > 0)
                 {
                     lock (_conLock)
                     {
                         EnsureSharedOpen();
-                        n = ExecNonQueryRetry(con, query, parameters, out lastId);
+                        if (isDel)
+                        {
+                            using (var tx = con.BeginTransaction())
+                            {
+                                try
+                                {
+                                    QueuePendingInTxn(con, tx, delIds);
+                                    n = ExecNonQueryRetry(con, query, parameters, out lastId, tx);
+                                    tx.Commit();
+                                }
+                                catch
+                                {
+                                    try { tx.Rollback(); } catch { }
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                            n = ExecNonQueryRetry(con, query, parameters, out lastId);
                     }
                 }
                 else
@@ -1351,7 +1484,25 @@ VALUES (@a, @m, @d, @u, @n, @r);", local))
                     using (var local = new SQLiteConnection(con_string))
                     {
                         local.Open();
-                        n = ExecNonQueryRetry(local, query, parameters, out lastId);
+                        if (isDel)
+                        {
+                            using (var tx = local.BeginTransaction())
+                            {
+                                try
+                                {
+                                    QueuePendingInTxn(local, tx, delIds);
+                                    n = ExecNonQueryRetry(local, query, parameters, out lastId, tx);
+                                    tx.Commit();
+                                }
+                                catch
+                                {
+                                    try { tx.Rollback(); } catch { }
+                                    throw;
+                                }
+                            }
+                        }
+                        else
+                            n = ExecNonQueryRetry(local, query, parameters, out lastId);
                     }
                 }
                 AfterSuccessfulWrite(query, n, lastId, parameters);
