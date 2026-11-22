@@ -125,15 +125,21 @@ abstract final class HubSync {
     'block_monthly_installments',
   ];
   /// Har tick live forms (~sub-second).
+  /// FK order — parents pehle (allocate/receipt pending_apply miss kam).
   static const _liveTables = <String>[
     'customers',
-    'customer_plots',
-    'receipts',
-    'ledger',
     'plots',
+    'customer_plots',
+    'ledger',
+    'receipts',
     'partner_money',
     'customer_plot_partners',
   ];
+
+  /// SoftMark kabhi mat — Rs 34,324 partner_money (held).
+  static const _softMarkBlockedSyncIds = <String>{
+    '1e5ee27ff6fc2ceec491a5406b665be6',
+  };
 
   static void _bump() {
     revision.value++;
@@ -1370,6 +1376,10 @@ abstract final class HubSync {
     final sid = syncId.trim();
     final table = localTable.trim();
     if (sid.isEmpty || table.isEmpty) return true;
+    if (_softMarkBlockedSyncIds.contains(sid.toLowerCase())) {
+      debugPrint('HubSync SoftMark blocked (protected): $sid');
+      return false;
+    }
     final cloud = _cloudTable(table);
     try {
       if (!await _ensureSb()) return false;
@@ -1641,11 +1651,10 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
       if (await _needsFullPull()) {
         await _fullPullAllTables();
       } else {
-        // Cursor: aaj ki WinForms entries jo 3 min se purani hain bhi aa jayein, phir <1s.
+        // Cursor pehle (tez) — sync_id merge only, wipe/dup nahi
         await _pullLiveCursor();
-        // WinForms parity — live deletes/heals har tick (warna alloc/delete ~2–4 min late)
+        // Deletes har tick (light) — SoftMark signal ~1s
         await _pullRecentDeletesFor(_liveTables, 180);
-        await _pullRecentHealFor(_liveTables, 180);
         await _processPendingApplyQueue();
         _bump();
 
@@ -1659,8 +1668,9 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
           }
         }
 
-        // Allocate miss + wider delete window (~20s) — WinForms _lastAllocCatchUp
-        if (DateTime.now().difference(_lastAllocCatchUp).inSeconds >= 20) {
+        // Live heal + alloc catch-up ~2s (har tick heavy heal tick ko minutes late karti thi)
+        if (DateTime.now().difference(_lastAllocCatchUp).inSeconds >= 2) {
+          await _pullRecentHealFor(_liveTables, 120);
           await _pullRecentDeletesFor(_liveTables, 6 * 3600);
           await _catchUpRecentAllocates(180);
           await _processPendingApplyQueue();

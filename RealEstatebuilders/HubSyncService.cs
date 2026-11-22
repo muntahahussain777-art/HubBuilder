@@ -38,12 +38,19 @@ namespace HubBuilders
             "customer_plot_partners", "partner_money", "block_monthly_installments"
         };
 
-        /// Live forms — har tick ~sub-second pull (customer/allocate/receipt).
+        /// Live forms — FK order (parents pehle) taake allocate/receipt pending_apply mein na atkein.
         private static readonly string[] LiveTables =
         {
-            "customers", "customer_plots", "receipts", "ledger",
-            "plots", "partner_money", "customer_plot_partners"
+            "customers", "plots", "customer_plots", "ledger", "receipts",
+            "partner_money", "customer_plot_partners"
         };
+
+        /// SoftMark kabhi mat — Rs 34,324 partner_money (held). Wipe/delete signal band.
+        private static readonly HashSet<string> SoftMarkBlockedSyncIds =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "1e5ee27ff6fc2ceec491a5406b665be6"
+            };
 
         private static DateTime _lastFullIncrementalUtc = DateTime.MinValue;
         private static DateTime _lastDeepHealUtc = DateTime.MinValue;
@@ -600,7 +607,7 @@ namespace HubBuilders
                 {
                     SetState("sync_schema", "11");
                     if (string.IsNullOrWhiteSpace(GetState("alias_backfill_done")))
-                        SetState("alias_backfill_done", "");
+                    SetState("alias_backfill_done", "");
                 }
             }
             catch { }
@@ -1533,9 +1540,9 @@ namespace HubBuilders
                             // Keep is_deleted as-is — ApplyFetched tombstone removes local Active
                         }
                         else
-                        {
-                            foreach (var r in fetched)
-                                r["is_deleted"] = false;
+                    {
+                        foreach (var r in fetched)
+                            r["is_deleted"] = false;
                         }
                     }
                     ApplyFetched(AsApplyRows(table, fetched));
@@ -1641,25 +1648,36 @@ namespace HubBuilders
             }
         }
 
-        /// <summary>Pending pehle txn mein likha — ab sirf SoftMark HTTP (bahar).</summary>
+        /// <summary>Pending pehle txn mein likha — ab sirf SoftMark HTTP (bahar). Thread pe — UI freeze nahi.</summary>
         public static void SoftMarkQueuedCascade(IEnumerable<CloudDeleteItem> items)
         {
             if (items == null) return;
+            var snapshot = new List<Tuple<string, string>>();
             foreach (var i in items)
             {
                 if (i == null || i.SyncIds == null) continue;
+                string table = (i.Table ?? "").Trim();
+                if (table.Length == 0) continue;
                 foreach (string sid in i.SyncIds)
                 {
                     if (string.IsNullOrWhiteSpace(sid)) continue;
+                    snapshot.Add(Tuple.Create(table, sid.Trim()));
+                }
+            }
+            if (snapshot.Count == 0) return;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                foreach (var t in snapshot)
+                {
                     try
                     {
-                        if (SoftMarkCloudDeleted(i.Table, sid))
-                            RemovePendingDelete(sid);
+                        if (SoftMarkCloudDeleted(t.Item1, t.Item2))
+                            RemovePendingDelete(t.Item2);
                     }
                     catch { }
                 }
-            }
-            try { ScheduleQuickSync(); } catch { }
+                try { ScheduleQuickSync(); } catch { }
+            });
         }
 
         private static void RemovePendingDelete(string syncId)
@@ -1791,7 +1809,7 @@ namespace HubBuilders
                 return;
             }
             try { TickSafeCore(); }
-            catch { }
+                catch { }
             finally { Interlocked.Exchange(ref _busy, 0); }
             if (Interlocked.Exchange(ref _tickAgain, 0) != 0)
                 ThreadPool.QueueUserWorkItem(__ => { try { KickTick(); } catch { } });
@@ -2269,12 +2287,12 @@ namespace HubBuilders
                             QueuePendingDelete("partner_money", sid);
                     }
                 }
-                using (var del = new SQLiteCommand("DELETE FROM partner_money WHERE " + whereSql + ";", con, tx))
-                {
-                    bind?.Invoke(del);
-                    del.ExecuteNonQuery();
-                }
-                try { MarkDirty(); } catch { }
+                    using (var del = new SQLiteCommand("DELETE FROM partner_money WHERE " + whereSql + ";", con, tx))
+                    {
+                        bind?.Invoke(del);
+                        del.ExecuteNonQuery();
+                    }
+                    try { MarkDirty(); } catch { }
                 if (softMarkCloud)
                     SoftMarkQueuedCascade(items);
             }
@@ -2433,6 +2451,11 @@ namespace HubBuilders
         {
             if (string.IsNullOrWhiteSpace(localTable) || string.IsNullOrWhiteSpace(syncId)) return true;
             string sid = syncId.Trim();
+            if (SoftMarkBlockedSyncIds.Contains(sid))
+            {
+                // Important entry — SoftMark/HTTP skip (pending hold pe rehti hai)
+                return false;
+            }
             string cloud = CloudTable(localTable);
             string patchJson = Json.Serialize(new Dictionary<string, object>
             {
@@ -2446,8 +2469,8 @@ namespace HubBuilders
                 {
                     string url = SupabaseConfig.Url.TrimEnd('/') + "/rest/v1/" + cloud
                         + "?sync_id=eq." + Uri.EscapeDataString(sid);
-                    var req = new HttpRequestMessage(new HttpMethod("PATCH"), url);
-                    ApplyHeaders(req);
+                var req = new HttpRequestMessage(new HttpMethod("PATCH"), url);
+                ApplyHeaders(req);
                     req.Headers.TryAddWithoutValidation("Prefer", "return=representation");
                     req.Content = new StringContent(patchJson, Encoding.UTF8, "application/json");
                     using (var resp = client.SendAsync(req).GetAwaiter().GetResult())
@@ -2495,7 +2518,7 @@ namespace HubBuilders
             var tomb = new Dictionary<string, object>
             {
                 { "sync_id", syncId },
-                { "is_deleted", true },
+                    { "is_deleted", true },
                 { "updated_at", DateTime.UtcNow.ToString("o") },
                 { "staff_name", (MainClass.LoggedInName ?? MainClass.LoggedInUsername ?? "system").Trim() }
             };
@@ -2651,9 +2674,9 @@ namespace HubBuilders
                 {
                     // FAST PATH (~sub-second):
                     // 1) Local dirty PUSH pehle — WinForms→mobile cloud pe pehle pahunche
-                    if (CanPush())
-                    {
-                        PushPendingDeletes();
+                if (CanPush())
+                {
+                    PushPendingDeletes();
                         try { DrainOutbox(); } catch { }
                         if (PushChanged())
                         {
