@@ -1643,6 +1643,10 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
       } else {
         // Cursor: aaj ki WinForms entries jo 3 min se purani hain bhi aa jayein, phir <1s.
         await _pullLiveCursor();
+        // WinForms parity — live deletes/heals har tick (warna alloc/delete ~2–4 min late)
+        await _pullRecentDeletesFor(_liveTables, 180);
+        await _pullRecentHealFor(_liveTables, 180);
+        await _processPendingApplyQueue();
         _bump();
 
         if (await _canPush()) {
@@ -1653,6 +1657,15 @@ CREATE TABLE IF NOT EXISTS sync_conflict (
             _dirty = false;
             _lastHashPush = DateTime.now();
           }
+        }
+
+        // Allocate miss + wider delete window (~20s) — WinForms _lastAllocCatchUp
+        if (DateTime.now().difference(_lastAllocCatchUp).inSeconds >= 20) {
+          await _pullRecentDeletesFor(_liveTables, 6 * 3600);
+          await _catchUpRecentAllocates(180);
+          await _processPendingApplyQueue();
+          _lastAllocCatchUp = DateTime.now();
+          _bump();
         }
 
         // Full incremental rare — har 3s pe 19 tables tick ko atka deti thi
